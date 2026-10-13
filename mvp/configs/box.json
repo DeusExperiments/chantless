@@ -1,0 +1,139 @@
+{
+  "run_id": "box-mvp-001",
+  "run_root": "/root/chantless/runs",
+  "source": {
+    "repo": "Qwen/Qwen3-0.6B",
+    "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "hf_dir": "/root/chantless/models/qwen3-0.6b",
+    "gguf": "/root/chantless/models/qwen3-0.6b-bf16.gguf",
+    "expected_gguf_sha256": "fd29a1cc6fe6b506a4c6c9d51383fb162344f024e850a0b6fad052a690790e60"
+  },
+  "toolchain": {
+    "llama_bin": "/root/chantless/llama.cpp/build/bin",
+    "traj_kl": "/root/chantless/bin/traj-kl",
+    "gpus": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7"
+    ],
+    "convert_py": "/root/chantless/llama.cpp/convert_hf_to_gguf.py"
+  },
+  "env": {
+    "module": "chantless.env.codetasks",
+    "kwargs": {
+      "seed": 20261012,
+      "variants_per_family": 320,
+      "split_sizes": {
+        "search": 12,
+        "select": 12,
+        "exam": 12,
+        "train": 6
+      },
+      "context": 8192,
+      "concurrency": 1,
+      "kv_type": "f16",
+      "max_total_memory_bytes": 2500000000
+    }
+  },
+  "decoding": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0
+  },
+  "serving": {
+    "slots_per_gpu": 16,
+    "ctx_per_slot": 8192
+  },
+  "objective_mode": "preserve",
+  "ladder": [
+    "BF16",
+    "Q8_0",
+    "Q6_K",
+    "Q5_K",
+    "Q4_K",
+    "Q3_K",
+    "Q2_K",
+    "IQ2_XS"
+  ],
+  "start_tier": "Q8_0",
+  "pool": {
+    "tasks_per_split": {
+      "search": 1200,
+      "select": 3840,
+      "train": 600,
+      "exam": 3840
+    },
+    "runs": 8,
+    "min_pass": 6
+  },
+  "stats": {
+    "margin": 0.03,
+    "alpha": 0.05,
+    "power": 0.95,
+    "n_floor": 1200,
+    "looks": 4,
+    "max_eps_per_task": 12,
+    "aa_tol": 0.015,
+    "aa_enforce": true,
+    "detector_bound": 0.03,
+    "n_aa": 3000,
+    "allow_small_pool": false,
+    "aa_replication": true
+  },
+  "proxy": {
+    "task_max_targets": 8000,
+    "general_docs": 300,
+    "general_seq_len": 1024,
+    "general_n_seq": 16,
+    "self_kl_tol": {
+      "task": 5e-05,
+      "general": 0.0001
+    }
+  },
+  "sanity": {
+    "floor_factor": 4.0,
+    "behavioral_items": 120,
+    "behavioral_seeds": 2,
+    "behavioral_margin": 0.05
+  },
+  "screen": {
+    "pairs": 200,
+    "fail_below": -0.1
+  },
+  "learner": {
+    "reprobe_every": 8,
+    "top_k": 16,
+    "screen_every": 8,
+    "gate_every": 32,
+    "max_moves": 2000,
+    "feedback": true,
+    "feedback_tasks": 40,
+    "implicate_share": 0.2,
+    "penalty_step": 1.0,
+    "max_revert": 2
+  },
+  "repair": {
+    "enabled": true,
+    "steps": 400,
+    "rank": 16,
+    "lr": 0.0001
+  },
+  "exam": {
+    "baseline_eps_per_task": 2
+  },
+  "budget": {
+    "max_hours": 2.65
+  },
+  "probe": {
+    "workers": 16,
+    "quantize_threads": 6,
+    "max_pruned": 24
+  },
+  "scratch_root": "/tmp/chantless-scratch"
+}

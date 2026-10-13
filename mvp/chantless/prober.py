@@ -1,0 +1,126 @@
+"""Probe = build a candidate from a mask, then score it against frozen-source reference stores.
+
+Stores (computed once from the frozen source; never moved with candidate weights):
+  task     KL on source-successful search-split trajectories (preserve proxy)
+  general  KL on general text + code (size-matched sanity cap)
+  fb_k     KL on candidate failure trajectories added by learner feedback (decision S4)
+In improve mode the task proxy is the candidate's NLL on verified-successful trajectories instead of KL.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import kl
+from .builder import Builder, mask_key
+from .runtime import Toolchain
+
+
+@dataclass
+class Store:
+    name: str
+    trj: str
+    dir: str
+    n_targets: int
+    weight: float = 1.0
+
+
+@dataclass
+class ProbeResult:
+    key: str
+    bytes: int
+    bpw: float
+    kl: dict = field(default_factory=dict)     # store -> kl
+    nll: dict = field(default_factory=dict)    # store -> candidate nll
+    fallbacks: dict = field(default_factory=dict)
+
+    def task_proxy(self, stores: list[Store], mode: str) -> float:
+        num = den = 0.0
+        for s in stores:
+            if s.name == "general":
+                continue
+            val = self.kl[s.name] if mode == "preserve" else self.nll[s.name]
+            num += val * s.n_targets * s.weight
+            den += s.n_targets * s.weight
+        return num / den
+
+
+class Prober:
+    def __init__(self, tc: Toolchain, builder: Builder, work: str | Path, log: str | None, workers: int | None = None,
+                 scratch: str | Path | None = None):
+        self.tc, self.builder = tc, builder
+        self.work = Path(work)                       # receipts (persist; resume reads them)
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.scratch = Path(scratch) if scratch else self.work   # built candidates (deleted after scoring)
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        self.log = log
+        self.stores: list[Store] = []
+        self._gpu_lock = threading.Lock()
+        self._free = list(tc.gpus)
+        self._cv = threading.Condition()
+        self.cache: dict[str, ProbeResult] = {}
+        self.workers = workers or max(1, len(tc.gpus))   # > n_gpus overlaps CPU builds with GPU scoring
+
+    def add_store(self, s: Store) -> None:
+        self.stores.append(s)
+
+    def _gpu(self):
+        with self._cv:
+            while not self._free:
+                self._cv.wait()
+            return self._free.pop()
+
+    def _release(self, g):
+        with self._cv:
+            self._free.append(g)
+            self._cv.notify()
+
+    def probe(self, mask: dict, stores: list[str] | None = None, keep: bool = False) -> ProbeResult:
+        key = mask_key(mask)
+        want = stores or [s.name for s in self.stores]
+        cached = self.cache.get(key) or self._from_disk(key)
+        if cached and all(n in cached.kl for n in want):
+            self.cache[key] = cached
+            return cached
+        b = self.builder.build(mask, self.scratch / f"p-{key}.gguf")
+        res = cached or ProbeResult(key, b.file_bytes, b.bpw, fallbacks=b.fallbacks)
+        g = self._gpu()
+        try:
+            for s in self.stores:
+                if s.name not in want or s.name in res.kl:
+                    continue
+                r = kl.traj_kl(self.tc, "kl", b.path, s.trj, s.dir, str(self.work / f"p-{key}-{s.name}.json"), self.log, gpu=g)
+                res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
+        finally:
+            self._release(g)
+            if not keep:
+                Path(b.path).unlink(missing_ok=True)
+        self.cache[key] = res
+        (self.work / f"p-{key}-meta.json").write_text(json.dumps({"bytes": res.bytes, "bpw": res.bpw, "fallbacks": res.fallbacks}))
+        return res
+
+    def _from_disk(self, key: str):
+        """Resume support: reload receipts of probes already measured in this run/tag (same weights, same stores)."""
+        meta = self.work / f"p-{key}-meta.json"
+        if not meta.exists():
+            return None
+        m = json.loads(meta.read_text())
+        res = ProbeResult(key, m["bytes"], m["bpw"], fallbacks=m.get("fallbacks", {}))
+        for s in self.stores:
+            f = self.work / f"p-{key}-{s.name}.json"
+            if f.exists():
+                r = json.loads(f.read_text())
+                res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
+        return res
+
+    def probe_many(self, masks: list[dict], stores: list[str] | None = None) -> list[ProbeResult]:
+        with ThreadPoolExecutor(self.workers) as ex:
+            return list(ex.map(lambda m: self.probe(m, stores), masks))
+
+    def invalidate(self) -> None:
+        """Called when weights change (repair) or stores change; cached KL values become stale."""
+        self.cache.clear()
