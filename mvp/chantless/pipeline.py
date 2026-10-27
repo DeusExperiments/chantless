@@ -585,7 +585,8 @@ class Run:
                  "dropped_absent": all(n not in inv for n in drop), "fallbacks": r1.fallbacks,
                  "rebuild_sha256_equal": h1 == h2, "sha256": h1}
         mem = self.measure_memory(r1.path)
-        n_attn_kept = sum(1 for g, e in m["groups"].items() if g.endswith(".attn") and e["tier"] != "drop")
+        n_attn_kept = sum(1 for g, e in m["groups"].items()
+                          if g.endswith(".attn") and self.groups[g].get("kv", True) and e["tier"] != "drop")
         kvb = bmod.kv_bytes(self.info, n_attn_kept, self.dep["context"], self.dep["concurrency"], self.dep["kv_type"])
         limit = self.dep.get("max_total_memory_bytes")
         constraint = {"limit": limit, "measured_total": mem.get("total_bytes"), "kv_formula_bytes": kvb,

@@ -7,11 +7,13 @@ from pathlib import Path
 
 import gguf
 
-QUANTIZABLE_ATTN = ("attn_q", "attn_k", "attn_v", "attn_output")
+# The "attn" group is the token-mixer sub-block: full attention (qwen3, qwen35) or gated delta net (qwen35).
+# qwen35's post_attention_norm is the FFN's pre-norm, so it belongs to the FFN group.
+QUANTIZABLE_ATTN = ("attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta")
 QUANTIZABLE_FFN = ("ffn_gate", "ffn_up", "ffn_down")
-ATTN_FIXED = ("attn_norm", "attn_q_norm", "attn_k_norm")
-FFN_FIXED = ("ffn_norm",)
-BLK = re.compile(r"^blk\.(\d+)\.([a-z_]+)\.(weight|bias)$")
+ATTN_FIXED = ("attn_norm", "attn_q_norm", "attn_k_norm", "ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm")
+FFN_FIXED = ("ffn_norm", "post_attention_norm")
+BLK = re.compile(r"^blk\.(\d+)\.([a-z0-9_]+?)(?:\.(weight|bias))?$")
 
 
 def inventory_slow(path: str | os.PathLike) -> list[dict]:
@@ -35,10 +37,14 @@ def groups_from_inventory(inv: list[dict]) -> dict[str, dict]:
     """Group map generated from the header: every tensor lands in exactly one group or the fixed set."""
     groups: dict[str, dict] = {}
     fixed = []
+    # MTP / NextN draft blocks are never part of the searched trunk
+    mtp_blocks = {p[1] for t in inv if len(p := t["name"].split(".")) > 3 and p[0] == "blk" and p[2] == "nextn"}
     for t in inv:
         name = t["name"]
         m = BLK.match(name)
-        if name == "token_embd.weight":
+        if name.startswith("blk.") and name.split(".")[1] in mtp_blocks:
+            fixed.append(name)
+        elif name == "token_embd.weight":
             groups.setdefault("token_embd", {"quantizable": [], "fixed": [], "droppable": False})["quantizable"].append(name)
         elif name == "output.weight":
             groups.setdefault("output", {"quantizable": [], "fixed": [], "droppable": False})["quantizable"].append(name)
@@ -54,6 +60,9 @@ def groups_from_inventory(inv: list[dict]) -> dict[str, dict]:
                 fixed.append(name)
         else:
             fixed.append(name)
+    for g, e in groups.items():
+        if g.endswith(".attn"):  # full attention keeps a KV cache; a gated delta net keeps constant recurrent state
+            e["kv"] = any(n.endswith(".attn_output.weight") for n in e["quantizable"])
     groups["_fixed"] = {"quantizable": [], "fixed": fixed, "droppable": False}
     seen = [n for g in groups.values() for n in g["quantizable"] + g["fixed"]]
     assert sorted(seen) == sorted(t["name"] for t in inv), "group map does not partition the tensors"

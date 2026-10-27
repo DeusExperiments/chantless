@@ -3,7 +3,7 @@
 This is a small but complete implementation of the tuned Chantless spec (`../explainer/design-notes.md`, decisions in `.local/architecture-implementation-planning-20261012/DECISIONS.md`). It runs on a deliberately small target so the algorithm and infrastructure can be frozen before porting to MiMo.
 
 - **Source model.** `Qwen/Qwen3-0.6B` @ `c1899de2…`, converted to BF16 GGUF. The GGUF sha256 is `fd29a1cc…` when built with the pinned converter.
-- **Runtime.** llama.cpp `9adc7f4` plus `patches/llama-cpp-9adc7f4-qwen3-subblock-drop.patch`. The patch lets the runtime run a model whose attention or FFN sub-blocks are physically absent. An absent sub-block runs as identity and allocates no KV cache.
+- **Runtime.** llama.cpp `9adc7f4` plus `patches/llama-cpp-9adc7f4-subblock-drop.patch` (`qwen3` and `qwen35`). The patch lets the runtime run a model whose token-mixer or FFN sub-blocks are physically absent. An absent sub-block runs as identity; an absent full-attention block allocates no KV cache and an absent gated delta net no recurrent state. The MVP run used the qwen3-only subset, kept as `patches/llama-cpp-9adc7f4-qwen3-subblock-drop.patch`.
 - **Environment.** `chantless.env.codetasks`: 42 families of procedurally generated Python function tasks, graded by hidden unit tests. The model has a `run_tests` tool turn. Splits are assigned per family (search / select / exam / train).
 
 ## How each architecture box is implemented
@@ -33,16 +33,9 @@ python -m chantless.cli run --config configs/box.json           # full MVP run o
 
 Phases resume from `runs/<id>/phases/*.done`. Run `--reset PHASE` to redo a phase and all later ones.
 
-## Tests
-
-```bash
-pytest -q tests/test_core.py                                           # no model needed
-CHANTLESS_MVP_ROOT=../.local/mvp pytest -q tests/test_integration.py   # builder, drop equivalence, KV, self-KL
-```
-
 ## Known limitations (by design for the MVP)
 
 - Weight repair trains without simulating quantisation. The loop measures the real built artifact, and repair is accepted only if it helps.
 - The dynquant baseline is our K94-style recipe re-implemented on this model, measured once on the same proxy. It is not the original Qwen3.8 pipeline.
 - Speedups, such as a tensor-variant cache and cached move rankings beyond the top-16 schedule, are deliberately absent. Every probe requantises the whole model.
-- Removal operators exist only for the `qwen3` architecture. MiMo's `qwen35` hybrid needs its own patch and equivalence tests.
+- Removal operators exist for `qwen3` and `qwen35`. The `qwen35` path compiles but has not been run on a real model. MTP heads and the vision encoder are left out of the converted GGUF.
