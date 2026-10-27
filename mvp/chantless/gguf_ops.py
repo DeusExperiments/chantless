@@ -27,7 +27,8 @@ def arch_info(path: str | os.PathLike) -> dict:
     arch = r.get_field("general.architecture").contents()
     def g(k, default=None):
         f = r.get_field(f"{arch}.{k}")
-        return f.contents() if f else default
+        v = f.contents() if f else default
+        return max(v) if isinstance(v, list) else v  # per-layer arrays (hybrids store 0 for recurrent layers)
     return {"arch": arch, "n_layer": int(g("block_count")), "n_embd": int(g("embedding_length")),
             "n_head": int(g("attention.head_count")), "n_head_kv": int(g("attention.head_count_kv")),
             "head_dim": int(g("attention.key_length", int(g("embedding_length")) // int(g("attention.head_count"))))}
