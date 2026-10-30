@@ -1,14 +1,19 @@
-"""llama.cpp process wrappers: llama-server lifecycle, llama-quantize, llama-imatrix, traj-kl."""
+"""llama.cpp process wrappers: llama-server lifecycle, llama-quantize, llama-imatrix, traj-kl, logodds."""
 from __future__ import annotations
 
 import json
 import os
 import socket
+import struct
 import subprocess
+import tempfile
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 
 @dataclass
@@ -16,10 +21,12 @@ class Toolchain:
     llama_bin: Path      # directory with llama-server, llama-quantize, llama-imatrix
     traj_kl: Path        # traj-kl binary
     gpus: list[str]      # device ids for CUDA_VISIBLE_DEVICES; [""] on Metal/CPU
+    logodds: Path | None = None  # logodds binary; needed only by classifier environments
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Toolchain":
-        return cls(Path(cfg["llama_bin"]), Path(cfg["traj_kl"]), [str(g) for g in cfg.get("gpus", [""])])
+        return cls(Path(cfg["llama_bin"]), Path(cfg["traj_kl"]), [str(g) for g in cfg.get("gpus", [""])],
+                   Path(cfg["logodds"]) if cfg.get("logodds") else None)
 
     def env_for(self, gpu: str) -> dict:
         env = dict(os.environ)
@@ -115,3 +122,67 @@ def quantize(tc: Toolchain, src: str, dst: str, base_type: str, overrides: dict[
 def imatrix(tc: Toolchain, model: str, text_file: str, out: str, log: str | None, ctx: int = 512, gpu: str = "") -> None:
     run([tc.llama_bin / "llama-imatrix", "-m", model, "-f", text_file, "-o", out, "-c", str(ctx), "-ngl", "999",
          "--parse-special", "--no-ppl"], log, env=tc.env_for(gpu))
+
+
+def trj_targets(path: str | os.PathLike) -> list[int]:
+    """Number of targets of each trajectory of a TRJ1 file, in file order (tokens are skipped, not read)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(8)
+        if len(head) != 8 or head[:4] != b"TRJ1":
+            raise ValueError(f"{path}: not a TRJ1 file")
+        out = []
+        for _ in range(struct.unpack("<I", head[4:])[0]):
+            rec = f.read(8)
+            if len(rec) != 8:
+                raise ValueError(f"{path}: truncated")
+            nt, ng = struct.unpack("<II", rec)
+            if f.seek(4 * (nt + ng), 1) > size:  # seeking past EOF does not fail by itself
+                raise ValueError(f"{path}: truncated")
+            out.append(ng)
+    return out
+
+
+class BatchScorer:
+    """logit[a] - logit[b] at every target of a TRJ1 file, from the logodds binary.
+
+    With gpu=None one file is sharded over every slot of every GPU (slots_per_gpu processes per GPU) and
+    merged back in file order; with a gpu given, one process runs there. A missing value raises.
+    """
+
+    def __init__(self, tc: Toolchain, slots_per_gpu: int = 2):
+        if tc.logodds is None:
+            raise ValueError("toolchain has no logodds binary (toolchain.logodds)")
+        self.tc, self.slots_per_gpu = tc, slots_per_gpu
+
+    def score_trj(self, model: str, trj: str, pair: tuple[int, int], gpu: str | None = None) -> np.ndarray:
+        counts = trj_targets(trj)
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        out = np.full(int(offsets[-1]), np.nan)
+        if not len(out):
+            return out
+        gpus = [g for g in self.tc.gpus for _ in range(self.slots_per_gpu)] if gpu is None else [gpu]
+        n = max(1, min(len(gpus), sum(1 for c in counts if c)))  # never start a process with nothing to score
+        with tempfile.TemporaryDirectory(prefix="logodds-") as tmp:
+            parts = [Path(tmp) / f"{i}.tsv" for i in range(n)]
+
+            def one(i):
+                cmd = [str(self.tc.logodds), "-m", str(model), "--traj", str(trj), "--pair", f"{pair[0]},{pair[1]}",
+                       "--out", str(parts[i]), "--shard", f"{i}/{n}"]
+                p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                   env=self.tc.env_for(gpus[i]))
+                if p.returncode != 0:
+                    tail = p.stderr.strip().splitlines()[-3:]
+                    raise RuntimeError(f"logodds failed ({p.returncode}) on {trj} shard {i}/{n}: {' | '.join(tail)}")
+
+            with ThreadPoolExecutor(n) as ex:
+                list(ex.map(one, range(n)))
+            for part in parts:
+                for line in open(part):
+                    ti, k, v = line.split("\t")
+                    out[offsets[int(ti)] + int(k)] = float(v)
+        miss = np.flatnonzero(~np.isfinite(out))
+        if len(miss):
+            raise RuntimeError(f"logodds left {len(miss)} of {len(out)} targets of {trj} unscored or non-finite "
+                               f"(first at {miss[0]})")
+        return out

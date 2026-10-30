@@ -10,7 +10,7 @@ import importlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-SPLITS = ("search", "select", "exam", "train")
+SPLITS = ("search", "select", "exam", "train", "calibration")  # calibration: optional, for classifier rules
 
 
 @dataclass
@@ -71,6 +71,20 @@ class Environment(Protocol):
     def verify(self, task: Task, episode: Episode) -> Verdict: ...
 
 
+@runtime_checkable
+class ClassifierHooks(Protocol):
+    """Optional hooks of an environment with `classifier = True`, judged at each model's own operating point.
+
+    score: a score per task id (lower = more toward the flagged class); calibrate: a JSON-serialisable rule
+    from this model's scores on the calibration split; decide: the verdict for one task under that rule.
+    """
+    classifier: bool
+
+    def score(self, tasks: list[Task], model: str, scorer: Any) -> dict[str, float]: ...
+    def calibrate(self, scores: dict[str, float]) -> dict: ...
+    def decide(self, task: Task, score: float, rule: dict) -> Verdict: ...
+
+
 def load_environment(module: str, **kwargs) -> Environment:
     mod = importlib.import_module(module)
     env = mod.make_environment(**kwargs)
@@ -86,6 +100,10 @@ def validate_environment(env: Any) -> None:
     for fn in ("tasks", "run", "verify"):
         if not callable(getattr(env, fn, None)):
             raise ValueError(f"environment lacks callable {fn}()")
+    if getattr(env, "classifier", False):
+        for fn in ("score", "calibrate", "decide"):
+            if not callable(getattr(env, fn, None)):
+                raise ValueError(f"classifier environment lacks callable {fn}()")
     for k in ("context", "concurrency", "kv_type"):
         if k not in env.deployment:
             raise ValueError(f"environment deployment block lacks {k!r}")
