@@ -107,9 +107,11 @@ def _check(item: dict, text: str) -> bool:
 
 def run_behavioral(srvs, decoding: dict, items: list[dict], seeds: list[int], side: str) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
+    jobs = [(it, s) for it in items for s in seeds]
+    if not jobs:
+        return []
     from .client import ChatClient
     clients = [ChatClient(s.url, decoding) for s in srvs]
-    jobs = [(it, s) for it in items for s in seeds]
 
     def one(ij):
         i, (it, s) = ij
@@ -149,12 +151,33 @@ class SizeMatchedCap:
         return {"points": list(zip(self.bpw, self.kl))}
 
 
-def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict], ladder: list[str], factor: float) -> dict:
-    """solo[group][setting] = {'kl_gen', 'bytes_saved'}; uniform[tier] = {'kl_gen', 'bytes_saved'}.
+class NoCap:
+    """No general-KL cap: every bpw is allowed."""
 
-    A solo setting is forbidden when its general-KL cost per byte saved exceeds `factor` times the
-    uniform-quant average at that tier (drop is compared with the cheapest uniform tier). The floor is
-    the cheapest tier reached before the first forbidden tier; drop is allowed only if it passes too.
+    def __call__(self, bpw: float) -> float:
+        return float("inf")
+
+    def to_dict(self) -> dict:
+        return {"kind": "off"}
+
+
+def make_cap(kind: str, points=None):
+    """'general_kl' -> SizeMatchedCap(points), as today; 'off' -> a cap that is always +inf."""
+    if kind == "general_kl":
+        return SizeMatchedCap(points)
+    if kind == "off":
+        return NoCap()
+    raise ValueError(f"unknown cap kind {kind!r}")
+
+
+def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict], ladder: list[str], factor: float,
+                     key: str = "kl_gen") -> dict:
+    """solo[group][setting] = {key, 'bytes_saved'}; uniform[tier] = {key, 'bytes_saved'}.
+
+    A solo setting is forbidden when its cost (`key`: general KL by default, or e.g. the task proxy) per
+    byte saved exceeds `factor` times the uniform-quant average at that tier (drop is compared with the
+    cheapest uniform tier). The floor is the cheapest tier reached before the first forbidden tier; drop
+    is allowed only if it passes too.
     """
     floors = {}
     cheapest = ladder[-1]
@@ -165,8 +188,8 @@ def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict],
             if t not in settings:
                 continue
             s, u = settings[t], uniform[t]
-            slope_u = u["kl_gen"] / max(1, u["bytes_saved"])
-            ok = s["bytes_saved"] > 0 and s["kl_gen"] <= factor * slope_u * s["bytes_saved"]
+            slope_u = u[key] / max(1, u["bytes_saved"])
+            ok = s["bytes_saved"] > 0 and s[key] <= factor * slope_u * s["bytes_saved"]
             evidence[t] = {**s, "limit": factor * slope_u * s["bytes_saved"], "ok": ok}
             if allowed_chain and ok:
                 min_tier = t
@@ -175,8 +198,8 @@ def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict],
         drop_ok = False
         if "drop" in settings:
             s, u = settings["drop"], uniform[cheapest]
-            slope_u = u["kl_gen"] / max(1, u["bytes_saved"])
-            drop_ok = s["kl_gen"] <= factor * slope_u * s["bytes_saved"]
+            slope_u = u[key] / max(1, u["bytes_saved"])
+            drop_ok = s[key] <= factor * slope_u * s["bytes_saved"]
             evidence["drop"] = {**s, "limit": factor * slope_u * s["bytes_saved"], "ok": drop_ok}
         floors[g] = {"min_tier": min_tier, "drop_ok": drop_ok, "evidence": evidence}
     return floors
