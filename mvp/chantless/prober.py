@@ -75,9 +75,30 @@ class Prober:
     def add_store(self, s: Store) -> None:
         if s.kind not in ("kl", "logodds"):
             raise ValueError(f"store {s.name}: unknown kind {s.kind!r}")
-        if s.kind == "logodds" and self.scorer is None:
-            raise ValueError(f"store {s.name}: a logodds store needs Prober(scorer=...)")
+        if s.kind == "logodds":
+            if self.scorer is None:
+                raise ValueError(f"store {s.name}: a logodds store needs Prober(scorer=...)")
+            self._check_meta(s)
         self.stores.append(s)
+
+    @staticmethod
+    def _check_meta(s: Store) -> None:
+        """Fail at add_store, not inside a probe worker, on a malformed logodds meta."""
+        m, err = s.meta, f"store {s.name}: logodds meta"
+        parts = m.get("parts")
+        if not isinstance(parts, list) or not parts:
+            raise ValueError(f"{err} needs a non-empty 'parts' list")
+        for p in parts:
+            if not isinstance(p, dict) or "name" not in p or p.get("role") not in ("pos", "neg") \
+                    or not isinstance(p.get("n"), int) or p["n"] <= 0:
+                raise ValueError(f"{err}: bad part {p!r} (needs name, role pos|neg, n > 0)")
+        if {p["role"] for p in parts} != {"pos", "neg"}:
+            raise ValueError(f"{err} needs at least one pos part and one neg part")
+        pair = m.get("pair")
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(t, int) for t in pair):
+            raise ValueError(f"{err}: 'pair' must be two ints, got {pair!r}")
+        if m.get("objective") not in objectives.OBJECTIVES:
+            raise ValueError(f"{err}: unknown objective {m.get('objective')!r} (have {sorted(objectives.OBJECTIVES)})")
 
     def _gpu(self):
         with self._cv:
@@ -132,16 +153,25 @@ class Prober:
             i += p["n"]
         return {k: np.concatenate(v) if v else np.zeros(0) for k, v in out.items()}
 
+    @staticmethod
+    def _finite(s: Store, x: np.ndarray, what: str) -> np.ndarray:
+        bad = int((~np.isfinite(x)).sum())
+        if bad:
+            raise RuntimeError(f"store {s.name}: {bad} of {len(x)} {what} scores are not finite")
+        return x
+
     def _logodds(self, model: str, s: Store, key: str, gpu: str) -> float:
         """Objective damage of the candidate on a logodds store. The receipt keeps "kl" and "nll_cand" for _from_disk."""
         if s.name not in self._src:
-            self._src[s.name] = self._split(s, np.load(Path(s.dir) / "source.npy"))
+            src = np.asarray(np.load(Path(s.dir) / "source.npy"), dtype=np.float64)
+            self._src[s.name] = self._split(s, self._finite(s, src, "source"))
         x = np.asarray(self.scorer.score_trj(model, s.trj, tuple(s.meta["pair"]), gpu=gpu), dtype=np.float64)
-        cand = self._split(s, x)
-        v = float(objectives.OBJECTIVES[s.meta["objective"]](cand, self._src[s.name], **s.meta.get("objective_args", {})))
+        cand = self._split(s, self._finite(s, x, "candidate"))
+        args = s.meta.get("objective_args", {})
+        v = float(objectives.OBJECTIVES[s.meta["objective"]](cand, self._src[s.name], **args))
         np.save(self.work / f"p-{key}-{s.name}.npy", x)
         (self.work / f"p-{key}-{s.name}.json").write_text(json.dumps(
-            {"kl": v, "nll_cand": v, "kind": "logodds", "objective": s.meta["objective"],
+            {"kl": v, "nll_cand": v, "kind": "logodds", "objective": s.meta["objective"], "objective_args": args,
              "n_pos": int(len(cand["pos"])), "n_neg": int(len(cand["neg"]))}))
         return v
 
@@ -156,6 +186,8 @@ class Prober:
             f = self.work / f"p-{key}-{s.name}.json"
             if f.exists():
                 r = json.loads(f.read_text())
+                if r.get("kind", "kl") != s.kind:   # same store name, other kind (classifier flag flipped): re-probe
+                    continue
                 res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
         return res
 

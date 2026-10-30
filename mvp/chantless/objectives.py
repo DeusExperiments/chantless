@@ -19,9 +19,14 @@ def pauc(x: dict, tail: float = 0.05, tau: float = 0.5) -> float:
     apparent cutoff and rewards noisier candidates. For the same reason x["neg"] must be a random sample of
     negatives, not a tail-selected one.
     """
+    if not tau > 0 or not 0 < tail <= 1:
+        raise ValueError(f"pauc needs tau > 0 and 0 < tail <= 1, got tau={tau}, tail={tail}")
     pos, neg = np.asarray(x["pos"], dtype=np.float64), np.asarray(x["neg"], dtype=np.float64)
     if not len(pos) or not len(neg):
         raise ValueError(f"pauc needs both parts: {len(pos)} pos, {len(neg)} neg")
+    bad = int((~np.isfinite(pos)).sum() + (~np.isfinite(neg)).sum())
+    if bad:   # np.sort puts NaN last, so NaN negatives would leave the hard tail silently
+        raise ValueError(f"pauc got {bad} non-finite scores")
     k = math.ceil(round(tail * len(neg), 9))   # round first: 0.05 * 60 is 3.0000000000000004 in floating point
     hard = np.sort(neg)[: max(1, k)]
     gap = (hard[None, :] - pos[:, None]) / tau
