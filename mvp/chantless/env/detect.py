@@ -16,6 +16,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import math
 import os
 import struct
 import threading
@@ -117,8 +118,13 @@ class DetectEnvironment:
                 raise ValueError("classifier=True needs calibration_ids_file and cache_dir")
             self.cache_dir = Path(cache_dir)
             self.pair = tuple(self._single_id(w) for w in ANSWERS)
+            # Cache identity: the full tokenizer serialisation (vocab, merges, added tokens) when there is one
+            backend = getattr(self.tok, "backend_tokenizer", None)
+            ident = backend.to_str() if backend is not None else f"{Path(hf_dir).resolve()}:{len(self.tok)}"
+            self._tok_id = hashlib.sha256(ident.encode()).hexdigest()
             self._classifier_tasks(d, rng, _read_ids(calibration_ids_file), search_per_cell, select_per_cell,
-                                   exam_test_per_cell, search_beemo_per_kind, select_beemo_per_kind, exam_beemo_per_kind)
+                                   exam_test_per_cell, search_beemo_per_kind, select_beemo_per_kind,
+                                   exam_beemo_per_kind)
             return
         cols = ["id", "text", "label", "format"]
         val = pq.read_table(d / "WildOutlines/data/validation-00000-of-00001.parquet", columns=cols).to_pylist()
@@ -166,10 +172,12 @@ class DetectEnvironment:
                if r["id"] in cal_ids]
         if len(cal) != len(cal_ids):
             raise ValueError(f"{len(cal_ids) - len(cal)} calibration ids are not in the calibration parquet")
+        first_half = [r for r in pool if r["prompt_id"] in first]
+        second_half = [r for r in pool if r["prompt_id"] not in first]
         picks = [("search", "wo-val", _sample(a, cell, search_per_cell, rng)),
-                 ("search", "beemo", _sample([r for r in pool if r["prompt_id"] in first], kind, search_beemo_per_kind, rng)),
+                 ("search", "beemo", _sample(first_half, kind, search_beemo_per_kind, rng)),
                  ("select", "wo-val", _sample(b, cell, select_per_cell, rng)),
-                 ("select", "beemo", _sample([r for r in pool if r["prompt_id"] not in first], kind, select_beemo_per_kind, rng)),
+                 ("select", "beemo", _sample(second_half, kind, select_beemo_per_kind, rng)),
                  ("exam", "wo-test", _sample(test, cell, exam_test_per_cell, rng)),
                  ("exam", "beemo", _sample([r for r in beemo if r["split"] == "exam"], kind, exam_beemo_per_kind, rng)),
                  ("calibration", "wo-cal", cal)]
@@ -215,7 +223,12 @@ class DetectEnvironment:
                                 add_special_tokens=False)["input_ids"]
 
     def _key(self, tasks: list[Task]) -> str:
-        return hashlib.sha256("\n".join([str(self.max_doc_tokens)] + [t.id for t in tasks]).encode()).hexdigest()[:16]
+        """Cache key: tokenizer, answer pair, prompt template, document cut and the ordered task ids."""
+        head = [self._tok_id, repr(self.pair), chat_prompt(""), str(self.max_doc_tokens)]
+        return hashlib.sha256("\n".join(head + [t.id for t in tasks]).encode()).hexdigest()[:16]
+
+    def _tmp(self, path: Path) -> Path:
+        return path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
 
     def trj_for(self, tasks: list[Task]) -> Path:
         """A TRJ1 file of these tasks in order, the answer token appended as the one target; cached by task ids."""
@@ -223,12 +236,13 @@ class DetectEnvironment:
         if path.exists():
             return path
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+        tmp = self._tmp(path)
         with open(tmp, "wb") as f:
             f.write(b"TRJ1" + struct.pack("<I", len(tasks)))
             for x in self._encoded(tasks):
                 seq = x + [self.pair[0]]
-                f.write(struct.pack("<II", len(seq), 1) + struct.pack(f"<{len(seq)}i", *seq) + struct.pack("<I", len(x)))
+                f.write(struct.pack("<II", len(seq), 1) + struct.pack(f"<{len(seq)}i", *seq)
+                        + struct.pack("<I", len(x)))
         os.replace(tmp, path)
         return path
 
@@ -251,10 +265,12 @@ class DetectEnvironment:
     def decide(self, task: Task, score: float, rule: dict) -> Verdict:
         flagged = score < rule["cutoff"]
         return Verdict(task.id, 0, flagged == (task.meta["label"] == "ai"), {},
-                       details={"score": score, "p_human": float(1.0 / (1.0 + np.exp(-score))), "cutoff": rule["cutoff"],
-                                "pred": "ai" if flagged else "human", "label": task.meta["label"], "kind": task.meta["kind"]})
+                       details={"score": score, "p_human": _sigmoid(score), "cutoff": rule["cutoff"],
+                                "pred": "ai" if flagged else "human", "label": task.meta["label"],
+                                "kind": task.meta["kind"]})
 
-    def proxy_spec(self, source_scores: dict[str, float], n_neg: int = 1000, n_pos: int = 600, seed: int = 0) -> list[dict]:
+    def proxy_spec(self, source_scores: dict[str, float], n_neg: int = 1000, n_pos: int = 600,
+                   seed: int = 0) -> list[dict]:
         """Parts of the log-odds store, in store order: a random sample of calibration humans, and the search
         split's AI documents whose source scores are closest to the source's cutoff. The humans are a random
         sample, never the low tail, so the objective can pick each candidate's own hardest ones."""
@@ -269,11 +285,14 @@ class DetectEnvironment:
     def stats_texts(self, n: int, seed: int = 0) -> list[str]:
         """n raw prompt strings from the search split (a fixed random sample) for the importance matrix."""
         pool = [t for t in self._tasks if t.split == "search"]
-        return [chat_prompt(pool[i].prompt["text"]) for i in np.sort(np.random.default_rng(seed).permutation(len(pool))[:n])]
+        pick = np.sort(np.random.default_rng(seed).permutation(len(pool))[:n])
+        return [chat_prompt(pool[i].prompt["text"]) for i in pick]
 
     def token_counts(self) -> dict[str, dict]:
         """{split: {"docs", "tokens"}}, tokens being the prompt plus answer token each forward pass reads."""
-        path = self.cache_dir / f"tokens-{self._key(self._tasks)}.json" if getattr(self, "cache_dir", None) else None
+        path = None
+        if getattr(self, "cache_dir", None):
+            path = self.cache_dir / f"tokens-{self._key(self._tasks)}.json"
         if path and path.exists():
             return json.loads(path.read_text())
         out: dict[str, dict] = {}
@@ -282,7 +301,9 @@ class DetectEnvironment:
             c["docs"], c["tokens"] = c["docs"] + 1, c["tokens"] + len(x) + 1
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(out))
+            tmp = self._tmp(path)
+            tmp.write_text(json.dumps(out))
+            os.replace(tmp, path)
         return out
 
     def run(self, task: Task, client, seed: int) -> Episode:
@@ -323,6 +344,14 @@ def _p_human(entry: dict) -> float:
     if h + a <= 0:
         raise KeyError("neither answer token among the returned probabilities")
     return h / (h + a)
+
+
+def _sigmoid(x: float) -> float:
+    """1 / (1 + e^-x) without overflow at large |x|."""
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1.0 + z)
 
 
 def make_environment(**kwargs) -> DetectEnvironment:
