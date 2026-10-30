@@ -69,6 +69,12 @@ def delta_and_bounds(rows: list[dict], alpha: float, n_boot: int = 0, seed: int 
     return out
 
 
+def empty_ok(b: dict, margin: float) -> bool:
+    """Non-inferiority for bounds that may be empty: True when nothing was measured (n_tasks == 0),
+    otherwise L > -margin."""
+    return b["n_tasks"] == 0 or b["L"] > -margin
+
+
 def discordance(rows: list[dict]) -> dict:
     """v = variance of a single paired difference; deff = (CR1 variance of the task-mean delta) / (iid variance of it).
 
