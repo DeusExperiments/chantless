@@ -9,6 +9,7 @@ model by the batch scorer and judged at that model's own rule, computed from its
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import threading
@@ -125,19 +126,28 @@ class Evaluator:
         return {t.id: float(got[t.id]) for t in tasks}
 
     def rule(self, model: str) -> dict:
-        """The decision rule for this model, from its calibration-split scores; cached in memory and on disk."""
+        """The decision rule for this model, from its calibration-split scores; cached in memory and on disk.
+
+        The disk copy is reused only when its calibration fingerprint (env name, version and sorted task ids)
+        and size match the current environment; otherwise the rule is recomputed and the file replaced.
+        """
         h = self.model_hash(model)
         with self._cls_lock:
             if h not in self._rules:
+                cal = [t for t in self.env.tasks() if t.split == "calibration"]
+                if not cal:
+                    raise ValueError("classifier environment has no calibration tasks")
+                fp = hashlib.sha256(json.dumps([self.env.name, self.env.version, sorted(t.id for t in cal)])
+                                    .encode()).hexdigest()
                 path = self.log_dir / "rules" / f"{h}.json"
-                if path.exists():
-                    self._rules[h] = read_json(path)["rule"]
+                old = read_json(path) if path.exists() else {}
+                if old.get("cal_sha") == fp and old.get("n") == len(cal):
+                    self._rules[h] = old["rule"]
                 else:
-                    cal = [t for t in self.env.tasks() if t.split == "calibration"]
-                    if not cal:
-                        raise ValueError("classifier environment has no calibration tasks")
-                    rule = self.env.calibrate(self._score(model, cal))
-                    write_json(path, {"model": str(model), "sha256_16": h, "n": len(cal), "rule": rule})
+                    scores = self._score(model, cal)
+                    self._scores.setdefault(h, {}).update(scores)  # a calibration task run as a job is not rescored
+                    rule = self.env.calibrate(scores)
+                    write_json(path, {"model": str(model), "sha256_16": h, "n": len(cal), "cal_sha": fp, "rule": rule})
                     self._rules[h] = rule
             return self._rules[h]
 

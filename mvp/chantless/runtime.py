@@ -126,6 +126,7 @@ def imatrix(tc: Toolchain, model: str, text_file: str, out: str, log: str | None
 
 def trj_targets(path: str | os.PathLike) -> list[int]:
     """Number of targets of each trajectory of a TRJ1 file, in file order (tokens are skipped, not read)."""
+    size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(8)
         if len(head) != 8 or head[:4] != b"TRJ1":
@@ -136,8 +137,7 @@ def trj_targets(path: str | os.PathLike) -> list[int]:
             if len(rec) != 8:
                 raise ValueError(f"{path}: truncated")
             nt, ng = struct.unpack("<II", rec)
-            f.seek(4 * nt, 1)
-            if len(f.read(4 * ng)) != 4 * ng:
+            if f.seek(4 * (nt + ng), 1) > size:  # seeking past EOF does not fail by itself
                 raise ValueError(f"{path}: truncated")
             out.append(ng)
     return out
@@ -181,7 +181,8 @@ class BatchScorer:
                 for line in open(part):
                     ti, k, v = line.split("\t")
                     out[offsets[int(ti)] + int(k)] = float(v)
-        miss = np.flatnonzero(np.isnan(out))
+        miss = np.flatnonzero(~np.isfinite(out))
         if len(miss):
-            raise RuntimeError(f"logodds left {len(miss)} of {len(out)} targets of {trj} unscored (first at {miss[0]})")
+            raise RuntimeError(f"logodds left {len(miss)} of {len(out)} targets of {trj} unscored or non-finite "
+                               f"(first at {miss[0]})")
         return out
