@@ -109,6 +109,7 @@
   "cap": "off",
   "floor_key": "task",
   "solo_tiers": [
+   "Q4_K",
    "IQ1_S"
   ]
  },
