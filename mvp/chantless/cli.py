@@ -1,4 +1,5 @@
-"""python -m chantless.cli run --config configs/X.json [--upto PHASE] [--reset PHASE]"""
+"""python -m chantless.cli run --config configs/X.json [--upto PHASE] [--reset PHASE]
+python -m chantless.cli plan --config configs/X.json [--rates R.json]"""
 from __future__ import annotations
 
 import argparse
@@ -17,14 +18,21 @@ def main():
     r.add_argument("--config", required=True)
     r.add_argument("--upto", choices=PHASES)
     r.add_argument("--reset", choices=PHASES, help="clear this phase marker and all later ones")
+    pl = sub.add_parser("plan", help="estimate moves, episodes, tokens, wall-clock and cost without running")
+    pl.add_argument("--config", required=True)
+    pl.add_argument("--rates", help="JSON {backend: {field: value}} merged over plan.RATES")
     a = ap.parse_args()
+    cfg = json.loads(Path(a.config).read_text())
+    if a.cmd == "plan":
+        from .plan import estimate, format_table
+        print(format_table(estimate(cfg, json.loads(Path(a.rates).read_text()) if a.rates else None)))
+        return
     # own process group: a SIGTERM to the run also stops its llama-server / traj-kl / quantize children
     try:
         os.setpgrp()
     except OSError:
         pass
     signal.signal(signal.SIGTERM, lambda *_: os.killpg(os.getpgrp(), signal.SIGKILL))
-    cfg = json.loads(Path(a.config).read_text())
     run = Run(cfg)
     if a.reset:
         for p in PHASES[PHASES.index(a.reset):]:
