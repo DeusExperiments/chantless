@@ -1,5 +1,5 @@
 """python -m chantless.cli run --config configs/X.json [--upto PHASE] [--reset PHASE]
-python -m chantless.cli plan --config configs/X.json [--rates R.json]"""
+python -m chantless.cli plan --config configs/X.json [--rates R.json] [--source MODEL.gguf]"""
 from __future__ import annotations
 
 import argparse
@@ -21,11 +21,16 @@ def main():
     pl = sub.add_parser("plan", help="estimate moves, episodes, tokens, wall-clock and cost without running")
     pl.add_argument("--config", required=True)
     pl.add_argument("--rates", help="JSON {backend: {field: value}} merged over plan.RATES")
+    pl.add_argument("--source", help="local copy of the source GGUF, read for its header in place of the config's path")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     if a.cmd == "plan":
         from .plan import estimate, format_table
-        print(format_table(estimate(cfg, json.loads(Path(a.rates).read_text()) if a.rates else None)))
+        try:
+            est = estimate(cfg, json.loads(Path(a.rates).read_text()) if a.rates else None, a.source)
+        except (FileNotFoundError, ValueError) as e:
+            raise SystemExit(f"plan: {e}")
+        print(format_table(est))
         return
     # own process group: a SIGTERM to the run also stops its llama-server / traj-kl / quantize children
     try:

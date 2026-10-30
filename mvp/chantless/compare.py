@@ -15,14 +15,18 @@ def cutoff(cal, rate: float = 0.01) -> float:
     cal = np.sort(np.asarray(cal, dtype=float))
     if not len(cal):
         raise ValueError("empty calibration set")
+    if not np.isfinite(cal).all():
+        raise ValueError(f"{int((~np.isfinite(cal)).sum())} non-finite calibration scores")
     return float(cal[int(rate * len(cal))])
 
 
 def _rate(flag, sel, boot):
+    if not sel.any():   # nothing to measure: NaN, never a measured zero
+        return {"caught": float("nan"), "ci": [float("nan"), float("nan")], "n": 0}
     fb, sb = flag[boot], sel[boot]
     dist = (fb & sb).sum(1) / np.maximum(sb.sum(1), 1)
-    point = float(flag[sel].mean()) if sel.any() else float("nan")
-    return {"caught": point, "ci": [float(np.percentile(dist, 2.5)), float(np.percentile(dist, 97.5))], "n": int(sel.sum())}
+    return {"caught": float(flag[sel].mean()), "ci": [float(np.percentile(dist, 2.5)), float(np.percentile(dist, 97.5))],
+            "n": int(sel.sum())}
 
 
 def compare(models: dict, labels: dict, kinds: dict, groups_of=None, boot: int = 1000, seed=0) -> dict:
@@ -33,19 +37,31 @@ def compare(models: dict, labels: dict, kinds: dict, groups_of=None, boot: int =
     groups_of: the kinds reported separately (each restricted to positives); None reports every positive
     kind when there are at least two. `seed` may be a numpy Generator, which is then advanced in place: one
     shared Generator over successive calls (test, then Beemo) reproduces measure.py's resamples exactly.
+    A label other than "pos"/"neg", or a non-finite score, is an error. A selection with no documents reports
+    NaN with a NaN interval.
     """
     names = list(models)
     if not names:
         raise ValueError("no models")
+    if boot < 1:
+        raise ValueError(f"boot must be at least 1, got {boot}")
     rng = np.random.default_rng(seed)
-    cuts = {m: cutoff(models[m]["cal"]) for m in names}
+    cuts = {}
+    for m in names:
+        try:
+            cuts[m] = cutoff(models[m]["cal"])
+        except ValueError as e:
+            raise ValueError(f"model {m}: {e}") from None
     ids = sorted(set(labels).intersection(*(set(models[m]["scores"]) for m in names)))
     if not ids:
         raise ValueError("no document was scored by every model")
+    bad = next((i for i in ids if labels[i] not in ("pos", "neg")), None)
+    if bad is not None:
+        raise ValueError(f"label of {bad!r} is {labels[bad]!r}; labels must be 'pos' or 'neg'")
     pos = np.array([labels[i] == "pos" for i in ids])
     kind = np.array([kinds.get(i, "") for i in ids])
     if groups_of is None:
-        ks = sorted(set(kind[pos]))
+        ks = sorted(str(k) for k in set(kind[pos]))
         groups_of = ks if len(ks) > 1 else []
     sel_k = {k: pos & (kind == k) for k in groups_of}
     idx = rng.integers(0, len(ids), (boot, len(ids)))
@@ -53,7 +69,11 @@ def compare(models: dict, labels: dict, kinds: dict, groups_of=None, boot: int =
            "unmatched": {m: len(models[m]["scores"]) - len(ids) for m in names}, "cutoffs": cuts, "bootstrap": boot,
            "models": {}}
     for m in names:
-        flag = np.array([models[m]["scores"][i] for i in ids], dtype=float) < cuts[m]
+        x = np.array([models[m]["scores"][i] for i in ids], dtype=float)
+        if not np.isfinite(x).all():
+            j = int(np.flatnonzero(~np.isfinite(x))[0])
+            raise ValueError(f"model {m}: score of {ids[j]!r} is {x[j]}")
+        flag = x < cuts[m]
         neg = _rate(flag, ~pos, idx)
         out["models"][m] = {"neg_flagged": neg["caught"], "neg_ci": neg["ci"], "pos": _rate(flag, pos, idx),
                             "kinds": {k: _rate(flag, s, idx) for k, s in sel_k.items()}}

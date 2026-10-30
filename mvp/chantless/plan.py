@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import numbers
 from collections import Counter
 from pathlib import Path
 
@@ -71,14 +72,12 @@ class SizeModel:
         return self.overhead + self.fixed + sum(self.group_bytes(g, e["tier"]) for g, e in m["groups"].items())
 
 
-def _token_stats(env, A: list) -> dict:
-    """{split: {"n": tasks, "mean": tokens per task}} from env.token_counts(), whatever shape it returns."""
-    n_split = Counter(t.split for t in env.tasks())
-    raw = env.token_counts()
+def _token_stats(raw: dict, n_split: Counter, A: list) -> dict:
+    """{split: {"n": tasks, "mean": tokens per task}} from what env.token_counts() returned, whatever its shape."""
     out = {}
     for s, v in raw.items():
         n = n_split.get(s, 0)
-        if isinstance(v, (int, float)):
+        if isinstance(v, numbers.Number):   # numpy scalars included
             total = float(v)
         elif isinstance(v, dict) and "mean" in v:
             out[s] = {"n": int(v.get("n", n)), "mean": float(v["mean"])}
@@ -147,19 +146,31 @@ def _moves(cfg, sm: SizeModel, start: dict, A: list) -> dict:
     return out
 
 
-def estimate(cfg: dict, rates: dict | None = None) -> dict:
-    """Counts, tokens and per-backend wall-clock and cost of running `cfg`; `rates` overrides or extends RATES."""
+def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) -> dict:
+    """Counts, tokens and per-backend wall-clock and cost of running `cfg`; `rates` overrides or extends RATES.
+
+    `source` replaces cfg["source"]["gguf"] for reading the header only (a box config's model path on a laptop).
+    """
     A: list[str] = []
     rt = copy.deepcopy(RATES)
     for k, v in (rates or {}).items():
         rt[k] = {**rt.get(k, {}), **v}
+        miss = [f for f in ("tflops", "gpus", "decode_gbps", "build_s_per_gb", "build_parallel", "usd_per_hour") if f not in rt[k]]
+        if miss:
+            raise ValueError(f"rates[{k!r}] is a new backend and lacks {', '.join(miss)}")
     run_dir = Path(cfg["run_root"]) / cfg["run_id"]
     lc, st, pc, sc = cfg.get("learner", {}), cfg.get("stats", {}), cfg.get("pool", {}), cfg.get("sanity", {})
     px, scr = cfg.get("proxy", {}), cfg.get("screen", {})
     ladder = cfg["ladder"]
 
     # ---- model and groups
-    sm = SizeModel(cfg["source"]["gguf"])
+    src = source or cfg["source"]["gguf"]
+    if not Path(src).exists():
+        raise FileNotFoundError(f"source GGUF {src} not found: the plan reads its header for groups and sizes; "
+                                "pass --source PATH to a local copy of the same model")
+    if source:
+        A.append(f"source header read from {source}, standing in for the config's {cfg['source']['gguf']}")
+    sm = SizeModel(src)
     groups = sm.groups
     imx = run_dir / "proxy" / "imatrix.gguf"
     if imx.exists():
@@ -193,11 +204,15 @@ def estimate(cfg: dict, rates: dict | None = None) -> dict:
         env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
         classifier = bool(getattr(env, "classifier", False))
         avail = Counter(t.split for t in env.tasks())
-        if callable(getattr(env, "token_counts", None)):
-            toks = _token_stats(env, A)
     except Exception as e:  # noqa: BLE001 - a plan must still print without the data
         avail = Counter()
         A.append(f"environment not loaded ({type(e).__name__}: {str(e)[:120]}); split sizes taken from the config")
+    if env is not None and callable(getattr(env, "token_counts", None)):
+        try:
+            toks = _token_stats(env.token_counts(), avail, A)
+        except Exception as e:  # noqa: BLE001
+            toks = {}
+            A.append(f"token_counts() unreadable ({type(e).__name__}: {str(e)[:120]}): 1,000 prompt tokens per task")
     if toks is None:
         toks = {}
         A.append("no env.token_counts(): 1,000 prompt tokens per task")
@@ -273,7 +288,8 @@ def estimate(cfg: dict, rates: dict | None = None) -> dict:
     if n_fb:
         A.append("feedback: every screen is assumed to yield failures (one failure store and one revert trial per windowed move)")
     if rounds:
-        A.append(f"exchange: {rounds} rounds (learner.exchange_rounds), each a sweep with one rung up plus exchange_top_k pairs")
+        A.append(f"exchange: {rounds} rounds (learner.exchange_rounds), each a sweep with one rung up plus exchange_top_k pairs; "
+                 "legal moves counted on the start mask, not the mask the search reaches")
     # exam baselines, as exam_baselines() picks them, at the estimated bytes of the target
     target_b = moves["target_bytes"] or moves["start_bytes"]
     blk = [g for g in real if g.startswith("blk.")]
@@ -305,6 +321,8 @@ def estimate(cfg: dict, rates: dict | None = None) -> dict:
         n_cal = avail.get("calibration") or toks.get("calibration", {}).get("n", 0)
         cal_tok = n_cal * mean("calibration")
         n_models = 1 + n_screens + 1 + n_base_models
+        if not n_cal:
+            A.append("calibration split size unknown (no calibration tasks or token counts): calibration not charged")
         A.append(f"classifier: each distinct task scored once per model and per evaluation call; {n_models} models calibrated "
                  f"on {n_cal} calibration documents (source, one per screen, the final mask, the exam baselines); a gate "
                  "re-uses the rule of the screen on the same mask")
