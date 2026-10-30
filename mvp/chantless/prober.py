@@ -5,6 +5,8 @@ Stores (computed once from the frozen source; never moved with candidate weights
   general  KL on general text + code (size-matched sanity cap)
   fb_k     KL on candidate failure trajectories added by learner feedback (decision S4)
 In improve mode the task proxy is the candidate's NLL on verified-successful trajectories instead of KL.
+A store of kind "logodds" (classifier environments) instead scores the candidate's log-odds at each
+trajectory's answer and records an objectives.OBJECTIVES damage against the source's, as both kl and nll.
 """
 from __future__ import annotations
 
@@ -15,7 +17,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import kl
+import numpy as np
+
+from . import kl, objectives
 from .builder import Builder, mask_key
 from .runtime import Toolchain
 
@@ -27,6 +31,8 @@ class Store:
     dir: str
     n_targets: int
     weight: float = 1.0
+    kind: str = "kl"        # "logodds": trj is meta["parts"] concatenated, dir holds source.npy
+    meta: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -51,8 +57,8 @@ class ProbeResult:
 
 class Prober:
     def __init__(self, tc: Toolchain, builder: Builder, work: str | Path, log: str | None, workers: int | None = None,
-                 scratch: str | Path | None = None):
-        self.tc, self.builder = tc, builder
+                 scratch: str | Path | None = None, scorer=None):
+        self.tc, self.builder, self.scorer = tc, builder, scorer   # scorer: runtime.BatchScorer, for logodds stores
         self.work = Path(work)                       # receipts (persist; resume reads them)
         self.work.mkdir(parents=True, exist_ok=True)
         self.scratch = Path(scratch) if scratch else self.work   # built candidates (deleted after scoring)
@@ -64,9 +70,35 @@ class Prober:
         self._cv = threading.Condition()
         self.cache: dict[str, ProbeResult] = {}
         self.workers = workers or max(1, len(tc.gpus))   # > n_gpus overlaps CPU builds with GPU scoring
+        self._src: dict[str, dict] = {}                   # logodds store -> source parts
 
     def add_store(self, s: Store) -> None:
+        if s.kind not in ("kl", "logodds"):
+            raise ValueError(f"store {s.name}: unknown kind {s.kind!r}")
+        if s.kind == "logodds":
+            if self.scorer is None:
+                raise ValueError(f"store {s.name}: a logodds store needs Prober(scorer=...)")
+            self._check_meta(s)
         self.stores.append(s)
+
+    @staticmethod
+    def _check_meta(s: Store) -> None:
+        """Fail at add_store, not inside a probe worker, on a malformed logodds meta."""
+        m, err = s.meta, f"store {s.name}: logodds meta"
+        parts = m.get("parts")
+        if not isinstance(parts, list) or not parts:
+            raise ValueError(f"{err} needs a non-empty 'parts' list")
+        for p in parts:
+            if not isinstance(p, dict) or "name" not in p or p.get("role") not in ("pos", "neg") \
+                    or not isinstance(p.get("n"), int) or p["n"] <= 0:
+                raise ValueError(f"{err}: bad part {p!r} (needs name, role pos|neg, n > 0)")
+        if {p["role"] for p in parts} != {"pos", "neg"}:
+            raise ValueError(f"{err} needs at least one pos part and one neg part")
+        pair = m.get("pair")
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(isinstance(t, int) for t in pair):
+            raise ValueError(f"{err}: 'pair' must be two ints, got {pair!r}")
+        if m.get("objective") not in objectives.OBJECTIVES:
+            raise ValueError(f"{err}: unknown objective {m.get('objective')!r} (have {sorted(objectives.OBJECTIVES)})")
 
     def _gpu(self):
         with self._cv:
@@ -96,6 +128,9 @@ class Prober:
                     continue
                 if gate and s.name != "general" and "general" in res.kl and not gate(res):
                     break
+                if s.kind == "logodds":
+                    res.kl[s.name] = res.nll[s.name] = self._logodds(b.path, s, key, g)
+                    continue
                 r = kl.traj_kl(self.tc, "kl", b.path, s.trj, s.dir, str(self.work / f"p-{key}-{s.name}.json"), self.log, gpu=g)
                 res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
         finally:
@@ -105,6 +140,40 @@ class Prober:
         self.cache[key] = res
         (self.work / f"p-{key}-meta.json").write_text(json.dumps({"bytes": res.bytes, "bpw": res.bpw, "fallbacks": res.fallbacks}))
         return res
+
+    @staticmethod
+    def _split(s: Store, x: np.ndarray) -> dict:
+        """Per-trajectory scores in meta["parts"] order -> {"pos": array, "neg": array}."""
+        parts = s.meta["parts"]
+        if len(x) != sum(p["n"] for p in parts):
+            raise RuntimeError(f"store {s.name}: {len(x)} scores for {sum(p['n'] for p in parts)} trajectories")
+        out, i = {"pos": [], "neg": []}, 0
+        for p in parts:
+            out[p["role"]].append(x[i: i + p["n"]])
+            i += p["n"]
+        return {k: np.concatenate(v) if v else np.zeros(0) for k, v in out.items()}
+
+    @staticmethod
+    def _finite(s: Store, x: np.ndarray, what: str) -> np.ndarray:
+        bad = int((~np.isfinite(x)).sum())
+        if bad:
+            raise RuntimeError(f"store {s.name}: {bad} of {len(x)} {what} scores are not finite")
+        return x
+
+    def _logodds(self, model: str, s: Store, key: str, gpu: str) -> float:
+        """Objective damage of the candidate on a logodds store. The receipt keeps "kl" and "nll_cand" for _from_disk."""
+        if s.name not in self._src:
+            src = np.asarray(np.load(Path(s.dir) / "source.npy"), dtype=np.float64)
+            self._src[s.name] = self._split(s, self._finite(s, src, "source"))
+        x = np.asarray(self.scorer.score_trj(model, s.trj, tuple(s.meta["pair"]), gpu=gpu), dtype=np.float64)
+        cand = self._split(s, self._finite(s, x, "candidate"))
+        args = s.meta.get("objective_args", {})
+        v = float(objectives.OBJECTIVES[s.meta["objective"]](cand, self._src[s.name], **args))
+        np.save(self.work / f"p-{key}-{s.name}.npy", x)
+        (self.work / f"p-{key}-{s.name}.json").write_text(json.dumps(
+            {"kl": v, "nll_cand": v, "kind": "logodds", "objective": s.meta["objective"], "objective_args": args,
+             "n_pos": int(len(cand["pos"])), "n_neg": int(len(cand["neg"]))}))
+        return v
 
     def _from_disk(self, key: str):
         """Resume support: reload receipts of probes already measured in this run/tag (same weights, same stores)."""
@@ -117,6 +186,8 @@ class Prober:
             f = self.work / f"p-{key}-{s.name}.json"
             if f.exists():
                 r = json.loads(f.read_text())
+                if r.get("kind", "kl") != s.kind:   # same store name, other kind (classifier flag flipped): re-probe
+                    continue
                 res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
         return res
 
@@ -127,3 +198,4 @@ class Prober:
     def invalidate(self) -> None:
         """Called when weights change (repair) or stores change; cached KL values become stale."""
         self.cache.clear()
+        self._src.clear()
