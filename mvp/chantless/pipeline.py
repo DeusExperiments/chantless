@@ -242,7 +242,7 @@ class Run:
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "search" and r["success"] and r["task"] in rel_search:
                 try:
-                    rr = R.episode(r["messages"], _tools())
+                    rr = R.episode(r["messages"], _tools(self.env))
                 except kl.RenderError as e:
                     self.log(f"proxy: reject {r['task']}: {e}")
                     continue
@@ -310,10 +310,13 @@ class Run:
         pts = [(bmod_bpw(src_bytes, P.builder.source_params), 0.0)] + [(u["bpw"], u["kl_gen"]) for u in uniform.values()]
         cap = sanity.SizeMatchedCap(pts)
         selfkl = read_json(self.dir / "proxy" / "proxy.json")["self_kl"]
+        # The floor is judged against the first rung the search can move to; a search that starts at Q8_0 and
+        # steps straight to Q4_K never has to resolve BF16-vs-Q8_0 differences
+        ft = self.cfg["proxy"].get("floor_tier", "Q8_0")
         for name, key in (("general", "kl_gen"), ("task", "kl_task")):
-            q8 = uniform["Q8_0"][key]
-            if selfkl[name] > 0.05 * q8:
-                raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform Q8_0 KL {q8}")
+            ref = uniform[ft][key]
+            if selfkl[name] > 0.05 * ref:
+                raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
         solo, masks, keys = {}, [], []
         for g in base["groups"]:
             tiers = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
@@ -383,7 +386,9 @@ class Run:
         import contextlib
         stack = contextlib.ExitStack()
         cs = stack.enter_context(self.ev.servers(model))
-        ss = stack.enter_context(self.ev.servers(self.src))
+        sbank = self._source_bank(split, tasks)
+        ss = stack.enter_context(self.ev.servers(self.src)) if sbank is None else None
+        (self.dir / "episodes" / f"gate-{tag}-src.jsonl").unlink(missing_ok=True)
         for look in range(1, looks + 1):
             lo, hi = (look - 1) * k // looks, look * k // looks
             if hi <= lo:
@@ -391,7 +396,13 @@ class Run:
             cj = [(t, s) for t in tasks for s in self.seeds(f"gate-{tag}-cand", t.id, k)[lo:hi]]
             sj = [(t, s) for t in tasks for s in self.seeds(f"gate-{tag}-src", t.id, k)[lo:hi]]
             rows += ok_rows(self.ev.run(model, cj, f"gate-{tag}-cand", "cand", srvs=cs))
-            rows += ok_rows(self.ev.run(self.src, sj, f"gate-{tag}-src", "src", srvs=ss))
+            if sbank is None:
+                rows += ok_rows(self.ev.run(self.src, sj, f"gate-{tag}-src", "src", srvs=ss))
+            else:
+                reused = [dict(sbank[t.id], seed=s, side="src") for t, s in sj]
+                for r in reused:
+                    append_jsonl(self.dir / "episodes" / f"gate-{tag}-src.jsonl", r)
+                rows += reused
             res = stats.sequential_decision(rows, look, looks, st["margin"], st["alpha"], final=(look == looks))
             self.log(f"gate {tag} look {look}/{looks}: delta={res['delta']:+.4f} L={res['L']:+.4f} U={res['U']:+.4f} -> {res['decision']}")
             if res["decision"] != "continue":
@@ -413,6 +424,45 @@ class Run:
         self.record("gates", {k_: v for k_, v in res.items() if k_ not in ("detectors",)})
         return res
 
+    def _source_bank(self, split: str, tasks) -> dict | None:
+        """The source's recorded result per task, when stats.reuse_source is set and every task has one.
+
+        Only valid for a deterministic environment (detect: one greedy forward pass), where re-scoring the
+        frozen source returns the same row. Select rows come from the pool and A/A episodes, exam rows from
+        the exam-pool episodes."""
+        if not self.cfg["stats"].get("reuse_source"):
+            return None
+        files = ["pool.jsonl", "aa-A.jsonl", "aa-B.jsonl"] if split != "exam" else ["exam-pool.jsonl"]
+        bank = {}
+        for f in files:
+            p = self.dir / "episodes" / f
+            for r in (read_jsonl(p) if p.exists() else []):
+                if r["success"] is not None and r["split"] == split:
+                    bank.setdefault(r["task"], {k: v for k, v in r.items() if k not in ("messages", "final", "verdict")})
+        return bank if all(t.id in bank for t in tasks) else None
+
+    def _exam_pool_from_scores(self, ex_tasks) -> list[dict]:
+        """Exam-pool source rows from the source's recorded per-document scores (exam.source_scores), instead
+        of a fresh source pass; a row counts as success when the label at the environment's cutoff is right."""
+        import glob
+        sc = {}
+        for f in glob.glob(str(Path(self.cfg["exam"]["source_scores"]) / "*.jsonl")):
+            for r in read_jsonl(f):
+                sc[r["id"]] = r
+        rows = []
+        out = self.dir / "episodes" / "exam-pool.jsonl"
+        out.unlink(missing_ok=True)
+        for t in ex_tasks:
+            r = sc[t.id.split(":", 1)[1]]
+            assert r["label"] == t.meta["label"], t.id
+            pred = "ai" if r["p_human"] < self.env.cutoff else "human"
+            row = {"task": t.id, "family": t.family, "split": t.split, "seed": 0, "side": "src", "success": pred == r["label"],
+                   "tests_passed": pred == r["label"], "detectors": {}, "infra_error": None, "turns": 1, "tokens": 1, "wall_s": 0.0,
+                   "p_human": r["p_human"], "reused_from": self.cfg["exam"]["source_scores"]}
+            append_jsonl(out, row)
+            rows.append(row)
+        return rows
+
     # ------------------------------------------------------------------ search
     def _failure_store(self, eps_rows: list[dict], name: str) -> dict | None:
         """Render failed trajectories, compute the frozen-source reference on them, register as a store."""
@@ -420,7 +470,7 @@ class Run:
         recs = []
         for r in eps_rows:
             try:
-                recs += R.episode(r["messages"], _tools() if r.get("family") in self._task_families() else None)
+                recs += R.episode(r["messages"], _tools(self.env) if r.get("family") in self._task_families() else None)
             except kl.RenderError:
                 continue
         if not recs:
@@ -458,6 +508,9 @@ class Run:
                 break
             if S.accepted >= lc.get("max_moves", 10 ** 9):
                 stop_reason = "max_moves"
+                break
+            if base.bytes <= lc.get("target_bytes", 0):
+                stop_reason = "target_bytes"
                 break
             best = L.step(S, base)
             if best is None:
@@ -497,7 +550,8 @@ class Run:
                         break
                 consecutive_fail = 0
                 last_screen = S.mask
-                L.full_reprobe(S, base)
+                if lc.get("reprobe_after_screen", True):
+                    L.full_reprobe(S, base)
                 if S.accepted % lc["gate_every"] == 0:
                     g = self.gate(P.builder.build(S.mask, self.scratch / "build" / "gate.gguf").path, f"m{S.accepted:04d}")
                     if not g["pass"]:
@@ -539,7 +593,7 @@ class Run:
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "train" and r["success"]:
                 try:
-                    recs += R.episode(r["messages"], _tools())
+                    recs += R.episode(r["messages"], _tools(self.env))
                 except kl.RenderError:
                     pass
         if not recs:
@@ -631,7 +685,10 @@ class Run:
         rng = random.Random(stable_seed(self.cfg["run_id"], "exam-pool"))
         rng.shuffle(ex_tasks)
         ex_tasks = ex_tasks[: pc["tasks_per_split"].get("exam", pc["tasks_per_split"]["select"])]
-        rows = ok_rows(self.ev.run(self.src, self.jobs("exam-pool", ex_tasks, pc["runs"]), "exam-pool", "src"))
+        if self.cfg["exam"].get("source_scores"):
+            rows = self._exam_pool_from_scores(ex_tasks)
+        else:
+            rows = ok_rows(self.ev.run(self.src, self.jobs("exam-pool", ex_tasks, pc["runs"]), "exam-pool", "src"))
         per = {}
         for r in rows:
             per.setdefault(r["task"], []).append(r["success"])
@@ -660,7 +717,12 @@ class Run:
         best = None
         rankings = {}
         for name, (b_t, rank_t, dep_t) in recipes.items():
+            if not {b_t, rank_t, dep_t} <= set(self.ladder):  # a recipe needs every tier it uses on this run's ladder
+                continue
             bm = self.uniform_mask(base, b_t)
+            if uniform.get(b_t, {}).get("bytes", 0) > target and mk.rank(dep_t) < mk.rank(b_t):
+                self.log(f"baseline {name}: skipped, its {b_t} base ({uniform[b_t]['bytes']:,} B) already exceeds the target and restores only add bytes")
+                continue
             floor = P.probe(bm, ["task"]).kl["task"]
             gains = [(floor - r.kl["task"], g) for g, r in zip(blk, P.probe_many([mk.apply(bm, g, rank_t) for g in blk], ["task"]))]
             ranked = [g for gain, g in sorted(gains, reverse=True) if gain > 0]
@@ -681,7 +743,8 @@ class Run:
                 bk, mm = bytes_k(k)
                 if best is None or abs(bk - target) < best[0]:
                     best = (abs(bk - target), f"dynquant-{name}-K{k}", mm)
-        cands[best[1]] = best[2]
+        if best:
+            cands[best[1]] = best[2]
         ranked = rankings
         out = {"target_bytes": target, "ranking": ranked, "points": {}}
         n = self.cfg["exam"]["baseline_eps_per_task"]
@@ -743,6 +806,9 @@ def bmod_bpw(nbytes: int, params: int) -> float:
     return nbytes * 8 / params
 
 
-def _tools():
+def _tools(env):
+    """The tool schema the environment's episodes were rendered with; codetasks predates the attribute."""
+    if hasattr(env, "tools"):
+        return env.tools
     from .env.codetasks import TOOLS
     return TOOLS

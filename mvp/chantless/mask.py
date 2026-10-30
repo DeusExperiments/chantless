@@ -13,7 +13,7 @@ SCHEMA = "chantless.mask/v2"
 LEGACY = "onlyskills.mask/v1"
 
 # Cheapening order. BF16 is the source representation; `drop` is physical removal.
-LADDER = ["BF16", "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K", "IQ2_XS"]
+LADDER = ["BF16", "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K", "IQ2_XS", "IQ1_S"]
 DROP = "drop"
 IMATRIX_REQUIRED = {"IQ2_XS", "IQ2_XXS", "IQ1_M", "IQ1_S"}
 

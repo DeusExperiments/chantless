@@ -66,16 +66,17 @@ class Learner:
     # ---- scoring
     def evaluate(self, state: LearnerState, moves: list[Move], base_res) -> list[dict]:
         masks = [mk.apply(state.mask, mv.group, mv.tier) for mv in moves]
-        res = self.prober.probe_many(masks)
+        # An illegal move's task score is never used, so its task stores are skipped once the general cap fails
+        res = self.prober.probe_many(masks, gate=lambda r: r.kl["general"] <= self.cap(r.bpw))
         base_p = base_res.task_proxy(self.prober.stores, self.mode)
         out = []
         for mv, r in zip(moves, res):
             d_bytes = base_res.bytes - r.bytes
-            d_proxy = r.task_proxy(self.prober.stores, self.mode) - base_p
-            pen = 1.0 + state.penalties.get(mv.group, 0.0)
-            score = (max(d_proxy, 0.0) * pen + 1e-12) / d_bytes if d_bytes > 0 else float("inf")
             cap = self.cap(r.bpw)
             legal = d_bytes > 0 and r.kl["general"] <= cap
+            d_proxy = r.task_proxy(self.prober.stores, self.mode) - base_p if legal else float("nan")
+            pen = 1.0 + state.penalties.get(mv.group, 0.0)
+            score = (max(d_proxy, 0.0) * pen + 1e-12) / d_bytes if legal else float("inf")
             row = {"move": mv.key, "score": score, "d_proxy": d_proxy, "d_bytes": d_bytes, "kl_general": r.kl["general"],
                    "cap": cap, "bpw": r.bpw, "legal": legal, "penalty": pen - 1.0, "bytes": r.bytes}
             state.cache[mv.key] = score if legal else float("inf")
@@ -138,7 +139,7 @@ class Learner:
                 continue
             m = mk.apply(state.mask, w["group"], w["from"])
             trials.append((w, m))
-        res = self.prober.probe_many([m for _, m in trials])
+        res = self.prober.probe_many([m for _, m in trials], [fb_store_name])  # the decision reads only this store
         gains = []
         for (w, _), r in zip(trials, res):
             v = r.kl[fb_store_name] if self.mode == "preserve" else r.nll[fb_store_name]

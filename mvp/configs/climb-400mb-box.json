@@ -1,0 +1,5 @@
+{"out": "/root/chantless/climb", "data": "/root/chantless/L/detect/climb/data",
+ "source": "/root/chantless/L/detect/mask/detector-bf16.gguf", "source_repo": "tokenbender/chantless-detect-qwen35-0.8b", "source_revision": "5e2c4b7817f404930413d48b6b4f6ce629847c14",
+ "groups": "/root/chantless/L/detect/mask/runs/detect-400mb-002/groups.json", "imatrix": "/root/chantless/L/detect/mask/runs/detect-400mb-002/proxy/imatrix.gguf",
+ "llama_bin": "/root/chantless/llama.cpp/build/bin", "logodds": "/root/chantless/bin/logodds", "gpus": [0,1,2,3,4,5,6,7], "procs_per_gpu": 2, "quantize_threads": 8,
+ "budget_bytes": 400000000, "exchange_rounds": 6, "finalists": 4, "r_humans": 1000, "r_ai_max": 600}

@@ -79,20 +79,23 @@ class Prober:
             self._free.append(g)
             self._cv.notify()
 
-    def probe(self, mask: dict, stores: list[str] | None = None, keep: bool = False) -> ProbeResult:
+    def probe(self, mask: dict, stores: list[str] | None = None, keep: bool = False, gate=None) -> ProbeResult:
+        """`gate(res)` is checked after the general store; when it returns False the other stores are skipped."""
         key = mask_key(mask)
         want = stores or [s.name for s in self.stores]
         cached = self.cache.get(key) or self._from_disk(key)
-        if cached and all(n in cached.kl for n in want):
+        if cached and (all(n in cached.kl for n in want) or (gate and "general" in cached.kl and not gate(cached))):
             self.cache[key] = cached
             return cached
         b = self.builder.build(mask, self.scratch / f"p-{key}.gguf")
         res = cached or ProbeResult(key, b.file_bytes, b.bpw, fallbacks=b.fallbacks)
         g = self._gpu()
         try:
-            for s in self.stores:
+            for s in sorted(self.stores, key=lambda s: s.name != "general"):
                 if s.name not in want or s.name in res.kl:
                     continue
+                if gate and s.name != "general" and "general" in res.kl and not gate(res):
+                    break
                 r = kl.traj_kl(self.tc, "kl", b.path, s.trj, s.dir, str(self.work / f"p-{key}-{s.name}.json"), self.log, gpu=g)
                 res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
         finally:
@@ -117,9 +120,9 @@ class Prober:
                 res.kl[s.name], res.nll[s.name] = float(r["kl"]), float(r["nll_cand"])
         return res
 
-    def probe_many(self, masks: list[dict], stores: list[str] | None = None) -> list[ProbeResult]:
+    def probe_many(self, masks: list[dict], stores: list[str] | None = None, gate=None) -> list[ProbeResult]:
         with ThreadPoolExecutor(self.workers) as ex:
-            return list(ex.map(lambda m: self.probe(m, stores), masks))
+            return list(ex.map(lambda m: self.probe(m, stores, gate=gate), masks))
 
     def invalidate(self) -> None:
         """Called when weights change (repair) or stores change; cached KL values become stale."""
