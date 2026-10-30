@@ -4,7 +4,7 @@
  "source": {
   "repo": "tokenbender/chantless-detect-qwen35-0.8b",
   "revision": "5e2c4b7817f404930413d48b6b4f6ce629847c14",
-  "hf_dir": "/root/chantless/L/detect/runs/qwen/final",
+  "hf_dir": "/root/chantless/L/detect/runs/qwen/tok",
   "gguf": "/root/chantless/L/detect/mask/detector-bf16.gguf"
  },
  "toolchain": {
@@ -27,7 +27,7 @@
   "module": "chantless.env.detect",
   "kwargs": {
    "data_dir": "/root/chantless/L/detect/hf-raw",
-   "hf_dir": "/root/chantless/L/detect/runs/qwen/final",
+   "hf_dir": "/root/chantless/L/detect/runs/qwen/tok",
    "classifier": true,
    "cutoff": null,
    "calibration_ids_file": "/root/chantless/cal_ids_smoke.json",
@@ -157,6 +157,31 @@
   "max_pruned": 64
  },
  "scoring": {
-  "slots_per_gpu": 2
+  "slots_per_gpu": 2,
+  "seed": {
+   "check": 64,
+   "files": [
+    {
+     "prefix": "wo-cal",
+     "npy": "/root/chantless/L/detect/climb/climb/scores/source-cal.npy",
+     "ids": "/root/chantless/L/detect/climb/data/cal.json"
+    },
+    {
+     "prefix": "wo-val",
+     "npy": "/root/chantless/L/detect/climb/climb/scores/source-val.npy",
+     "ids": "/root/chantless/L/detect/climb/data/val.json"
+    },
+    {
+     "prefix": "wo-test",
+     "npy": "/root/chantless/L/detect/climb/climb/scores/source-test.npy",
+     "ids": "/root/chantless/L/detect/climb/data/test.json"
+    },
+    {
+     "prefix": "beemo",
+     "npy": "/root/chantless/L/detect/climb/climb/scores/source-beemo.npy",
+     "ids": "/root/chantless/L/detect/climb/data/beemo.json"
+    }
+   ]
+  }
  }
 }

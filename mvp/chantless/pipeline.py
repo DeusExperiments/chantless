@@ -78,10 +78,32 @@ class Run:
             self.scorer = BatchScorer(self.tc, cfg.get("scoring", {}).get("slots_per_gpu", 2))
             self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
                                 cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes", scorer=self.scorer)
+            if cfg.get("scoring", {}).get("seed"):
+                self._seed_source_scores(cfg["scoring"]["seed"])
         else:
             self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
                                 cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes")
         self.t0 = time.time()
+
+    def _seed_source_scores(self, sd: dict):
+        """Reuse the source's recorded scores from an earlier run of the same source file and tokenisation
+        (scoring.seed: {"files": [{"prefix", "npy", "ids"}], "check": n}). A random sample is rescored first;
+        any disagreement beyond 1e-3 in log-odds refuses the whole seed and the run scores fresh."""
+        import numpy as np
+        rec = {}
+        for f in sd["files"]:
+            ids = [m["id"] for m in json.loads(Path(f["ids"]).read_text())]
+            vals = np.load(f["npy"])
+            assert len(ids) == len(vals), f["npy"]
+            rec.update({f"{f['prefix']}:{i}": float(v) for i, v in zip(ids, vals) if f"{f['prefix']}:{i}" in self.by_id})
+        sample = random.Random(20261030).sample(sorted(rec), min(sd.get("check", 64), len(rec)))
+        fresh = self.env.score([self.by_id[i] for i in sample], self.src, self.scorer)
+        worst = max(abs(fresh[i] - rec[i]) for i in sample)
+        if worst > 1e-3:   # another backend or build: score fresh instead
+            self.log(f"seed refused: recorded source scores disagree with a fresh pass by {worst:.2e}; scoring fresh")
+            return
+        self.ev.seed(self.src, rec)
+        self.log(f"seeded {len(rec):,} source scores from earlier receipts; {len(sample)} rescored, worst |diff| {worst:.1e}")
 
     def annotate_imatrix(self, path):
         import gguf
@@ -290,7 +312,7 @@ class Run:
         pdir = self.dir / "proxy"
         pdir.mkdir(exist_ok=True)
         by_split = lambda sp: [t for t in self.env.tasks() if t.split == sp]
-        src_scores = self.env.score(by_split("calibration") + by_split("search"), self.src, self.scorer)
+        src_scores = self.ev.scores(self.src, by_split("calibration") + by_split("search"))
         parts = self.env.proxy_spec(src_scores, **pc.get("spec", {}))
         tasks = [self.by_id[i] for p in parts for i in p["ids"]]
         trj = pdir / "task.bin"
@@ -836,7 +858,7 @@ class Run:
         strip = lambda i: i.split(":", 1)[1]
         models = {}
         for name, path in (("specialist", spec), ("source", self.src)):
-            sc = self.env.score(cal + tasks, path, self.scorer)
+            sc = self.ev.scores(path, cal + tasks)
             models[name] = {"cal": np.array([sc[t.id] for t in cal]), "scores": {strip(t.id): sc[t.id] for t in tasks}}
         for ext in self.cfg["exam"]["external"]:
             rows = [r for f in glob.glob(str(Path(ext["scores"]) / "*.jsonl")) for r in read_jsonl(f)]

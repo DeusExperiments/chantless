@@ -144,12 +144,30 @@ class Evaluator:
                 if old.get("cal_sha") == fp and old.get("n") == len(cal):
                     self._rules[h] = old["rule"]
                 else:
-                    scores = self._score(model, cal)
-                    self._scores.setdefault(h, {}).update(scores)  # a calibration task run as a job is not rescored
+                    known = self._scores.setdefault(h, {})
+                    todo = [t for t in cal if t.id not in known]   # seeded or earlier-scored calibration tasks are reused
+                    if todo:
+                        known.update(self._score(model, todo))
+                    scores = {t.id: known[t.id] for t in cal}
                     rule = self.env.calibrate(scores)
                     write_json(path, {"model": str(model), "sha256_16": h, "n": len(cal), "cal_sha": fp, "rule": rule})
                     self._rules[h] = rule
             return self._rules[h]
+
+    def scores(self, model: str, tasks: list[Task]) -> dict[str, float]:
+        """Classifier scores of `tasks` under `model`, through the same per-model cache the episodes use."""
+        h = self.model_hash(model)
+        with self._cls_lock:
+            known = self._scores.setdefault(h, {})
+            todo = list({t.id: t for t in tasks if t.id not in known}.values())
+            if todo:
+                known.update(self._score(model, todo))
+            return {t.id: known[t.id] for t in tasks}
+
+    def seed(self, model: str, scores: dict[str, float]) -> None:
+        """Preload recorded scores for `model` (same file, same tokenisation); the caller verifies a sample first."""
+        with self._cls_lock:
+            self._scores.setdefault(self.model_hash(model), {}).update(scores)
 
     def _run_classifier(self, model: str, jobs: list[tuple[Task, int]], tag: str, side: str, save: bool) -> list[dict]:
         rule = self.rule(model)
