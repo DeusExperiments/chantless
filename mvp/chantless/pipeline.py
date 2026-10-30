@@ -67,8 +67,20 @@ class Run:
         self.ladder = cfg["ladder"]
         self.mode = cfg.get("objective_mode", "preserve")
         self.dep = self.env.deployment
-        self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
-                            cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes")
+        # classifier environments (CLASSIFIER-CONTRACT.md) score documents in batches and judge each model at
+        # its own calibrated rule; every other environment keeps the episode path
+        self.classifier = getattr(self.env, "classifier", False)
+        self.scorer = None
+        if self.classifier and cfg["sanity"].get("behavioral_items", 0):
+            raise ValueError("classifier environments have no chat servers: set sanity.behavioral_items to 0")
+        if self.classifier:
+            from .runtime import BatchScorer
+            self.scorer = BatchScorer(self.tc, cfg.get("scoring", {}).get("slots_per_gpu", 2))
+            self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
+                                cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes", scorer=self.scorer)
+        else:
+            self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
+                                cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes")
         self.t0 = time.time()
 
     def annotate_imatrix(self, path):
@@ -232,6 +244,8 @@ class Run:
 
     # ------------------------------------------------------------------ proxy stores + imatrix
     def phase_proxy(self):
+        if self.classifier:
+            return self._proxy_classifier()
         pc = self.cfg["proxy"]
         R = kl.Renderer(self.cfg["source"]["hf_dir"])
         pdir = self.dir / "proxy"
@@ -269,6 +283,52 @@ class Run:
         self.log(f"proxy: task {meta_t} general {meta_g} self-KL {out['self_kl']}")
         self.mark("proxy")
 
+    def _proxy_classifier(self):
+        """Classifier proxy: a log-odds store of the parts env.proxy_spec picks (random calibration humans, AI
+        documents near the source's cutoff), scored by the configured objective; plus the usual general store."""
+        pc = self.cfg["proxy"]
+        pdir = self.dir / "proxy"
+        pdir.mkdir(exist_ok=True)
+        by_split = lambda sp: [t for t in self.env.tasks() if t.split == sp]
+        src_scores = self.env.score(by_split("calibration") + by_split("search"), self.src, self.scorer)
+        parts = self.env.proxy_spec(src_scores, **pc.get("spec", {}))
+        tasks = [self.by_id[i] for p in parts for i in p["ids"]]
+        trj = pdir / "task.bin"
+        shutil.copyfile(self.env.trj_for(tasks), trj)
+        sdir = pdir / "store_task"
+        sdir.mkdir(exist_ok=True)
+        import numpy as np
+        from . import objectives
+        src = np.asarray(self.scorer.score_trj(self.src, str(trj), tuple(self.env.pair)), dtype=float)
+        np.save(sdir / "source.npy", src)
+        again = np.asarray(self.scorer.score_trj(self.src, str(trj), tuple(self.env.pair)), dtype=float)
+        meta_task = {"kind": "logodds", "n_seq": len(tasks), "n_targets": len(tasks),
+                     "meta": {"parts": [{"name": p["name"], "role": p["role"], "n": p["n"]} for p in parts],
+                              "pair": list(self.env.pair), "objective": pc.get("objective", "pauc"),
+                              "objective_args": pc.get("objective_args", {})}}
+        split = lambda x: {r: np.concatenate([x[sum(q["n"] for q in parts[:k]):][: p["n"]] for k, p in enumerate(parts)
+                                              if p["role"] == r]) for r in ("pos", "neg")}
+        self_damage = abs(objectives.OBJECTIVES[meta_task["meta"]["objective"]](split(again), split(src),
+                                                                                **meta_task["meta"]["objective_args"]))
+        write_json(pdir / "parts.json", parts)
+        R = kl.Renderer(self.cfg["source"]["hf_dir"])
+        texts = sanity.general_texts(pc["general_docs"], 20261012, pdir / "general_texts.json")
+        meta_g = kl.write_trj(pdir / "general.bin", kl.pack_text(R, texts, pc["general_seq_len"], pc["general_n_seq"]))
+        kl.traj_kl(self.tc, "base", self.src, str(pdir / "general.bin"), str(pdir / "store_general"), str(pdir / "base_general.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
+        sg = kl.traj_kl(self.tc, "kl", self.src, str(pdir / "general.bin"), str(pdir / "store_general"), str(pdir / "self_general.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
+        tol = pc.get("self_kl_tol", {})
+        if self_damage > tol.get("task", 1e-5) or sg["kl"] > tol.get("general", 1e-4):
+            raise RuntimeError(f"self-check failed: task damage {self_damage}, general KL {sg['kl']}")
+        (pdir / "stats_corpus.txt").write_text("\n\n".join(self.env.stats_texts(pc.get("stats_docs", 200)) + texts[: pc["general_docs"] // 2]))
+        run_imatrix(self.tc, self.src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
+        self.annotate_imatrix(pdir / "imatrix.gguf")
+        write_json(self.dir / "groups.json", self.groups)
+        out = {"task": meta_task, "general": meta_g, "self_kl": {"task": self_damage, "general": sg["kl"]},
+               "imatrix_sha256": sha256_file(pdir / "imatrix.gguf")}
+        write_json(pdir / "proxy.json", out)
+        self.log(f"proxy (classifier): {[(p['name'], p['role'], p['n']) for p in parts]}; self-damage {self_damage:.2e}, general self-KL {sg['kl']:.2e}")
+        self.mark("proxy")
+
     def make_prober(self, weights: str, tag: str) -> Prober:
         pdir = self.dir / "proxy"
         meta = read_json(pdir / "proxy.json")
@@ -276,11 +336,15 @@ class Run:
         B.threads = self.cfg.get("probe", {}).get("quantize_threads", 8)
         B.max_pruned = self.cfg.get("probe", {}).get("max_pruned", 4)
         P = Prober(self.tc, B, self.dir / "probe" / tag, str(self.dir / "probe.log"), workers=self.cfg.get("probe", {}).get("workers"),
-                   scratch=self.scratch / "cand" / tag)
-        P.add_store(Store("task", str(pdir / "task.bin"), self._staged(pdir / "store_task"), meta["task"]["n_targets"]))
+                   scratch=self.scratch / "cand" / tag, scorer=self.scorer)
+        if self.cfg.get("probe", {}).get("slots_per_gpu"):   # several concurrent probes per GPU
+            P._free = [g for g in self.tc.gpus for _ in range(self.cfg["probe"]["slots_per_gpu"])]
+        P.add_store(Store("task", str(pdir / "task.bin"), self._staged(pdir / "store_task"), meta["task"]["n_targets"],
+                          kind=meta["task"].get("kind", "kl"), meta=meta["task"].get("meta", {})))
         P.add_store(Store("general", str(pdir / "general.bin"), self._staged(pdir / "store_general"), meta["general"]["n_targets"]))
         for fb in read_jsonl(self.dir / "feedback_stores.jsonl"):
-            P.add_store(Store(fb["name"], fb["trj"], fb["dir"], fb["n_targets"], fb.get("weight", 1.0)))
+            P.add_store(Store(fb["name"], fb["trj"], fb["dir"], fb["n_targets"], fb.get("weight", 1.0),
+                              kind=fb.get("kind", "kl"), meta=fb.get("meta", {})))
         return P
 
     def _staged(self, store_dir) -> str:
@@ -308,13 +372,19 @@ class Run:
         for t, r in zip(um, P.probe_many(list(um.values()), ["general", "task"])):
             uniform[t] = {"kl_gen": r.kl["general"], "kl_task": r.kl["task"], "bytes": r.bytes, "bpw": r.bpw, "bytes_saved": src_bytes - r.bytes}
         pts = [(bmod_bpw(src_bytes, P.builder.source_params), 0.0)] + [(u["bpw"], u["kl_gen"]) for u in uniform.values()]
-        cap = sanity.SizeMatchedCap(pts)
+        cap = sanity.make_cap(sc.get("cap", "general_kl"), pts)
+        fkey = sc.get("floor_key", "kl_gen")   # "task": floors from the task proxy (classifier objectives)
+        if fkey == "task":
+            for u in uniform.values():
+                u["task"] = u["kl_task"]
         selfkl = read_json(self.dir / "proxy" / "proxy.json")["self_kl"]
         # The floor is judged against the first rung the search can move to; a search that starts at Q8_0 and
         # steps straight to Q4_K never has to resolve BF16-vs-Q8_0 differences
         ft = self.cfg["proxy"].get("floor_tier", "Q8_0")
         for name, key in (("general", "kl_gen"), ("task", "kl_task")):
             ref = uniform[ft][key]
+            if self.classifier and name == "task":   # a damage, not a KL: it can be near zero or negative
+                ref = abs(ref)
             if selfkl[name] > 0.05 * ref:
                 raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
         solo, masks, keys = {}, [], []
@@ -324,9 +394,12 @@ class Run:
                 masks.append(mk.apply(base, g, t))
                 keys.append((g, t))
         self.log(f"sanity: {len(masks)} solo probes")
-        for (g, t), r in zip(keys, P.probe_many(masks, ["general"])):
+        for (g, t), r in zip(keys, P.probe_many(masks, ["general", "task"] if fkey == "task" else ["general"])):
             solo.setdefault(g, {})[t] = {"kl_gen": r.kl["general"], "bytes_saved": src_bytes - r.bytes}
-        floors = sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"])
+            if fkey == "task":
+                solo[g][t]["task"] = r.kl["task"]
+        floors = (sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"]) if fkey == "kl_gen" else
+                  sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"], key=fkey))
         init = mk.new_mask(self.groups, self.cfg["start_tier"], self._source_pin(), self.mode)
         for g, f in floors.items():
             init["floors"][g] = {"min_tier": f["min_tier"], "drop_ok": f["drop_ok"]}
@@ -340,7 +413,7 @@ class Run:
         write_json(self.dir / "sanity" / "floors.json", floors)
         write_json(self.dir / "sanity" / "sanity_mask.json", init)
         n_forbid = sum(1 for f in floors.values() for e in f["evidence"].values() if not e["ok"])
-        self.log(f"sanity: cap points {cap.to_dict()['points']}; forbidden solo settings {n_forbid}")
+        self.log(f"sanity: cap {cap.to_dict().get('points', cap.to_dict())}; forbidden solo settings {n_forbid}")
         P.builder.cleanup()
         self.mark("sanity")
 
@@ -417,7 +490,8 @@ class Run:
         brows = [dict(r, side="cand") for r in beh if r["success"] is not None] + [dict(r, side="src") for r in bank if r["success"] is not None]
         bb = stats.delta_and_bounds(brows, st["alpha"], n_boot=2000)
         res["behavioral"] = bb
-        res["behavioral_ok"] = bb["L"] > -self.cfg["sanity"]["behavioral_margin"]
+        res["behavioral_ok"] = (stats.empty_ok(bb, self.cfg["sanity"]["behavioral_margin"]) if self.classifier and not brows
+                                else bb["L"] > -self.cfg["sanity"]["behavioral_margin"])
         res["pass"] = res["pass"] and res["behavioral_ok"]
         res.update(tag=tag, split=split, n_gate=n_gate, eps_per_task=k, n_tasks=len(tasks))
         write_json(self.dir / "gates" / f"{tag}.json", res)
@@ -466,6 +540,8 @@ class Run:
     # ------------------------------------------------------------------ search
     def _failure_store(self, eps_rows: list[dict], name: str) -> dict | None:
         """Render failed trajectories, compute the frozen-source reference on them, register as a store."""
+        if self.classifier:
+            return self._failure_store_classifier(eps_rows, name)
         R = kl.Renderer(self.cfg["source"]["hf_dir"])
         recs = []
         for r in eps_rows:
@@ -485,13 +561,41 @@ class Run:
         append_jsonl(self.dir / "feedback_stores.jsonl", row)
         return row
 
+    def _failure_store_classifier(self, eps_rows: list[dict], name: str) -> dict | None:
+        """Classifier failure store: the proxy's objective on the failed documents. Failed positives (missed AI)
+        become the pos part, or the proxy's own pos part if none failed; failed negatives join the proxy's
+        random human sample, where the objective's own-tail choice will count them when they are hard."""
+        import numpy as np
+        parts = read_json(self.dir / "proxy" / "parts.json")
+        failed = [self.by_id[r["task"]] for r in eps_rows if r.get("task") in self.by_id]
+        if not failed:
+            return None
+        rule = self.ev.rule(self.src)
+        fpos = [t.id for t in failed if self.env.decide(t, -1e9, rule).tests_passed]   # a flag is right: a positive
+        fneg = [t.id for t in failed if t.id not in set(fpos)]
+        neg = next(p for p in parts if p["role"] == "neg")["ids"] + fneg
+        pos = fpos or next(p for p in parts if p["role"] == "pos")["ids"]
+        tasks = [self.by_id[i] for i in neg + pos]
+        d = self.scratch / "proxy" / name
+        d.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.env.trj_for(tasks), d / "fb.bin")
+        (d / "store").mkdir(exist_ok=True)
+        np.save(d / "store" / "source.npy", np.asarray(self.scorer.score_trj(self.src, str(d / "fb.bin"), tuple(self.env.pair)), dtype=float))
+        pm = read_json(self.dir / "proxy" / "proxy.json")["task"]["meta"]
+        meta = {**pm, "parts": [{"name": "neg", "role": "neg", "n": len(neg)}, {"name": "pos", "role": "pos", "n": len(pos)}]}
+        row = {"name": name, "trj": str(d / "fb.bin"), "dir": str(d / "store"), "n_targets": len(tasks), "weight": 1.0,
+               "kind": "logodds", "meta": meta}
+        append_jsonl(self.dir / "feedback_stores.jsonl", row)
+        return row
+
     def _task_families(self):
         return {t.family for t in self.env.tasks()}
 
     def phase_search(self):
         lc = self.cfg["learner"]
         init = read_json(self.dir / "sanity" / "sanity_mask.json")
-        cap = sanity.SizeMatchedCap([tuple(p) for p in read_json(self.dir / "sanity" / "cap.json")["points"]])
+        cd = read_json(self.dir / "sanity" / "cap.json")
+        cap = sanity.make_cap("off") if cd.get("kind") == "off" else sanity.SizeMatchedCap([tuple(p) for p in cd["points"]])
         weights = self.src
         P = self.make_prober(weights, "search")
         L = Learner(P, self.groups, self.ladder, cap, self.mode, lc, self.log, self.record)
@@ -502,6 +606,7 @@ class Run:
         L.full_reprobe(S, base)
         fb_i, consecutive_fail, deadline = 0, 0, self.t0 + 3600 * self.cfg["budget"]["max_hours"]
         stop_reason = "exhausted"
+        exch, n_exch = False, 0   # exchange phase (learner.exchange_rounds > 0): at the budget, one up + one down per round
         while True:
             if time.time() > deadline:
                 stop_reason = "budget"
@@ -509,18 +614,32 @@ class Run:
             if S.accepted >= lc.get("max_moves", 10 ** 9):
                 stop_reason = "max_moves"
                 break
-            if base.bytes <= lc.get("target_bytes", 0):
-                stop_reason = "target_bytes"
-                break
-            best = L.step(S, base)
-            if best is None:
-                stop_reason = "exhausted"
-                break
+            if base.bytes <= lc.get("target_bytes", 0) and not exch:
+                if lc.get("exchange_rounds", 0) <= 0:
+                    stop_reason = "target_bytes"
+                    break
+                exch = True
+            if exch:
+                if n_exch >= lc["exchange_rounds"]:
+                    stop_reason = "exchange_rounds_done"
+                    break
+                n_exch += 1
+                best = L.exchange(S, base, lc["target_bytes"])
+                if best is None:
+                    stop_reason = "exchange_converged"
+                    break
+                label = " + ".join(m.key for m in best["pair"] if m)
+            else:
+                best = L.step(S, base)
+                if best is None:
+                    stop_reason = "exhausted"
+                    break
+                label = best["move"].key
             base = best["res"]
-            self.record("history", {"step": S.accepted, "move": best["move"].key, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl,
-                                    "score": best["score"], "event": "accept"})
-            self.log(f"move {S.accepted}: {best['move'].key} bytes={base.bytes} bpw={base.bpw:.3f} kl_task={base.kl['task']:.5f} kl_gen={base.kl['general']:.5f}")
-            if S.accepted % lc["screen_every"] == 0:
+            self.record("history", {"step": S.accepted, "move": label, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl,
+                                    "score": best["score"], "event": "exchange" if exch else "accept"})
+            self.log(f"{'exchange' if exch else 'move'} {S.accepted}: {label} bytes={base.bytes} bpw={base.bpw:.3f} kl_task={base.kl['task']:.5f} kl_gen={base.kl['general']:.5f}")
+            if S.accepted % lc["screen_every"] == 0 or exch:
                 cand = P.builder.build(S.mask, self.scratch / "build" / "screen.gguf").path
                 sc = self.screen(cand, f"m{S.accepted:04d}")
                 # failure feedback from search-split episodes (never the select split)
@@ -533,7 +652,8 @@ class Run:
                     fb_i += 1
                     st_row = self._failure_store(fails, f"fb{fb_i:03d}")
                     if st_row:
-                        P.add_store(Store(st_row["name"], st_row["trj"], st_row["dir"], st_row["n_targets"]))
+                        P.add_store(Store(st_row["name"], st_row["trj"], st_row["dir"], st_row["n_targets"],
+                                          kind=st_row.get("kind", "kl"), meta=st_row.get("meta", {})))
                         L.feedback(S, st_row["name"], base, revert=not sc["pass"])
                 base = P.probe(S.mask)
                 if not sc["pass"]:
@@ -701,7 +821,41 @@ class Run:
         write_json(self.dir / "gates" / "exam.json", res)
         # descriptive baselines at matched bytes (observed, not claimed)
         self.exam_baselines(spec)
+        if self.classifier and self.cfg["exam"].get("external"):
+            self.exam_compare(spec)
         self.mark("exam", {"claim_holds": res["claim_holds"]})
+
+    def exam_compare(self, spec: str):
+        """Classifier exam, descriptive: the specialist, the source and external models (exam.external), each at
+        its own 1%-of-calibration-negatives cutoff, on every exam document, with shared bootstrap resamples."""
+        import glob
+        import numpy as np
+        from . import compare
+        tasks = [t for t in self.env.tasks() if t.split == "exam"]
+        cal = [t for t in self.env.tasks() if t.split == "calibration"]
+        strip = lambda i: i.split(":", 1)[1]
+        models = {}
+        for name, path in (("specialist", spec), ("source", self.src)):
+            sc = self.env.score(cal + tasks, path, self.scorer)
+            models[name] = {"cal": np.array([sc[t.id] for t in cal]), "scores": {strip(t.id): sc[t.id] for t in tasks}}
+        for ext in self.cfg["exam"]["external"]:
+            rows = [r for f in glob.glob(str(Path(ext["scores"]) / "*.jsonl")) for r in read_jsonl(f)]
+            cal_ids = {strip(t.id) for t in cal}
+            models[ext["name"]] = {"cal": np.array([r["p_human"] for r in rows if r["id"] in cal_ids]),
+                                   "scores": {r["id"]: r["p_human"] for r in rows}}
+        rng = np.random.default_rng(0)
+        out = {}
+        for source in sorted({t.id.split(":", 1)[0] for t in tasks}):
+            sel = [t for t in tasks if t.id.split(":", 1)[0] == source]
+            labels = {strip(t.id): "pos" if self.env.decide(t, -1e9, self.ev.rule(self.src)).tests_passed else "neg" for t in sel}
+            kinds = {strip(t.id): t.meta.get("kind", "") for t in sel}
+            ms = {m: {"cal": v["cal"], "scores": {i: x for i, x in v["scores"].items() if i in labels}} for m, v in models.items()}
+            out[source] = compare.compare(ms, labels, kinds, boot=self.cfg["exam"].get("boot", 1000), seed=rng)
+            for m in models:
+                if m != "specialist":
+                    out[source].setdefault("beats", {})[m] = compare.beats(out[source], "specialist", m)
+        write_json(self.dir / "gates" / "exam_compare.json", out)
+        self.log(f"exam compare: {json.dumps({s_: {m: v.get('pos', v) for m, v in r.get('models', r).items()} for s_, r in out.items()}, default=str)[:600]}")
 
     def exam_baselines(self, spec: str):
         target = gguf_ops.file_bytes(spec)
@@ -796,6 +950,14 @@ class Run:
         for k, v in (bl or {}).get("points", {}).items():
             match = "" if v.get("matched_within_5pct", True) else f" (NOT byte-matched: {v['bytes_ratio_to_target']:.2f}x target; nearest this recipe reaches)"
             lines.append(f"- {k}: {v['bytes']:,} bytes, delta={v['delta']:+.4f} [{v['L']:+.4f}, {v['U']:+.4f}]{match}")
+        cmp_ = g("gates/exam_compare.json")
+        if cmp_:
+            lines += ["", "## Classifier comparison (descriptive, not claimed)",
+                      "Each model at its own cutoff (1% of calibration negatives); positives caught, 95% bootstrap intervals over shared resamples."]
+            for source, r in cmp_.items():
+                lines.append(f"- {source} ({r['docs']} docs): " + "; ".join(
+                    f"{m} {v['pos']['caught']:.3f} [{v['pos']['ci'][0]:.3f}, {v['pos']['ci'][1]:.3f}], negatives flagged {v['neg_flagged']:.3f}"
+                    for m, v in r["models"].items()) + "; interval wholly above: " + ", ".join(f"{m} {b}" for m, b in r.get("beats", {}).items()))
         lines += ["", "## Not established", "No global optimum, no generalisation beyond this environment and model, no latency/throughput claim, no MiMo/qwen35 result."]
         (self.dir / "report.md").write_text("\n".join(lines) + "\n")
         self.log("report written")
