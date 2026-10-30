@@ -150,8 +150,8 @@ class Learner:
         def row(label, r, phase):
             cap = self.cap(r.bpw)
             in_cap = r.kl["general"] <= cap
-            legal = in_cap and r.bytes <= budget_bytes
             d_proxy = r.task_proxy(stores, mode) - base_p if in_cap else float("nan")
+            legal = in_cap and r.bytes <= budget_bytes and d_proxy == d_proxy  # a NaN proxy must not win min() below
             out = {"move": label, "score": d_proxy if legal else float("inf"), "d_proxy": d_proxy, "d_bytes": base_res.bytes - r.bytes,
                    "kl_general": r.kl["general"], "cap": cap, "bpw": r.bpw, "legal": legal, "penalty": 0.0, "bytes": r.bytes, "phase": phase}
             self.record("probes", out)
