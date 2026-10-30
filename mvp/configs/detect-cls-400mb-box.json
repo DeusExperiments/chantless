@@ -1,0 +1,162 @@
+{
+ "run_id": "detect-cls-400mb-001",
+ "run_root": "/root/chantless/runs",
+ "source": {
+  "repo": "tokenbender/chantless-detect-qwen35-0.8b",
+  "revision": "5e2c4b7817f404930413d48b6b4f6ce629847c14",
+  "hf_dir": "/root/chantless/L/detect/runs/qwen/final",
+  "gguf": "/root/chantless/L/detect/mask/detector-bf16.gguf"
+ },
+ "toolchain": {
+  "llama_bin": "/root/chantless/llama.cpp/build/bin",
+  "traj_kl": "/root/chantless/bin/traj-kl",
+  "logodds": "/root/chantless/bin/logodds",
+  "gpus": [
+   "0",
+   "1",
+   "2",
+   "3",
+   "4",
+   "5",
+   "6",
+   "7"
+  ],
+  "convert_py": "/root/chantless/llama.cpp/convert_hf_to_gguf.py"
+ },
+ "env": {
+  "module": "chantless.env.detect",
+  "kwargs": {
+   "data_dir": "/root/chantless/L/detect/hf-raw",
+   "hf_dir": "/root/chantless/L/detect/runs/qwen/final",
+   "classifier": true,
+   "cutoff": null,
+   "calibration_ids_file": "/root/chantless/L/detect/runs/scores/qwen/calibration.shard*.jsonl",
+   "cache_dir": "/root/chantless/cache",
+   "search_per_cell": null,
+   "select_per_cell": null,
+   "exam_test_per_cell": null,
+   "exam_beemo_per_kind": null,
+   "search_beemo_per_kind": null,
+   "select_beemo_per_kind": null,
+   "context": 4608,
+   "kv_type": "f16"
+  }
+ },
+ "decoding": {
+  "temperature": 0.0
+ },
+ "serving": {
+  "slots_per_gpu": 4,
+  "ctx_per_slot": 4608
+ },
+ "objective_mode": "preserve",
+ "ladder": [
+  "BF16",
+  "Q8_0",
+  "Q4_K",
+  "IQ1_S"
+ ],
+ "start_tier": "Q4_K",
+ "pool": {
+  "tasks_per_split": {
+   "search": 100000,
+   "select": 100000,
+   "exam": 100000
+  },
+  "runs": 1,
+  "min_pass": 1
+ },
+ "stats": {
+  "margin": 0.02,
+  "alpha": 0.05,
+  "power": 0.95,
+  "n_floor": 200,
+  "looks": 4,
+  "max_eps_per_task": 1,
+  "aa_tol": 0.015,
+  "aa_enforce": true,
+  "detector_bound": 0.03,
+  "n_aa": 2000,
+  "n_override": 100000,
+  "v_min": 0.05,
+  "allow_small_pool": true
+ },
+ "proxy": {
+  "objective": "pauc",
+  "objective_args": {
+   "tail": 0.05,
+   "tau": 0.5
+  },
+  "spec": {
+   "n_neg": 1000,
+   "n_pos": 600
+  },
+  "stats_docs": 200,
+  "general_docs": 30,
+  "general_seq_len": 1024,
+  "general_n_seq": 4,
+  "floor_tier": "Q4_K",
+  "self_kl_tol": {
+   "task": 0.001,
+   "general": 0.0001
+  }
+ },
+ "sanity": {
+  "floor_factor": 4.0,
+  "behavioral_items": 0,
+  "behavioral_seeds": 1,
+  "behavioral_margin": 0.1,
+  "cap": "off",
+  "floor_key": "task",
+  "solo_tiers": [
+   "IQ1_S"
+  ]
+ },
+ "screen": {
+  "pairs": 300,
+  "fail_below": -0.05
+ },
+ "learner": {
+  "reprobe_every": 16,
+  "top_k": 32,
+  "screen_every": 4,
+  "gate_every": 1000,
+  "reprobe_after_screen": false,
+  "max_moves": 200,
+  "target_bytes": 400000000,
+  "feedback": true,
+  "feedback_tasks": 200,
+  "implicate_share": 0.2,
+  "penalty_step": 1.0,
+  "max_revert": 2,
+  "exchange_rounds": 6,
+  "allow_negative_proxy": true,
+  "exchange_eps": 0.0001,
+  "exchange_top_k": 32
+ },
+ "repair": {
+  "enabled": false
+ },
+ "exam": {
+  "baseline_eps_per_task": 1,
+  "boot": 1000,
+  "external": [
+   {
+    "name": "modernbert",
+    "scores": "/root/chantless/L/detect/runs/scores/modernbert"
+   }
+  ]
+ },
+ "budget": {
+  "max_hours": 4
+ },
+ "probe": {
+  "workers": 16,
+  "slots_per_gpu": 2,
+  "quantize_threads": 8,
+  "max_pruned": 64
+ },
+ "scoring": {
+  "slots_per_gpu": 2
+ }
+}

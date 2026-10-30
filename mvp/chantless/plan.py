@@ -254,9 +254,10 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     cap_kind = sc.get("cap", "general_kl")
     pj = _receipt(run_dir, "proxy/proxy.json")
     if classifier:
-        n_neg, n_pos = px.get("n_neg", 1000), px.get("n_pos", 600)
+        spec = px.get("spec", {})   # the pipeline passes proxy.spec to env.proxy_spec
+        n_neg, n_pos = spec.get("n_neg", 1000), spec.get("n_pos", 600)
         task_tok = n_neg * mean("calibration") + n_pos * mean("search")
-        A.append(f"log-odds store: {n_neg} calibration negatives + {n_pos} search positives (proxy.n_neg / proxy.n_pos)")
+        A.append(f"log-odds store: {n_neg} calibration negatives + {n_pos} search positives (proxy.spec.n_neg / n_pos)")
         if cap_kind == "off":
             gen_tok = 0
             A.append("sanity.cap is off: no general store is scored")
