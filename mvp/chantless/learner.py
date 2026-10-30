@@ -34,14 +34,20 @@ class LearnerState:
     accepted: int = 0
 
 
-def legal_moves(state: LearnerState, groups: dict, ladder: list[str]) -> list[Move]:
+def legal_moves(state: LearnerState, groups: dict, ladder: list[str], allow_up: bool = False) -> list[Move]:
+    """One rung down or a drop per group. `allow_up` adds one rung up (never above ladder[1], so BF16 is never a
+    target) and brings a dropped group back at its cheapest permitted tier."""
     out = []
     m = state.mask
     for g, e in m["groups"].items():
         t = e["tier"]
-        if t == mk.DROP:
-            continue
         fl = m.get("floors", {}).get(g, {"min_tier": ladder[-1], "drop_ok": groups[g]["droppable"]})
+        if t == mk.DROP:
+            if allow_up:
+                back = next((u for u in reversed(ladder[1:]) if mk.rank(u) <= mk.rank(fl["min_tier"]) and mk.tier_allowed(groups[g], u)), None)
+                if back and f"{g}->{back}" not in state.blocked:
+                    out.append(Move(g, back))
+            continue
         i = ladder.index(t)
         if i + 1 < len(ladder) and mk.rank(ladder[i + 1]) <= mk.rank(fl["min_tier"]) and mk.tier_allowed(groups[g], ladder[i + 1]):
             mv = Move(g, ladder[i + 1])
@@ -49,6 +55,10 @@ def legal_moves(state: LearnerState, groups: dict, ladder: list[str]) -> list[Mo
                 out.append(mv)
         if groups[g]["droppable"] and fl.get("drop_ok"):
             mv = Move(g, mk.DROP)
+            if mv.key not in state.blocked:
+                out.append(mv)
+        if allow_up and i >= 2 and mk.tier_allowed(groups[g], ladder[i - 1]):
+            mv = Move(g, ladder[i - 1])
             if mv.key not in state.blocked:
                 out.append(mv)
     # keep at least one attention block
@@ -64,6 +74,12 @@ class Learner:
         self.cfg, self.log, self.record = cfg, log, record
 
     # ---- scoring
+    def _cost(self, d_proxy: float, pen: float) -> float:
+        """Penalised proxy damage. With `allow_negative_proxy` a gain counts as a gain, which the penalty shrinks."""
+        if not self.cfg.get("allow_negative_proxy", False):
+            return max(d_proxy, 0.0) * pen
+        return d_proxy * pen if d_proxy >= 0 else d_proxy / pen
+
     def evaluate(self, state: LearnerState, moves: list[Move], base_res) -> list[dict]:
         masks = [mk.apply(state.mask, mv.group, mv.tier) for mv in moves]
         # An illegal move's task score is never used, so its task stores are skipped once the general cap fails
@@ -76,7 +92,7 @@ class Learner:
             legal = d_bytes > 0 and r.kl["general"] <= cap
             d_proxy = r.task_proxy(self.prober.stores, self.mode) - base_p if legal else float("nan")
             pen = 1.0 + state.penalties.get(mv.group, 0.0)
-            score = (max(d_proxy, 0.0) * pen + 1e-12) / d_bytes if legal else float("inf")
+            score = (self._cost(d_proxy, pen) + 1e-12) / d_bytes if legal else float("inf")
             row = {"move": mv.key, "score": score, "d_proxy": d_proxy, "d_bytes": d_bytes, "kl_general": r.kl["general"],
                    "cap": cap, "bpw": r.bpw, "legal": legal, "penalty": pen - 1.0, "bytes": r.bytes}
             state.cache[mv.key] = score if legal else float("inf")
@@ -120,6 +136,65 @@ class Learner:
         state.accepted += 1
         state.window.append({"group": mv.group, "from": prev, "to": mv.tier})
         state.cache.pop(mv.key, None)
+        return best
+
+    # ---- exchange (one group up, one down or dropped, under a byte budget)
+    def exchange(self, state: LearnerState, base_res, budget_bytes: int):
+        """One exchange round: probe every single move (up included), estimate pairs additively, probe the best
+        `exchange_top_k` for real and accept the lowest task proxy if it beats the base by more than `exchange_eps`.
+        Returns a `step()`-shaped dict plus `"pair": [move_a, move_b | None]`, or None."""
+        stores, mode = self.prober.stores, self.mode
+        gate = lambda r: r.kl["general"] <= self.cap(r.bpw)
+        base_p = base_res.task_proxy(stores, mode)
+
+        def row(label, r, phase):
+            cap = self.cap(r.bpw)
+            in_cap = r.kl["general"] <= cap
+            d_proxy = r.task_proxy(stores, mode) - base_p if in_cap else float("nan")
+            legal = in_cap and r.bytes <= budget_bytes and d_proxy == d_proxy  # a NaN proxy must not win min() below
+            out = {"move": label, "score": d_proxy if legal else float("inf"), "d_proxy": d_proxy, "d_bytes": base_res.bytes - r.bytes,
+                   "kl_general": r.kl["general"], "cap": cap, "bpw": r.bpw, "legal": legal, "penalty": 0.0, "bytes": r.bytes, "phase": phase}
+            self.record("probes", out)
+            return out
+
+        singles = legal_moves(state, self.groups, self.ladder, allow_up=True)
+        if not singles:
+            return None
+        res = self.prober.probe_many([mk.apply(state.mask, mv.group, mv.tier) for mv in singles], gate=gate)
+        d = []   # (move, d_proxy, candidate bytes minus base bytes), singles inside the cap only
+        for mv, r in zip(singles, res):
+            rw = row(mv.key, r, "exchange-sweep")
+            if rw["d_proxy"] == rw["d_proxy"]:
+                d.append((mv, rw["d_proxy"], r.bytes - base_res.bytes))
+        room = budget_bytes - base_res.bytes
+        est = [(dp, a, None) for a, dp, db in d if db <= room]
+        est += [(dpa + dpb, a, b) for a, dpa, dba in d if dba > 0 for b, dpb, dbb in d
+                if dbb < 0 and a.group != b.group and dba + dbb <= room]
+        est.sort(key=lambda x: x[0])
+        trial = est[: self.cfg.get("exchange_top_k", 32)]
+        if not trial:
+            return None
+        masks = []
+        for _, a, b in trial:
+            m = mk.apply(state.mask, a.group, a.tier)
+            masks.append(mk.apply(m, b.group, b.tier) if b else m)
+        res = self.prober.probe_many(masks, gate=gate)
+        rows = []
+        for (e, a, b), m, r in zip(trial, masks, res):
+            rw = row(a.key + (f" + {b.key}" if b else ""), r, "exchange-trial")
+            rows.append({**rw, "estimate": e, "move": a, "pair": [a, b], "res": r, "mask": m})
+        legal = [r for r in rows if r["legal"]]
+        if not legal:
+            return None
+        best = min(legal, key=lambda r: (r["d_proxy"], r["bytes"]))
+        if not best["d_proxy"] < -self.cfg.get("exchange_eps", 0.0):
+            return None
+        for mv in best["pair"]:
+            if mv:
+                state.window.append({"group": mv.group, "from": state.mask["groups"][mv.group]["tier"], "to": mv.tier})
+                state.cache.pop(mv.key, None)
+        state.mask = best.pop("mask")
+        state.accepted += 1
         return best
 
     # ---- failure feedback (decision S4)
