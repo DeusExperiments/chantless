@@ -1,0 +1,25 @@
+{
+ "toolchain": {"llama_bin": "/root/n/llama/build/bin", "traj_kl": "/bin/true", "gpus": ["0"], "logodds": "/root/n/bin/logodds"},
+ "learn": {
+  "model": "/root/n/m/detector-200mb-q4cut50.gguf",
+  "config_dir": "/root/n/m/hf",
+  "ggml_lib": "/root/n/llama/build/bin/libggml-base.so",
+  "pair": [21019, 2053],
+  "cutoff": -2.947997510433197,
+  "n_calibration": 20000,
+  "pool_trj": "/root/n/m/p80.trj",
+  "select_rows": "/root/n/m/push_select_rows.json",
+  "feedback_trj": "/root/n/m/feedback.trj",
+  "feedback_rows": "/root/n/m/feedback.json",
+  "out_dir": "/root/n/learn",
+  "last_blocks": 2,
+  "lr": 2e-5,
+  "steps": 200,
+  "margin": 1.0,
+  "pair_margin": 2.0,
+  "replay_weight": 1.0,
+  "replay_humans": 1000,
+  "replay_select": 1000,
+  "max_human_rise": 0.01
+ }
+}

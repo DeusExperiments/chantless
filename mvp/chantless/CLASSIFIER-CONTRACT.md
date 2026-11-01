@@ -157,6 +157,15 @@ File: `env/detect.py`.
     WildOutlines test plus Beemo's other 70%. Sizes come from kwargs. Families are
     split/source/format/kind, as today.
 
+## Piece G: learning from labelled examples
+Files: new `lattice.py`, new `learn.py`, `cli.py`.
+
+- `cli learn` is a new command, so `run` and `plan` and every existing config are untouched.
+- Input is a built GGUF. Its structure (removed sub-blocks, cut neurons, trimmed vocabulary) is read from the
+  file. Only levels on Q4_K and Q8_0 grids move; scales, other tiers and the header stay byte-identical.
+- Select is split by task id: side 0 may be replayed in training, side 1 alone judges. Feedback folds are held
+  out by `--fold`. The result is a preview, not an exam claim.
+
 ## Ownership
 The pipeline wiring (`pipeline.py`), integration and golden checks belong to the integrator. No piece edits
 a file it does not own.
