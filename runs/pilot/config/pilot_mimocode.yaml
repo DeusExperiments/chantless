@@ -1,0 +1,33 @@
+# Chantless inherited pilot: native MiMo-Code scaffold, local Docker, BF16 llama-server.
+use_dataset_env: true
+
+agent:
+  type: mimocode-agent
+  tools:
+    - tool: bash
+      config:
+        timeout: 60
+        max_timeout: 300
+    - tool: read
+    - tool: write
+    - tool: edit
+    - tool: grep
+    - tool: glob
+    - tool: task
+  step_limit: 500
+
+environment:
+  cwd: "/testbed"
+  timeout: 300
+  environment_class: docker
+
+model:
+  model_name: "mimo9b-bf16"
+  protocol: "chat"
+  model_kwargs:
+    base_url: "http://localhost:8080/v1"
+    api_key: "none"
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    timeout: 3600
