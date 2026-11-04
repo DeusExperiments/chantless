@@ -623,84 +623,90 @@ class Run:
         L = Learner(P, self.groups, self.ladder, cap, self.mode, lc, self.log, self.record)
         S = LearnerState(mask=init)
         last_gate, last_screen = None, init      # source's gate on record is the A/A
-        base = P.probe(S.mask)
-        self.record("history", {"step": 0, "mask_key": base.key, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl, "event": "start"})
-        L.full_reprobe(S, base)
-        fb_i, consecutive_fail, deadline = 0, 0, self.t0 + 3600 * self.cfg["budget"]["max_hours"]
-        stop_reason = "exhausted"
-        exch, n_exch = False, 0   # exchange phase (learner.exchange_rounds > 0): at the budget, one up + one down per round
-        while True:
-            if time.time() > deadline:
-                stop_reason = "budget"
-                break
-            if S.accepted >= lc.get("max_moves", 10 ** 9):
-                stop_reason = "max_moves"
-                break
-            if base.bytes <= lc.get("target_bytes", 0) and not exch:
-                if lc.get("exchange_rounds", 0) <= 0:
-                    stop_reason = "target_bytes"
+        algo = lc.get("algo", "greedy")
+        if algo == "oneshot":
+            S.mask, stop_reason = self._search_oneshot(P, init, lc), "oneshot"
+        elif algo == "greedy":
+            base = P.probe(S.mask)
+            self.record("history", {"step": 0, "mask_key": base.key, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl, "event": "start"})
+            L.full_reprobe(S, base)
+            fb_i, consecutive_fail, deadline = 0, 0, self.t0 + 3600 * self.cfg["budget"]["max_hours"]
+            stop_reason = "exhausted"
+            exch, n_exch = False, 0   # exchange phase (learner.exchange_rounds > 0): at the budget, one up + one down per round
+            while True:
+                if time.time() > deadline:
+                    stop_reason = "budget"
                     break
-                exch = True
-            if exch:
-                if n_exch >= lc["exchange_rounds"]:
-                    stop_reason = "exchange_rounds_done"
+                if S.accepted >= lc.get("max_moves", 10 ** 9):
+                    stop_reason = "max_moves"
                     break
-                n_exch += 1
-                best = L.exchange(S, base, lc["target_bytes"])
-                if best is None:
-                    stop_reason = "exchange_converged"
-                    break
-                label = " + ".join(m.key for m in best["pair"] if m)
-            else:
-                best = L.step(S, base)
-                if best is None:
-                    stop_reason = "exhausted"
-                    break
-                label = best["move"].key
-            base = best["res"]
-            self.record("history", {"step": S.accepted, "move": label, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl,
-                                    "score": best["score"], "event": "exchange" if exch else "accept"})
-            self.log(f"{'exchange' if exch else 'move'} {S.accepted}: {label} bytes={base.bytes} bpw={base.bpw:.3f} kl_task={base.kl['task']:.5f} kl_gen={base.kl['general']:.5f}")
-            if S.accepted % lc["screen_every"] == 0 or exch:
-                cand = P.builder.build(S.mask, self.scratch / "build" / "screen.gguf").path
-                sc = self.screen(cand, f"m{S.accepted:04d}")
-                # failure feedback from search-split episodes (never the select split)
-                fb_tasks = random.Random(stable_seed("fb", S.accepted)).sample(self.reliable("search"), min(lc["feedback_tasks"], len(self.reliable("search"))))
-                fb_rows = ok_rows(self.ev.run(cand, [(t, stable_seed("fb", S.accepted, t.id)) for t in fb_tasks], f"fb-{S.accepted:04d}", "cand"))
-                fails = [r for r in read_jsonl(self.dir / "episodes" / f"fb-{S.accepted:04d}.jsonl") if r["success"] is False]
-                fails += sc["_beh_fail"]
-                self.log(f"screen m{S.accepted}: delta={sc['delta']:+.3f} beh={sc['behavioral_rate']:.3f}/{sc['behavioral_source']:.3f} pass={sc['pass']}; feedback failures={len(fails)}/{len(fb_rows) + len(sc['_beh_fail'])}")
-                if lc.get("feedback", True) and fails:
-                    fb_i += 1
-                    st_row = self._failure_store(fails, f"fb{fb_i:03d}")
-                    if st_row:
-                        P.add_store(Store(st_row["name"], st_row["trj"], st_row["dir"], st_row["n_targets"],
-                                          kind=st_row.get("kind", "kl"), meta=st_row.get("meta", {})))
-                        L.feedback(S, st_row["name"], base, revert=not sc["pass"])
-                base = P.probe(S.mask)
-                if not sc["pass"]:
-                    consecutive_fail += 1
-                    if consecutive_fail >= 2 or not lc.get("feedback", True):
-                        S.mask = last_screen
-                        stop_reason = "screen_failed"
+                if base.bytes <= lc.get("target_bytes", 0) and not exch:
+                    if lc.get("exchange_rounds", 0) <= 0:
+                        stop_reason = "target_bytes"
                         break
+                    exch = True
+                if exch:
+                    if n_exch >= lc["exchange_rounds"]:
+                        stop_reason = "exchange_rounds_done"
+                        break
+                    n_exch += 1
+                    best = L.exchange(S, base, lc["target_bytes"])
+                    if best is None:
+                        stop_reason = "exchange_converged"
+                        break
+                    label = " + ".join(m.key for m in best["pair"] if m)
+                else:
+                    best = L.step(S, base)
+                    if best is None:
+                        stop_reason = "exhausted"
+                        break
+                    label = best["move"].key
+                base = best["res"]
+                self.record("history", {"step": S.accepted, "move": label, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl,
+                                        "score": best["score"], "event": "exchange" if exch else "accept"})
+                self.log(f"{'exchange' if exch else 'move'} {S.accepted}: {label} bytes={base.bytes} bpw={base.bpw:.3f} kl_task={base.kl['task']:.5f} kl_gen={base.kl['general']:.5f}")
+                if S.accepted % lc["screen_every"] == 0 or exch:
                     cand = P.builder.build(S.mask, self.scratch / "build" / "screen.gguf").path
-                    sc2 = self.screen(cand, f"m{S.accepted:04d}-after-feedback")
-                    if not sc2["pass"]:
-                        S.mask = last_screen
-                        stop_reason = "screen_failed_after_feedback"
-                        break
-                consecutive_fail = 0
-                last_screen = S.mask
-                if lc.get("reprobe_after_screen", True):
-                    L.full_reprobe(S, base)
-                if S.accepted % lc["gate_every"] == 0:
-                    g = self.gate(P.builder.build(S.mask, self.scratch / "build" / "gate.gguf").path, f"m{S.accepted:04d}")
-                    if not g["pass"]:
-                        S.mask = last_gate or init
-                        stop_reason = "gate_failed"
-                        break
-                    last_gate = S.mask
+                    sc = self.screen(cand, f"m{S.accepted:04d}")
+                    # failure feedback from search-split episodes (never the select split)
+                    fb_tasks = random.Random(stable_seed("fb", S.accepted)).sample(self.reliable("search"), min(lc["feedback_tasks"], len(self.reliable("search"))))
+                    fb_rows = ok_rows(self.ev.run(cand, [(t, stable_seed("fb", S.accepted, t.id)) for t in fb_tasks], f"fb-{S.accepted:04d}", "cand"))
+                    fails = [r for r in read_jsonl(self.dir / "episodes" / f"fb-{S.accepted:04d}.jsonl") if r["success"] is False]
+                    fails += sc["_beh_fail"]
+                    self.log(f"screen m{S.accepted}: delta={sc['delta']:+.3f} beh={sc['behavioral_rate']:.3f}/{sc['behavioral_source']:.3f} pass={sc['pass']}; feedback failures={len(fails)}/{len(fb_rows) + len(sc['_beh_fail'])}")
+                    if lc.get("feedback", True) and fails:
+                        fb_i += 1
+                        st_row = self._failure_store(fails, f"fb{fb_i:03d}")
+                        if st_row:
+                            P.add_store(Store(st_row["name"], st_row["trj"], st_row["dir"], st_row["n_targets"],
+                                              kind=st_row.get("kind", "kl"), meta=st_row.get("meta", {})))
+                            L.feedback(S, st_row["name"], base, revert=not sc["pass"])
+                    base = P.probe(S.mask)
+                    if not sc["pass"]:
+                        consecutive_fail += 1
+                        if consecutive_fail >= 2 or not lc.get("feedback", True):
+                            S.mask = last_screen
+                            stop_reason = "screen_failed"
+                            break
+                        cand = P.builder.build(S.mask, self.scratch / "build" / "screen.gguf").path
+                        sc2 = self.screen(cand, f"m{S.accepted:04d}-after-feedback")
+                        if not sc2["pass"]:
+                            S.mask = last_screen
+                            stop_reason = "screen_failed_after_feedback"
+                            break
+                    consecutive_fail = 0
+                    last_screen = S.mask
+                    if lc.get("reprobe_after_screen", True):
+                        L.full_reprobe(S, base)
+                    if S.accepted % lc["gate_every"] == 0:
+                        g = self.gate(P.builder.build(S.mask, self.scratch / "build" / "gate.gguf").path, f"m{S.accepted:04d}")
+                        if not g["pass"]:
+                            S.mask = last_gate or init
+                            stop_reason = "gate_failed"
+                            break
+                        last_gate = S.mask
+        else:
+            raise ValueError(f"learner.algo must be greedy or oneshot, got {algo!r}")
         self.log(f"search stopped: {stop_reason} after {S.accepted} accepted moves")
         # optional weight repair on the selected mask
         final_weights, lineage = self.src, []
@@ -726,6 +732,64 @@ class Run:
                                                      "weights": final_weights, "penalties": S.penalties, "blocked": sorted(S.blocked)})
         P.builder.cleanup()
         self.mark("search", {"stop_reason": stop_reason, "accepted": S.accepted})
+
+    def _search_oneshot(self, P, init, lc):
+        """One solve on the sanity solo probes, then one build to check bytes (see oneshot.py)."""
+        import numpy as np
+        from . import oneshot
+        base = mk.new_mask(self.groups, "BF16", self._source_pin(), self.mode)
+        sdir = self.dir / "probe" / "sanity"
+        stores = [s for s in P.stores if s.kind == "logodds" and s.name != "general"]
+        tiers = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
+        solo, used = {}, []
+        for s in stores:
+            src = np.asarray(np.load(Path(s.dir) / "source.npy"), dtype=np.float64)
+            have = all((sdir / f"p-{bmod.mask_key(mk.apply(base, g, t))}-{s.name}.npy").exists()
+                       for g in base["groups"] for t in [x for x in tiers if mk.tier_allowed(self.groups[g], x)][:1])
+            if not have:
+                self.log(f"oneshot: store {s.name} has no sanity solo scores; left out of the surrogate")
+                continue
+            used.append((s.name, s.weight, oneshot.pauc_store(P._split(s, src), s.meta["parts"], s.meta.get("objective_args", {})), src))
+        if not used:
+            raise RuntimeError("oneshot needs per-trajectory sanity solo scores on at least one logodds store")
+        options = {}
+        for g in base["groups"]:
+            o = [t for t in self.ladder[1:] if mk.tier_allowed(self.groups[g], t) and t in lc.get("oneshot_tiers", ["Q8_0", "Q4_K", "IQ1_S"])]
+            o += ["drop"] if self.groups[g]["droppable"] and lc.get("allow_drop", True) else []
+            options[g] = []
+            for t in o:
+                shifts = []
+                for name, _, _, src in used:
+                    f = sdir / f"p-{bmod.mask_key(mk.apply(base, g, t))}-{name}.npy"
+                    if f.exists():
+                        shifts.append(np.load(f) - src)
+                if len(shifts) == len(used):
+                    solo[(g, t)] = np.concatenate(shifts); options[g].append(t)
+                elif t == "Q8_0":      # never solo-probed by default: taken as no shift (uniform Q8_0 task damage is ~0)
+                    options[g].append(t)
+        bm = oneshot.ByteModel(self.src, self.groups)
+        u = read_json(self.dir / "sanity" / "uniform.json")
+        bm.calibrate(self.uniform_mask(base, "Q4_K"), u["Q4_K"]["bytes"])
+        cost = {}
+        for g, o in options.items():
+            for t in o:
+                m1 = mk.apply(self.uniform_mask(base, "Q8_0"), g, t)
+                cost[(g, t)] = bm(m1) - bm(self.uniform_mask(base, "Q8_0"))
+        ref = bm(self.uniform_mask(base, "Q8_0"))
+        hdr = ref - sum(cost.get((g, "Q8_0"), 0) for g in options)
+        sur = (oneshot.FidelitySurrogate if lc.get("oneshot_objective", "fidelity") == "fidelity" else oneshot.Surrogate)(used, solo)
+        budget, target = lc["target_bytes"], lc["target_bytes"]
+        for attempt in range(3):
+            tiers_of = oneshot.solve(sur, options, cost, budget, hdr, log=self.log)
+            m = {**init, "groups": {g: {"tier": t} for g, t in tiers_of.items()}, "floors": {}}
+            mk.validate(m, self.groups)
+            r = P.probe(m)
+            self.record("history", {"step": 0, "mask_key": r.key, "bytes": r.bytes, "bpw": r.bpw, "kl": r.kl, "event": "oneshot", "budget": budget})
+            self.log(f"oneshot attempt {attempt + 1}: built {r.bytes} bytes for budget {budget} (target {target}); kl_task={r.kl.get('task', float('nan')):.5f}")
+            if r.bytes <= target:
+                return m
+            budget -= r.bytes - target
+        raise RuntimeError("oneshot: the built file stayed over target after three solves")
 
     def _repair(self, m, P):
         from . import repair

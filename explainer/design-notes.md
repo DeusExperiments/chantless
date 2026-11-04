@@ -42,6 +42,8 @@ KEY SCOPE: Our central research is BETWEEN the full model and precision allocati
 
 LEARNER DRIVER (decided by tokenbender): A proxy may rank moves, but task-verifier and sanity failures must change later allocation decisions, not only stop or roll back the search. Trajectories from failed episodes are added to the scoring proxy. Groups implicated by the failure are re-measured, then penalized or reverted, before further moves. A search that uses the proxy only, with behavioral stopping, is kept as an ablation. It does not satisfy this contract.
 
+CLASSIFIER ONE-SHOT PATH (decided by tokenbender, November 5, 2026): For classifier environments, where every probe yields one score per trajectory, a one-shot search is an adopted alternative to the feedback learner (`learner.algo: "oneshot"`). It reuses the sanity phase's solo probes, plus width probes when neuron cuts are allowed. It predicts any mask's per-trajectory scores as the source's scores plus the sum of the solo shifts, chooses the mask that best keeps the source's ranking of the store's trajectories (1 - Spearman, `oneshot_objective: "fidelity"`) under the byte target using an exact byte model, and builds once. The learner-driver contract above and the in-loop sanity floors do not apply to this path. Acceptance is unchanged: the built file must still pass the sequential non-inferiority gate and then the single-use exam. Evidence (Qwen3.5-0.8B detector; select gate of 14,161 source-right documents, one GPU; November 4-5, 2026): at 200 MB it lost 47 documents at 200,240,128 bytes, against 46 for the hand-built 200,296,000-byte mask. Paired, 24 documents were wrong only for the one-shot mask and 20 only for the hand-built one (p about 0.65). It was better on WildOutlines and worse on Beemo (21 against 12). At 396 MB it lost 34 against the feedback learner's 29. A pAUC proxy objective did worse (60 and 36 lost). Generative environments keep the feedback learner.
+
 ## 3. Central artifact: a precision mask
 The mask assigns a representation or precision budget to each controllable component. Unlike a binary keep/drop mask, it can specify multiple tiers. An illustrative allocation is: component A → 8 bits; B → 4 bits; C → approximately 1.5 bits per weight; D → removal, effectively 0 bits.
 
@@ -177,6 +179,9 @@ AGREED DECISIONS
 
 DECIDED IN SPEC TUNING (October 12, 2026)
 The learner driver: failures feed back into allocation. The objective is built weight bytes, with total memory as a separate constraint. Sanity uses floors, a size-matched cap and behavioral gates. Search starts at layer groups from the sanity mask. KL is proxy-only. Acceptance uses sequential non-inferiority. Runtime is pinned llama.cpp/GGUF. The environment uses a single entry-point contract. Weight training goes through the deployed builder.
+
+DECIDED NOVEMBER 5, 2026
+Classifier environments may use the one-shot path (§2): solo probes, an additive per-trajectory surrogate, a fidelity objective, one build, and the same gate and exam.
 
 STILL OPEN (left to the implementation goal or to engineering)
 Which removal operators the first build supports; the first source model and environment; the definition of done and the first claim; the exact proxy-refresh and penalty rules; alternating versus joint weight updates; detector thresholds; stopping budget; hardware, compute and authorization. These choices remain open, not completed features.
