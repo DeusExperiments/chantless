@@ -6,6 +6,8 @@ This is a small but complete implementation of the tuned Chantless spec (`../exp
 - **Runtime.** llama.cpp `9adc7f4` plus `patches/llama-cpp-9adc7f4-subblock-drop.patch` (`qwen3` and `qwen35`). The patch lets the runtime run a model whose token-mixer or FFN sub-blocks are physically absent. An absent sub-block runs as identity; an absent full-attention block allocates no KV cache and an absent gated delta net no recurrent state. The MVP run used the qwen3-only subset, kept as `patches/llama-cpp-9adc7f4-qwen3-subblock-drop.patch`.
 - **Environment.** `chantless.env.codetasks`: 42 families of procedurally generated Python function tasks, graded by hidden unit tests. The model has a `run_tests` tool turn. Splits are assigned per family (search / select / exam / train).
 
+- **Gemma 4 E2B.** llama.cpp `a01dff9` plus `patches/llama-cpp-a01dff9-gemma4-subblock-removal.patch`; the 10% mask and Learned Apprentice scripts are in `gemma4/` (see `gemma4/README.md`).
+
 ## How each architecture box is implemented
 
 | Spec box | Module | What it does |
