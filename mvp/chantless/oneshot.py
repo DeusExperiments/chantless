@@ -84,9 +84,11 @@ class ByteModel:
         self.vocab_size = int(self.inv["token_embd.weight"]["shape"][1]) if "token_embd.weight" in self.inv else 0
         self._vocab_kv_cut = 0
         self._vocab_rows_kept: int | None = None
+        self._vocab_cache_key: object = None
 
     def set_vocab_trim(self, keep: Sequence[int] | np.ndarray | None, kv_cut: int | None = None) -> None:
         """Configure vocabulary trim accounting (`keep` array, or explicit `(kept_count, kv_cut)`)."""
+        self._vocab_cache_key = None
         if keep is None:
             self._vocab_kv_cut = 0
             self._vocab_rows_kept = None
@@ -165,8 +167,14 @@ class ByteModel:
         tiers = {g: e["tier"] for g, e in m["groups"].items()}
         widths = {il: len(idx) for il, idx in mk.kept_widths(m).items()}
         dead = set(m.get("dead_tensors") or ())
-        if m.get("vocab_keep") is not None and self._vocab_rows_kept is None and self.source_gguf is not None:
-            self.set_vocab_trim(mk.unpack_bitmap(m["vocab_keep"]))
+        vk = m.get("vocab_keep")
+        if vk is not None and self.source_gguf is not None:
+            vkey = vk.get("b64") if isinstance(vk, dict) else tuple(vk)
+            if vkey != self._vocab_cache_key or self._vocab_rows_kept is None:
+                self.set_vocab_trim(mk.unpack_bitmap(vk))
+                self._vocab_cache_key = vkey
+        elif "vocab_keep" in m and vk is None and self._vocab_cache_key is not None:
+            self.set_vocab_trim(None)
         return self._raw_file_bytes(tiers, widths, dead, self.kv_end + self.kv_q_delta, m.get("tensors"))
 
 
@@ -235,10 +243,13 @@ def solve(
     pair_top: int = 60,
     max_polish: int = 100,
     log=print,
+    guard_fn=None,
 ) -> dict:
     """Solve `min sur.damage(m)` s.t. `header + sum cost[(g, m[g])] <= budget`.
 
     Each `options[g]` may contain tier strings (`"Q4_K"`) or `(tier, width)` tuples (`("Q4_K", 3072)`).
+    Optional `guard_fn(m, bytes_m) -> float` returns `<= 0.0` when satisfied and `> 0.0` excess violation
+    (e.g. predicted `general` KL minus `SizeMatchedCap(bpw)`), preferred whenever feasible.
     """
     rich = {g: o[0] if len(set(cost[(g, x)] for x in o)) == 1 else max(o, key=lambda t: cost[(g, t)]) for g, o in options.items()}
     m = dict(rich)
@@ -247,7 +258,9 @@ def solve(
     x = sur.src + sum(dvc[(g, t)] for g, t in m.items())
     cur = sur.damage(x)
     while B(m) > budget:
-        best = None
+        best_ok = None
+        best_any = None
+        cur_b = B(m)
         for g, o in options.items():
             for t in o:
                 db = cost[(g, m[g])] - cost[(g, t)]
@@ -256,8 +269,14 @@ def solve(
                 y = x - dvc[(g, m[g])] + dvc[(g, t)]
                 d = sur.damage(y) - cur
                 sc = (d + 1e-12) / db if d >= 0 else d * db
-                if best is None or sc < best[0]:
-                    best = (sc, g, t, y, d)
+                cand = (sc, g, t, y, d)
+                if best_any is None or sc < best_any[0]:
+                    best_any = cand
+                if guard_fn is not None:
+                    m_try = dict(m); m_try[g] = t
+                    if guard_fn(m_try, cur_b - db) <= 0.0 and (best_ok is None or sc < best_ok[0]):
+                        best_ok = cand
+        best = best_ok if best_ok is not None else best_any
         if best is None:
             raise RuntimeError(f"budget {budget} is below the cheapest mask {B(m)}")
         _, g, t, x, d = best
@@ -266,14 +285,24 @@ def solve(
     log(f"oneshot: descent reached {B(m)} bytes, predicted damage {cur:.6f}")
     for _ in range(max_polish):
         b = B(m)
+        cur_viol = max(0.0, float(guard_fn(m, b))) if guard_fn is not None else 0.0
         singles = []
         for g, o in options.items():
             for t in o:
                 if t != m[g]:
                     singles.append((sur.damage(x - dvc[(g, m[g])] + dvc[(g, t)]) - cur, cost[(g, t)] - cost[(g, m[g])], g, t))
         best = (-1e-7, None)
+
+        def _guard_ok(changes, new_b):
+            if guard_fn is None:
+                return True
+            m_try = dict(m)
+            for gg, tt in changes:
+                m_try[gg] = tt
+            return float(guard_fn(m_try, new_b)) <= cur_viol + 1e-9
+
         for d, db, g, t in singles:
-            if b + db <= budget and d < best[0]:
+            if b + db <= budget and d < best[0] and _guard_ok([(g, t)], b + db):
                 best = (d, [(g, t)])
         ups = sorted([s for s in singles if s[1] > 0], key=lambda s: s[0])[:pair_top]
         downs = sorted([s for s in singles if s[1] < 0], key=lambda s: s[0] / -s[1])[:pair_top]
@@ -282,7 +311,7 @@ def solve(
             for d2, db2, g2, t2 in downs:
                 if g1 != g2 and b + db1 + db2 <= budget:
                     d = sur.damage(y1 - dvc[(g2, m[g2])] + dvc[(g2, t2)]) - cur
-                    if d < best[0]:
+                    if d < best[0] and _guard_ok([(g1, t1), (g2, t2)], b + db1 + db2):
                         best = (d, [(g1, t1), (g2, t2)])
         if best[1] is None:
             break
@@ -344,6 +373,38 @@ def pauc_store(src_split: dict, parts: list[dict], args: dict):
     def fn(x):
         return objectives.pauc_damage({"pos": x[roles], "neg": x[~roles]}, src_split, **args)
     return fn
+
+
+def kl_store_damage(tgt_weights: np.ndarray):
+    """Target-weighted mean KL or NLL damage function for a generative `traj-kl` store."""
+    tw = np.asarray(tgt_weights, dtype=np.float64)
+    denom = max(1.0, float(tw.sum()))
+    def fn(x: np.ndarray) -> float:
+        return float(np.dot(x, tw) / denom)
+    return fn
+
+
+def extract_traj_kl(receipt_json: dict, mode: str = "preserve") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return `(cand_vec, src_vec, tgt_weights)` from a `traj-kl` JSON receipt containing `'trajs'`."""
+    trajs = receipt_json.get("trajs")
+    if not isinstance(trajs, list) or not trajs:
+        # Scalar fallback if an older/stub receipt lacks per-trajectory breakdown
+        n_t = max(1, int(receipt_json.get("n_tgt", 1)))
+        if mode == "preserve":
+            return np.array([float(receipt_json["kl"])], dtype=np.float64), np.zeros(1, dtype=np.float64), np.array([float(n_t)], dtype=np.float64)
+        return (
+            np.array([float(receipt_json["nll_cand"])], dtype=np.float64),
+            np.array([float(receipt_json.get("nll_src", 0.0))], dtype=np.float64),
+            np.array([float(n_t)], dtype=np.float64),
+        )
+    tw = np.array([float(r.get("n_tgt", 1)) for r in trajs], dtype=np.float64)
+    if mode == "preserve":
+        cand = np.array([float(r["kl"]) for r in trajs], dtype=np.float64)
+        src = np.zeros(len(trajs), dtype=np.float64)
+    else:
+        cand = np.array([float(r["nll_cand"]) for r in trajs], dtype=np.float64)
+        src = np.array([float(r.get("nll_src", 0.0)) for r in trajs], dtype=np.float64)
+    return cand, src, tw
 
 
 def _rank(a: np.ndarray) -> np.ndarray:

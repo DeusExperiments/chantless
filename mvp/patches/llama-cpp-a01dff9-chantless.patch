@@ -1,0 +1,349 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8b40e7..7de75f0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -135,7 +135,7 @@ option(LLAMA_BUILD_EXAMPLES  "llama: build examples"
+ option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
+-option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
++option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" OFF)
+ option(LLAMA_CONNECT         "llama: include the llama-connect tool (downloads a prebuilt binary)"               OFF)
+ 
+ option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index f05b5d6..742086a 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -319,6 +319,9 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
+ }
+ 
+ bool llama_hparams::has_kv(uint32_t il) const {
++    if (il < LLAMA_MAX_LAYERS && attn_dropped[il]) {
++        return false;
++    }
+     return kv_source(il) == il;
+ }
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 95daf48..720aa45 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -112,6 +112,10 @@ struct llama_hparams {
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+ 
++    // Chantless: sub-blocks physically absent from the GGUF (identity in the graph, no KV cache)
++    std::array<bool, LLAMA_MAX_LAYERS> attn_dropped = {};
++    std::array<bool, LLAMA_MAX_LAYERS> ffn_dropped  = {};
++
+     // per-layer expert feed-forward size
+     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr;
+     // per-layer top-k expert routing count
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3c4e598..7c2ea31 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3262,7 +3262,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             return il < hparams.n_layer() && !hparams.is_recr(il);
+                         };
+                         filter_recr = [&](uint32_t il) {
+-                            return il < hparams.n_layer() && hparams.is_recr(il);
++                            // Chantless: a physically absent gated delta net keeps no recurrent state
++                            return il < hparams.n_layer() && hparams.is_recr(il) && !hparams.attn_dropped[il];
+                         };
+ 
+                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index df245f8..6ca8c0e 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -77,23 +77,24 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
+         const int64_t n_embd_head = hparams.n_embd_head_k(i);
+         const int64_t n_embd_k    = hparams.n_embd_k_gqa(i);
+         const int64_t n_embd_v    = hparams.n_embd_v_gqa(i);
+-        const int     kv_flags    = hparams.has_kv(i) ? 0 : TENSOR_NOT_REQUIRED;
++        const int     kv_flags    = TENSOR_NOT_REQUIRED;
+ 
+-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
++        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+ 
+         // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
+         layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i),
+             {n_embd, n_embd_head * n_head + n_embd_k + n_embd_v}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+         if (!layer.wqkv) {
+-            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head * n_head}, 0);
++            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head * n_head}, TENSOR_NOT_REQUIRED);
+             layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_k}, kv_flags);
+             layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
+         }
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, TENSOR_NOT_REQUIRED);
++        hparams.attn_dropped[i] = (layer.wo == nullptr);
+ 
+-        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
++        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, TENSOR_NOT_REQUIRED);
+         layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_flags);
+-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
++        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+ 
+         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
+ 
+@@ -107,15 +108,16 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
+         int64_t n_ff_cur = hparams.n_ff(i);
+ 
+         // for expert layers, we use normal FFN as shared expert (same as python code)
+-        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+-        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd},TENSOR_NOT_REQUIRED);
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur},TENSOR_NOT_REQUIRED);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur},TENSOR_NOT_REQUIRED);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd},TENSOR_NOT_REQUIRED);
++        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd},TENSOR_NOT_REQUIRED);
+ 
+         // MoE router
+         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+         bool has_expert = layer.ffn_gate_inp != nullptr;
++        hparams.ffn_dropped[i] = (layer.ffn_down == nullptr && !has_expert);
+ 
+         // norm
+         if (has_expert) {
+@@ -140,9 +142,9 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
+ 
+         // per-layer embeddings
+         if (n_embd_per_layer > 0) {
+-            layer.per_layer_inp_gate   = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_per_layer}, 0);
+-            layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd}, 0);
+-            layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
++            layer.per_layer_inp_gate   = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_per_layer},TENSOR_NOT_REQUIRED);
++            layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd},TENSOR_NOT_REQUIRED);
++            layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd},TENSOR_NOT_REQUIRED);
+         }
+     }
+ }
+@@ -240,6 +242,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         res->t_layer_inp[il] = inpL;
+ 
++        ggml_tensor * attn_out = nullptr;
++        if (model.layers[il].wo) {
+         // norm
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+@@ -329,9 +333,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+                 LLM_NORM_RMS, il);
+         cb(cur, "attn_post_norm", il);
+ 
+-        ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
++        attn_out = ggml_add(ctx0, cur, inpL);
+         cb(attn_out, "attn_out", il);
++        } else {
++            // Chantless: attention sub-block removed, residual stream passes through
++            if (!prune_shared && il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++                inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
++            }
++            attn_out = inpL;
++        }
+ 
++        if (model.layers[il].ffn_down || model.layers[il].ffn_gate_inp) {
+         // feed-forward network
+         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
+         if (is_moe_layer) {
+@@ -408,9 +420,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         // residual connection
+         cur = ggml_add(ctx0, cur, attn_out);
++        } else {
++            // Chantless: FFN sub-block removed
++            cur = attn_out;
++        }
+ 
+         // per-layer embedding
+-        if (inp_per_layer) {
++        if (inp_per_layer && model.layers[il].per_layer_inp_gate) {
+             ggml_tensor * pe_in = cur;
+             cb(cur, "pe_in", il);
+ 
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index c01f838..a51ac12 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -12,7 +12,7 @@ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
+     }
+ }
+ 
+-void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
++void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
+     LLAMA_LOAD_LOCALS;
+ 
+     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+@@ -35,18 +35,29 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+     for (int i = 0; i < n_layer; ++i) {
+         auto & layer = layers[i];
+ 
+-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
++        // Chantless: a sub-block whose tensors are all absent from the file is physically removed.
++        // Partial removal is rejected; presence is decided by the output projection of each sub-block.
++        const bool has_attn = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT, "weight", i).str().c_str()) != nullptr;
++        const bool has_ffn  = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "weight", i).str().c_str()) != nullptr;
++        hparams.attn_dropped[i] = !has_attn;
++        hparams.ffn_dropped[i]  = !has_ffn;
+ 
+-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
++        if (has_attn) {
++            layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+ 
+-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
++            create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
++            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+ 
+-        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
++            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
++            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
++        }
++
++        if (has_ffn) {
++            layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   hparams.n_ff(i)}, 0);
++            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  hparams.n_ff(i), n_embd}, 0);
++            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   hparams.n_ff(i)}, 0);
++        }
+     }
+ }
+ 
+@@ -87,6 +98,9 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
+ 
+         ggml_tensor * inpSA = inpL;
+ 
++        ggml_tensor * ffn_inp = inpL;
++
++        if (!hparams.attn_dropped[il]) {
+         // norm
+         cur = build_norm(inpL,
+                 model.layers[il].attn_norm, NULL,
+@@ -129,9 +143,15 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++        ffn_inp = ggml_add(ctx0, cur, inpSA);
++        } else if (il == n_layer - 1 && inp_out_ids) {
++            ffn_inp = ggml_get_rows(ctx0, inpSA, inp_out_ids);
++        }
+         cb(ffn_inp, "ffn_inp", il);
+ 
++        cur = ffn_inp;
++        if (!hparams.ffn_dropped[il]) {
++
+         // feed-forward network
+         cur = build_norm(ffn_inp,
+                 model.layers[il].ffn_norm, NULL,
+@@ -147,6 +167,7 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
+         cb(cur, "ffn_out", il);
+ 
+         cur = ggml_add(ctx0, cur, ffn_inp);
++        }
+ 
+         cur = build_cvec(cur, il);
+         cb(cur, "l_out", il);
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 8a4e434..ee1968b 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -64,8 +64,29 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         const int64_t value_dim  = head_v_dim * n_v_heads;
+         const int64_t conv_dim   = key_dim * 2 + value_dim;
+ 
++        // Chantless: a sub-block whose tensors are all absent from the file is physically removed.
++        // The mixer sub-block (attn_norm + full attention or gated delta net) is present iff its output
++        // projection is; the FFN sub-block (attn_post_norm + ffn_*) iff ffn_down is. Partial removal is rejected.
++        const bool mtp_only  = hparams.n_layer_nextn > 0 && (flags & TENSOR_NOT_REQUIRED) != 0;
++        const auto mixer_out = hparams.is_recr(il) ? tn(LLM_TENSOR_SSM_OUT, "weight", il) : tn(LLM_TENSOR_ATTN_OUT, "weight", il);
++        const bool has_attn  = mtp_only || ml.get_tensor_meta(mixer_out.str().c_str()) != nullptr;
++        const bool has_ffn   = mtp_only || ml.get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "weight", il).str().c_str()) != nullptr;
++        hparams.attn_dropped[il] = !has_attn;
++        hparams.ffn_dropped[il]  = !has_ffn;
++
++        if (has_ffn) {
++            layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
++
++            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   hparams.n_ff(il)}, flags);
++            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  hparams.n_ff(il), n_embd}, flags);
++            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   hparams.n_ff(il)}, flags);
++        }
++
++        if (!has_attn) {
++            return;
++        }
++
+         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, flags);
+-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
+ 
+         if (!hparams.is_recr(il)) {
+             // Attention layers
+@@ -88,10 +109,6 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
+             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
+         }
+-
+-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
+-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
+-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+     };
+ 
+     auto load_block_mtp = [&](int il) {
+@@ -106,9 +123,9 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+ 
+-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
+-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
+-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   hparams.n_ff(il)}, mtp_flags);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  hparams.n_ff(il), n_embd}, mtp_flags);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   hparams.n_ff(il)}, mtp_flags);
+ 
+         // NextN-specific tensors that define the MTP block.
+         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
+@@ -161,6 +178,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         ggml_tensor * inpSA = inpL;
+ 
++        if (!hparams.attn_dropped[il]) {
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
+@@ -182,11 +200,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         // Residual connection
+         cur = ggml_add(ctx0, cur, inpSA);
++        } else if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
++            cur = ggml_get_rows(ctx0, inpSA, inp_out_ids);
++        } else {
++            cur = inpSA;
++        }
+         cb(cur, "attn_residual", il);
+ 
+         // Save the tensor before post-attention norm for residual connection
+         ggml_tensor * ffn_residual = cur;
+ 
++        if (!hparams.ffn_dropped[il]) {
+         // Post-attention norm
+         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+         cb(attn_post_norm, "attn_post_norm", il);
+@@ -197,6 +221,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+ 
+         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+         cur = ggml_add(ctx0, cur, ffn_residual);
++        }
+         cb(cur, "post_ffn", il);
+ 
+         cur = build_cvec(cur, il);

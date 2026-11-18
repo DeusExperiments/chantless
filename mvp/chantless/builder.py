@@ -49,20 +49,26 @@ def mask_key(mask: dict) -> str:
         core["vocab_keep"] = mask.get("vocab_keep")
         app = mask.get("apprentice") or {}
         if app.get("switches") or app.get("levels"):
-            core["apprentice"] = {"switches": app.get("switches", {}), "levels": app.get("levels", {})}
+            core["apprentice"] = {
+                "switches": app.get("switches", {}),
+                "levels": app.get("levels", {}),
+                **({"switch_mode": app["switch_mode"]} if app.get("switch_mode") else {}),
+            }
     return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()[:20]
 
 
 def _apply_apprentice(gguf_in: str | Path, gguf_out: str | Path, app: dict) -> None:
     switches = app.get("switches") or {}
     sparse = app.get("levels") or {}
+    switch_mode = app.get("switch_mode", "down_grid")
     if not switches and not sparse:
         if Path(gguf_in).resolve() != Path(gguf_out).resolve():
             shutil.copyfile(gguf_in, gguf_out)
         return
     art = lattice.Artifact(str(gguf_in))
+    row_zeros: dict[str, np.ndarray] = {}
+    updates: dict[str, np.ndarray] = {}
     try:
-        updates: dict[str, np.ndarray] = {}
         for name, spec in sparse.items():
             idx, vals = maskmod.unpack_sparse_levels(spec)
             lv = art.grid(name).levels.copy()
@@ -70,21 +76,44 @@ def _apply_apprentice(gguf_in: str | Path, gguf_out: str | Path, app: dict) -> N
             updates[name] = lv
         for k, spec in switches.items():
             il = int(k)
-            name = f"blk.{il}.ffn_down.weight"
             dead = maskmod.unpack_bitmap(spec)
             if len(dead) == 0:
                 continue
-            shape = art.shape(name)
-            g = art.grid(name)
-            lv = updates.get(name, g.levels.copy()).reshape(shape)
-            zero = np.clip(np.round(-g.lo / np.maximum(g.step, 1e-30)), 0, g.top).astype(np.uint8).reshape(shape)
-            lv[:, dead] = zero[:, dead]
-            updates[name] = lv.reshape(-1)
+            if switch_mode == "up_row_zero":
+                for suf in ("ffn_up.weight", "ffn_gate.weight"):
+                    tname = f"blk.{il}.{suf}"
+                    if tname in art.tensors:
+                        row_zeros[tname] = dead
+            else:
+                name = f"blk.{il}.ffn_down.weight"
+                shape = art.shape(name)
+                g = art.grid(name)
+                lv = updates.get(name, g.levels.copy()).reshape(shape)
+                zero = np.clip(np.round(-g.lo / np.maximum(g.step, 1e-30)), 0, g.top).astype(np.uint8).reshape(shape)
+                lv[:, dead] = zero[:, dead]
+                updates[name] = lv.reshape(-1)
     finally:
         art.close()
-    tmp = str(gguf_out) + ".app.part"
-    lattice.write_levels(str(gguf_in), tmp, updates)
-    os.replace(tmp, gguf_out)
+    cur_src = str(gguf_in)
+    tmp_mid = None
+    try:
+        if updates:
+            dst1 = str(gguf_out) + (".lvl.part" if row_zeros else ".app.part")
+            lattice.write_levels(cur_src, dst1, updates)
+            if row_zeros:
+                tmp_mid = dst1
+                cur_src = dst1
+            else:
+                os.replace(dst1, gguf_out)
+        if row_zeros:
+            tmp2 = str(gguf_out) + ".row.part"
+            lattice.zero_rows(cur_src, tmp2, row_zeros)
+            os.replace(tmp2, gguf_out)
+        elif not updates and Path(gguf_in).resolve() != Path(gguf_out).resolve():
+            shutil.copyfile(gguf_in, gguf_out)
+    finally:
+        if tmp_mid is not None:
+            Path(tmp_mid).unlink(missing_ok=True)
 
 
 class Builder:

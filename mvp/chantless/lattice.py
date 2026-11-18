@@ -120,3 +120,38 @@ def write_levels(src: str | os.PathLike, dst: str | os.PathLike, levels: dict[st
     art.close()
     os.replace(tmp, dst)
     assert Path(src).stat().st_size == Path(dst).stat().st_size
+
+
+def zero_rows(src: str | os.PathLike, dst: str | os.PathLike, row_indices: dict[str, np.ndarray]) -> None:
+    """Zero whole rows `row_indices[name]` of 2D GGUF tensors across ANY ggml quant type (`IQ1_S`..`BF16`).
+
+    For `ffn_up.weight` and `ffn_gate.weight` (`dims = [n_embd, n_ff]`), `n_embd` is a multiple of 256 so each
+    neuron row `j` owns an integer number of unshared quantization super-blocks; writing `0x00` bytes sets the
+    fp16 block scale `d = 0.0`, which dequantizes to exact `0.0f` in every ggml kernel without adding 1 byte.
+    """
+    art = Artifact(src)
+    tmp = str(dst) + ".part"
+    shutil.copyfile(src, tmp)
+    try:
+        with open(tmp, "r+b") as f:
+            for name, rows in row_indices.items():
+                idx = np.unique(np.asarray(rows, dtype=np.int64))
+                if len(idx) == 0:
+                    continue
+                t = art.tensors[name]
+                if len(t["dims"]) != 2:
+                    raise ValueError(f"zero_rows expects a 2D tensor, got {name} dims={t['dims']}")
+                n_rows = int(t["dims"][1])
+                if t["n_bytes"] % n_rows != 0:
+                    raise ValueError(f"{name}: n_bytes={t['n_bytes']} not divisible by n_rows={n_rows}")
+                if int(idx[0]) < 0 or int(idx[-1]) >= n_rows:
+                    raise ValueError(f"{name}: row index out of range [0, {n_rows})")
+                row_bytes = t["n_bytes"] // n_rows
+                buf = np.frombuffer(bytes(art.raw(name)), dtype=np.uint8).reshape(n_rows, row_bytes).copy()
+                buf[idx] = 0
+                f.seek(art.h.data_start + t["offset"])
+                f.write(buf.tobytes())
+    finally:
+        art.close()
+    os.replace(tmp, dst)
+    assert Path(src).stat().st_size == Path(dst).stat().st_size

@@ -23,10 +23,11 @@ from pathlib import Path
 import numpy as np
 from torch import nn
 
-from . import lattice
+from . import lattice, mask as maskmod
 
 LAYER_NAMES = {
     "attn_norm": "input_layernorm.weight", "post_attention_norm": "post_attention_layernorm.weight",
+    "ffn_norm": "post_attention_layernorm.weight",
     "ffn_gate": "mlp.gate_proj.weight", "ffn_up": "mlp.up_proj.weight", "ffn_down": "mlp.down_proj.weight",
     "attn_q": "self_attn.q_proj.weight", "attn_k": "self_attn.k_proj.weight", "attn_v": "self_attn.v_proj.weight",
     "attn_output": "self_attn.o_proj.weight", "attn_q_norm": "self_attn.q_norm.weight", "attn_k_norm": "self_attn.k_norm.weight",
@@ -35,6 +36,39 @@ LAYER_NAMES = {
     "ssm_out": "linear_attn.out_proj.weight", "ssm_norm": "linear_attn.norm.weight",
     "ssm_conv1d": "linear_attn.conv1d.weight", "ssm_a": "linear_attn.A_log", "ssm_dt": "linear_attn.dt_bias",
 }
+
+_GGML_LIBS_CACHE: dict[str, list[ctypes.CDLL]] = {}
+
+
+def _load_ggml_libs(ggml_lib: str | None) -> list[ctypes.CDLL]:
+    if not ggml_lib:
+        raise ValueError("ggml_lib path (directory or shared library) is required to dequantize non-grid tensors")
+    key = str(Path(ggml_lib).resolve())
+    if key in _GGML_LIBS_CACHE:
+        return _GGML_LIBS_CACHE[key]
+    p = Path(key)
+    lib_dir = p if p.is_dir() else p.parent
+    cands: list[Path] = ([] if p.is_dir() else [p])
+    for stem in ("libggml-base", "libggml-cpu", "libggml", "libllama"):
+        for ext in (".so", ".dylib"):
+            cand = lib_dir / f"{stem}{ext}"
+            if cand.exists() and cand not in cands:
+                cands.append(cand)
+    loaded: list[ctypes.CDLL] = []
+    for c in cands:
+        try:
+            loaded.append(ctypes.CDLL(str(c), mode=getattr(ctypes, "RTLD_GLOBAL", 0)))
+        except OSError:
+            loaded.append(ctypes.CDLL(str(c)))
+    # Initialize IQ2_XS / IQ1_S lookup grids once before calling `dequantize_row_*`
+    for lib in loaded:
+        init_fn = getattr(lib, "llama_backend_init", None) or getattr(lib, "ggml_cpu_init", None)
+        if init_fn is not None:
+            init_fn.argtypes, init_fn.restype = [], None
+            init_fn()
+            break
+    _GGML_LIBS_CACHE[key] = loaded
+    return loaded
 
 
 class OnGrid(nn.Module):
@@ -58,6 +92,8 @@ def hf_name(gg: str) -> str:
         return "model.embed_tokens.weight"
     if gg == "output_norm.weight":
         return "model.norm.weight"
+    if gg == "output.weight":
+        return "lm_head.weight"
     p = gg.split(".")
     return f"model.layers.{p[1]}.{LAYER_NAMES[p[2]]}"
 
@@ -67,12 +103,20 @@ def floats(art: lattice.Artifact, name: str, ggml_lib: str | None) -> np.ndarray
     t, shape = art.tensors[name], art.shape(name)
     if t["type"] == "F32":
         return np.frombuffer(art.raw(name), dtype="<f4").reshape(shape)
+    if t["type"] == "F16":
+        return np.frombuffer(art.raw(name), dtype="<f2").astype(np.float32).reshape(shape)
     if t["type"] == "BF16":    # the top half of a float32; ggml has no dequantize_row_bf16
         return (np.frombuffer(art.raw(name), dtype="<u2").astype("<u4") << 16).view("<f4").reshape(shape)
     if t["type"] in lattice.TOP:
         return art.grid(name).values().reshape(shape)
-    lib = ctypes.CDLL(ggml_lib)
-    fn = getattr(lib, f"dequantize_row_{t['type'].lower()}")
+    sym = f"dequantize_row_{t['type'].lower()}"
+    fn = None
+    for lib in _load_ggml_libs(ggml_lib):
+        fn = getattr(lib, sym, None)
+        if fn is not None:
+            break
+    if fn is None:
+        raise RuntimeError(f"could not find {sym} in {ggml_lib}")
     fn.argtypes, fn.restype = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int64], None
     y = np.empty(t["n_elements"], np.float32)
     fn(bytes(art.raw(name)), y.ctypes.data, t["n_elements"])
@@ -108,9 +152,33 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
             return (z, None) if self.pair else z
 
     conf = AutoConfig.from_pretrained(config_dir)
+    if hasattr(conf, "get_text_config"):
+        conf = conf.get_text_config()
+    elif hasattr(conf, "text_config"):
+        conf = conf.text_config
     conf.vocab_size = art.tensors["token_embd.weight"]["dims"][1]
     conf.use_cache = False
     model = AutoModelForCausalLM.from_config(conf, dtype=torch.float32)
+    # `(1 + weight)` RMSNorm models (`Qwen3_5`, `Gemma`) init `norm.weight` to zeros; standard `RMSNorm` (`Qwen3`) inits to ones.
+    norm_offset = 1.0 if float(model.model.norm.weight.detach().abs().max()) == 0.0 else 0.0
+    num_k_heads = int(getattr(conf, "linear_num_key_heads", 0) or 0)
+    num_v_heads = int(getattr(conf, "linear_num_value_heads", 0) or 0)
+    head_k_dim = int(getattr(conf, "linear_key_head_dim", 0) or 0)
+    head_v_dim = int(getattr(conf, "linear_value_head_dim", 0) or 0)
+    unreorder_gdn_v = (num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads
+                       and getattr(art.h, "arch", "") in ("qwen35", "qwen3next"))
+    num_v_per_k = (num_v_heads // num_k_heads) if unreorder_gdn_v else 1
+    qk_half = head_k_dim * num_k_heads
+
+    def _unreorder_v(t, dim: int, hdim: int):
+        sh = list(t.shape)
+        if dim < 0:
+            dim += len(sh)
+        ns = sh[:dim] + [num_v_per_k, num_k_heads, hdim] + sh[dim + 1:]
+        perm = list(range(len(ns)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return t.reshape(*ns).permute(*perm).contiguous().reshape(*sh)
+
     for il, layer in enumerate(model.model.layers):
         if f"blk.{il}.ffn_down.weight" not in art.tensors:
             layer.mlp = Zero(False)
@@ -119,25 +187,41 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
                 rows, cols = art.shape(f"blk.{il}.{gg}.weight")
                 setattr(layer.mlp, nm, nn.Linear(cols, rows, bias=False))
         if not ({f"blk.{il}.ssm_out.weight", f"blk.{il}.attn_output.weight"} & art.tensors.keys()):
-            if layer.block_type == "linear_attention":
+            if getattr(layer, "block_type", "attention") == "linear_attention":
                 layer.linear_attn = Zero(False)
             else:
                 layer.self_attn = Zero(True)
     params = dict(model.named_parameters())
     for name in art.tensors:
-        p, v = params[hf_name(name)], torch.from_numpy(floats(art, name, ggml_lib).copy())
-        # the three places conversion to GGUF changes a value (conversion/qwen.py, Qwen3NextModel.modify_tensors)
+        hfn = hf_name(name)
+        if hfn == "lm_head.weight" and hfn not in params:
+            model.lm_head = nn.Linear(art.shape(name)[1], art.shape(name)[0], bias=False)
+            params[hfn] = model.lm_head.weight
+        p, v = params[hfn], torch.from_numpy(floats(art, name, ggml_lib).copy())
+        # conversion to GGUF adjustments (conversion/qwen.py, Qwen3NextModel & _LinearAttentionVReorderBase)
         if "ssm_conv1d" in name:
             v = v.unsqueeze(1)
         elif name.endswith(".ssm_a"):
             v = torch.log(-v)
-        elif name.endswith("norm.weight") and "ssm_norm" not in name:
-            v = v - 1
+        elif name.endswith("norm.weight") and "ssm_norm" not in name and norm_offset != 0.0:
+            v = v - norm_offset
+        if unreorder_gdn_v and "linear_attn." in hfn:
+            if ".in_proj_qkv." in hfn or ".conv1d." in hfn:
+                v = torch.cat([v[: 2 * qk_half], _unreorder_v(v[2 * qk_half :], 0, head_v_dim)], dim=0)
+            elif ".in_proj_z." in hfn:
+                v = _unreorder_v(v, 0, head_v_dim)
+            elif ".in_proj_a." in hfn or ".in_proj_b." in hfn:
+                v = _unreorder_v(v, 0, 1)
+            elif hfn.endswith(".A_log") or hfn.endswith(".dt_bias"):
+                v = _unreorder_v(v.unsqueeze(-1), 0, 1).squeeze(-1)
+            elif ".out_proj." in hfn:
+                v = _unreorder_v(v, 1, head_v_dim)
         assert p.shape == v.shape, (name, p.shape, v.shape)
         p.data = v
     for p in model.parameters():
         p.requires_grad_(False)
-    model.lm_head.weight = model.model.embed_tokens.weight
+    if "output.weight" not in art.tensors:
+        model.lm_head.weight = model.model.embed_tokens.weight
     model.to(device)
     mods = dict(model.named_modules())
     grids = {}
@@ -460,21 +544,101 @@ def learn(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.
     return rec
 
 
-def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int],
-                cutoff: float, out: str, cfg: dict, log=print, device: str | None = None, strata: list[str] | None = None) -> dict:
-    """Weights stay fixed and only one on/off switch per kept neuron learns, by a straight-through gradient. A switched-off
-    neuron is written as its outgoing column set as near zero as the grid allows, so the real file can be judged as usual."""
+def _apply_switches_to_file_and_mask(
+    art: lattice.Artifact,
+    art_path: str,
+    out: str,
+    layers: list[int],
+    theta: dict,
+    switch_mode: str,
+    mask_in: dict | str | Path | None = None,
+    mask_out: str | Path | None = None,
+) -> tuple[dict[int, list[int]], int, dict[int, int], dict | None]:
+    off: dict[int, list[int]] = {}
+    widths_by_layer: dict[int, int] = {}
+    bits = 0
+    if switch_mode == "up_row_zero":
+        row_zeros: dict[str, np.ndarray] = {}
+        for il in layers:
+            w_il = int(art.shape(f"blk.{il}.ffn_up.weight")[0])
+            widths_by_layer[il] = w_il
+            dead = np.flatnonzero(theta[il].detach().cpu().numpy() <= 0)
+            off[il] = dead.tolist()
+            bits += w_il
+            if len(dead):
+                for suf in ("ffn_up.weight", "ffn_gate.weight"):
+                    tname = f"blk.{il}.{suf}"
+                    if tname in art.tensors:
+                        row_zeros[tname] = dead
+        lattice.zero_rows(art_path, out, row_zeros)
+    else:
+        levels: dict[str, np.ndarray] = {}
+        for il in layers:
+            name, shape = f"blk.{il}.ffn_down.weight", art.shape(f"blk.{il}.ffn_down.weight")
+            widths_by_layer[il] = int(shape[1])
+            dead = np.flatnonzero(theta[il].detach().cpu().numpy() <= 0)
+            off[il], bits = dead.tolist(), bits + int(shape[1])
+            if len(dead):
+                g = art.grid(name)
+                lv = g.levels.reshape(shape).copy()
+                zero = np.clip(np.round(-g.lo / np.maximum(g.step, 1e-30)), 0, g.top).astype(np.uint8).reshape(shape)
+                lv[:, dead] = zero[:, dead]
+                levels[name] = lv.reshape(-1)
+        lattice.write_levels(art_path, out, levels)
+
+    m_v3 = None
+    if mask_in is not None:
+        raw_m = maskmod.load(mask_in) if isinstance(mask_in, (str, Path)) else mask_in
+        m_v3 = maskmod.upgrade_v2(raw_m)
+        m_v3["apprentice"]["switch_mode"] = switch_mode
+        m_v3["apprentice"]["switches"] = {
+            str(il): maskmod.pack_bitmap(dead, widths_by_layer[il])
+            for il, dead in sorted(off.items()) if len(dead) > 0
+        }
+        if mask_out is not None:
+            Path(mask_out).write_text(json.dumps(m_v3))
+    return off, bits, widths_by_layer, m_v3
+
+
+def _switchable_layers(art: lattice.Artifact, n_layers: int, switch_mode: str, last_blocks: int | None = None) -> list[int]:
+    if switch_mode == "up_row_zero":
+        layers = [
+            il for il in range(n_layers)
+            if f"blk.{il}.ffn_up.weight" in art.tensors and f"blk.{il}.ffn_gate.weight" in art.tensors and f"blk.{il}.ffn_down.weight" in art.tensors
+        ]
+    else:
+        layers = [il for il in range(n_layers) if art.tensors.get(f"blk.{il}.ffn_down.weight", {}).get("type") in lattice.TOP]
+    if last_blocks is not None and last_blocks > 0:
+        layers = layers[-int(last_blocks):]
+    return layers
+
+
+def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int] | None = None,
+                cutoff: float = 0.0, out: str = "", cfg: dict | None = None, log=print, device: str | None = None,
+                strata: list[str] | None = None, mask_in: dict | str | Path | None = None, mask_out: str | Path | None = None) -> dict:
+    """Weights stay fixed and only one on/off switch per kept neuron learns, by a straight-through gradient.
+
+    When `pair is None` or `cfg.get("task_kind") == "generative"`, dispatches to `learn_gates_seq` on sequence trajectories.
+    With `switch_mode == "up_row_zero"` (default), switched-off neurons zero contiguous super-block rows in `ffn_up` & `ffn_gate`
+    across ALL ggml quant types (`IQ1_S`, `IQ2_XS`, `Q2_K`..`Q8_0`, `BF16`) for exact `0.0f` parity with zero bytes added.
+    """
+    cfg = cfg or {}
+    if pair is None or cfg.get("task_kind") == "generative":
+        return learn_gates_seq(art_path, config_dir, feedback, replay, out, cfg, log=log, device=device, mask_in=mask_in, mask_out=mask_out)
+
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     amp = device.startswith("cuda")
+    switch_mode = cfg.get("switch_mode", "up_row_zero")
     art = lattice.Artifact(art_path)
     model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
     if cfg.get("checkpointing", True) and amp:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
-    layers = [il for il in range(len(model.model.layers)) if art.tensors.get(f"blk.{il}.ffn_down.weight", {}).get("type") in lattice.TOP]
-    theta = {il: torch.nn.Parameter(torch.ones(art.shape(f"blk.{il}.ffn_down.weight")[1], device=device)) for il in layers}
+    layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
+    init_val = float(cfg.get("gate_init", 1.0))
+    theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
 
     def hook(il):
         def f(mod, args):
@@ -488,25 +652,306 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, cfg.get("gate_lr", 0.03))
     for h in hooks:
         h.remove()
-    levels, off, bits = {}, {}, 0
-    for il in layers:
-        name, shape = f"blk.{il}.ffn_down.weight", art.shape(f"blk.{il}.ffn_down.weight")
-        dead = np.flatnonzero(theta[il].detach().cpu().numpy() <= 0)
-        off[il], bits = dead.tolist(), bits + shape[1]
-        if len(dead):
-            g = art.grid(name)
-            lv = g.levels.reshape(shape).copy()
-            zero = np.clip(np.round(-g.lo / np.maximum(g.step, 1e-30)), 0, g.top).astype(np.uint8).reshape(shape)
-            lv[:, dead] = zero[:, dead]
-            levels[name] = lv.reshape(-1)
-    lattice.write_levels(art_path, out, levels)
+    off, bits, _, m_v3 = _apply_switches_to_file_and_mask(
+        art, art_path, out, layers, theta, switch_mode,
+        mask_in=mask_in or cfg.get("mask_in"), mask_out=mask_out or cfg.get("mask_out"),
+    )
     art.close()
     n = sum(map(len, off.values()))
-    rec = {"method": "gates", "steps": cfg.get("steps", 200), "gate_lr": cfg.get("gate_lr", 0.03), "neurons": bits, "off": n, "fraction_moved": n / max(1, bits), "off_by_layer": {str(k): len(v) for k, v in off.items()},
+    rec = {"method": "gates", "switch_mode": switch_mode, "steps": cfg.get("steps", 200), "gate_lr": cfg.get("gate_lr", 0.03),
+           "neurons": bits, "off": n, "fraction_moved": n / max(1, bits), "off_by_layer": {str(k): len(v) for k, v in off.items()},
            "loss_first": hist[0] if hist else None, "loss_last": hist[-1] if hist else None, "n_feedback": len(feedback), "n_replay": len(replay),
            "base_sha256": sha256(art_path), "out_sha256": sha256(out), "bytes": Path(out).stat().st_size}
     Path(str(out) + ".lineage.json").write_text(json.dumps(rec, indent=1))
     Path(str(out) + ".switches.json").write_text(json.dumps({str(k): v for k, v in off.items()}))
+    if m_v3 is not None:
+        rec["mask"] = m_v3
+    return rec
+
+
+def read_trj_multi(path: str | Path) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Read any single- or multi-target `TRJ1` file into `[(tokens_i32, targets_u32), ...]`."""
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    with open(path, "rb") as f:
+        if f.read(4) != b"TRJ1":
+            raise ValueError(f"{path}: bad TRJ1 magic")
+        (n,) = struct.unpack("<I", f.read(4))
+        for _ in range(n):
+            nt, ng = struct.unpack("<II", f.read(8))
+            tok = np.frombuffer(f.read(4 * nt), dtype=np.int32).copy()
+            tgt = np.frombuffer(f.read(4 * ng), dtype=np.uint32).copy()
+            out.append((tok, tgt))
+    return out
+
+
+def _norm_seq_lesson(r: dict) -> dict:
+    if "pos_tokens" in r and "pos_targets" in r:
+        pos_tok = np.asarray(r["pos_tokens"], dtype=np.int64)
+        pos_tgt = np.asarray(r["pos_targets"], dtype=np.int64)
+        neg_tok = np.asarray(r["neg_tokens"], dtype=np.int64) if r.get("neg_tokens") is not None else None
+        neg_tgt = np.asarray(r["neg_targets"], dtype=np.int64) if r.get("neg_targets") is not None else None
+    elif "prompt_tokens" in r and "corrected_tokens" in r:
+        pr = list(map(int, r["prompt_tokens"]))
+        good = list(map(int, r["corrected_tokens"]))
+        if not pr or not good:
+            raise ValueError("prompt_tokens and corrected_tokens must be non-empty")
+        pos_tok = np.asarray(pr + good, dtype=np.int64)
+        pos_tgt = np.arange(len(pr), len(pos_tok), dtype=np.int64)
+        bad = list(map(int, r["mistaken_tokens"])) if r.get("mistaken_tokens") else []
+        if bad:
+            neg_tok = np.asarray(pr + bad, dtype=np.int64)
+            neg_tgt = np.arange(len(pr), len(neg_tok), dtype=np.int64)
+        else:
+            neg_tok = neg_tgt = None
+    else:
+        raise ValueError("generative lesson needs ('pos_tokens', 'pos_targets') or ('prompt_tokens', 'corrected_tokens')")
+    if len(pos_tgt) == 0 or int(pos_tgt[0]) < 1 or int(pos_tgt[-1]) >= len(pos_tok):
+        raise ValueError("pos_targets must satisfy 1 <= t < len(pos_tokens)")
+    if neg_tok is not None and (neg_tgt is None or len(neg_tgt) == 0 or int(neg_tgt[0]) < 1 or int(neg_tgt[-1]) >= len(neg_tok)):
+        raise ValueError("neg_targets must satisfy 1 <= t < len(neg_tokens)")
+    return {"pos_tokens": pos_tok, "pos_targets": pos_tgt, "neg_tokens": neg_tok, "neg_targets": neg_tgt}
+
+
+def _norm_replay_traj(item) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(item, dict):
+        tok, tgt = np.asarray(item["tokens"], dtype=np.int64), np.asarray(item["targets"], dtype=np.int64)
+    else:
+        tok, tgt = np.asarray(item[0], dtype=np.int64), np.asarray(item[1], dtype=np.int64)
+    if len(tgt) == 0 or int(tgt[0]) < 1 or int(tgt[-1]) >= len(tok):
+        raise ValueError("replay trajectory targets must satisfy 1 <= t < len(tokens)")
+    return tok, tgt
+
+
+def collate_right(seqs: list[np.ndarray], device: str, round_to: int = 32):
+    """Right-padded batch so causal `position_ids = 0..L-1` and `logits[k, t - 1]` match unpadded prefixes."""
+    import torch
+    max_l = max(len(s) for s in seqs)
+    n = int(-(-max_l // round_to) * round_to) if round_to > 1 else max_l
+    ids = torch.zeros((len(seqs), n), dtype=torch.long)
+    mask = torch.zeros((len(seqs), n), dtype=torch.long)
+    for k, s in enumerate(seqs):
+        ln = len(s)
+        ids[k, :ln] = torch.from_numpy(np.asarray(s, dtype=np.int64))
+        mask[k, :ln] = 1
+    return ids.to(device), mask.to(device)
+
+
+def _forward_backbone(model, seqs: list[np.ndarray], device: str, amp: bool, round_to: int = 32):
+    import torch
+    ids, attn = collate_right(seqs, device, round_to=round_to)
+    dev_type = device.split(":")[0]
+    if amp and dev_type == "cuda":
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return model.model(input_ids=ids, attention_mask=attn).last_hidden_state
+    return model.model(input_ids=ids, attention_mask=attn).last_hidden_state
+
+
+def _seq_mean_logprob(model, h_batch, seqs: list[np.ndarray], tgts: list[np.ndarray]):
+    """Compute length-normalized mean target log-prob `mean_{t in tgt} log p(tok[t] | tok[:t])` per sequence."""
+    import torch
+    out = []
+    for k, (tok, tgt) in enumerate(zip(seqs, tgts)):
+        pos_idx = torch.from_numpy(tgt - 1).to(h_batch.device, dtype=torch.long)
+        lbl = torch.from_numpy(tok[tgt]).to(h_batch.device, dtype=torch.long)
+        logits = model.lm_head(h_batch[k, pos_idx]).float()
+        logp = torch.log_softmax(logits, dim=-1)
+        picked = logp.gather(-1, lbl.unsqueeze(-1)).squeeze(-1)
+        out.append(picked.mean())
+    return torch.stack(out)
+
+
+def student_traj_nll(model, trajs: list[tuple[np.ndarray, np.ndarray]], device: str = "cpu", amp: bool = False) -> list[dict]:
+    """Evaluate exact per-trajectory `(n_tok, n_tgt, nll_cand, top1)` on `TRJ1` pairs using the PyTorch student."""
+    import torch
+    res = []
+    with torch.no_grad():
+        for i, (tok_raw, tgt_raw) in enumerate(trajs):
+            tok = np.asarray(tok_raw, dtype=np.int64)
+            tgt = np.asarray(tgt_raw, dtype=np.int64)
+            h = _forward_backbone(model, [tok], device, amp, round_to=1)[0]
+            pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
+            lbl = torch.from_numpy(tok[tgt]).to(device, dtype=torch.long)
+            logits = model.lm_head(h[pos_idx]).float()
+            logp = torch.log_softmax(logits, dim=-1)
+            nll = float(-logp.gather(-1, lbl.unsqueeze(-1)).squeeze(-1).mean().item())
+            top1 = float((logits.argmax(dim=-1) == lbl).float().mean().item())
+            res.append({"i": i, "n_tok": int(len(tok)), "n_tgt": int(len(tgt)), "nll_cand": nll, "top1": top1})
+    return res
+
+
+def learn_gates_seq(
+    art_path: str,
+    config_dir: str,
+    feedback: list[dict],
+    replay: list,
+    out: str,
+    cfg: dict | None = None,
+    log=print,
+    device: str | None = None,
+    mask_in: dict | str | Path | None = None,
+    mask_out: str | Path | None = None,
+) -> dict:
+    """Generative / tool-calling switch Apprentice (`<=25` mistake lessons + replay KL hold + A-GEM projection).
+
+    Optimizes straight-through binary MLP neuron switches `theta` (`1` bit/neuron, zero weight values changed, zero bytes added):
+      - Lesson objective: `-nll_weight * mean_logp(y+ | x) + margin_weight * softplus(margin - (mean_logp(y+ | x) - mean_logp(y- | x)))`
+      - Replay hold: exact full-vocabulary token KL at replay target positions from cached pre-`lm_head` states `h0`
+      - A-GEM projection: projects conflicting lesson gradients orthogonal to replay-hold gradients whenever `dot(g_new, g_hold) < 0`
+    """
+    import torch
+
+    cfg = cfg or {}
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp = device.startswith("cuda") and bool(cfg.get("amp", True))
+    switch_mode = cfg.get("switch_mode", "up_row_zero")
+    pad_mult = int(cfg.get("pad_multiple", 32))
+
+    lessons = [_norm_seq_lesson(r) for r in feedback]
+    if not lessons:
+        raise ValueError("learn_gates_seq requires at least one feedback lesson")
+    rep_trajs = [_norm_replay_traj(x) for x in replay]
+
+    art = lattice.Artifact(art_path)
+    model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
+    if cfg.get("checkpointing", False) and amp:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.train()
+
+    layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
+    if not layers:
+        art.close()
+        raise RuntimeError(f"no switchable FFN layers found in {art_path} under switch_mode={switch_mode!r}")
+
+    init_val = float(cfg.get("gate_init", 1.0))
+    theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
+
+    # Cache frozen starting model's pre-`lm_head` hidden states `h0` at replay target positions (100x smaller than full-vocab logits!)
+    replay_h0: list[torch.Tensor] = []
+    with torch.no_grad():
+        for tok, tgt in rep_trajs:
+            h = _forward_backbone(model, [tok], device, amp, round_to=pad_mult)[0]
+            pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
+            replay_h0.append(h[pos_idx].detach().to(torch.bfloat16 if amp else torch.float32).cpu())
+
+    def hook(il):
+        def f(mod, args):
+            s = torch.sigmoid(theta[il])
+            g = (theta[il] > 0).float() + s - s.detach()
+            return (args[0] * g.to(args[0].dtype),)
+        return f
+
+    hooks = [model.model.layers[il].mlp.down_proj.register_forward_pre_hook(hook(il)) for il in layers]
+    flat = list(theta.values())
+    opt = torch.optim.AdamW(flat, lr=float(cfg.get("gate_lr", 0.05)), weight_decay=0.0)
+    rng = random.Random(cfg.get("seed", 20261031))
+
+    steps = int(cfg.get("steps", 80))
+    nf = int(cfg.get("feedback_batch", min(4, len(lessons))))
+    nr = int(cfg.get("replay_batch", min(4, len(rep_trajs)))) if rep_trajs else 0
+    nll_w = float(cfg.get("nll_weight", 1.0))
+    margin_w = float(cfg.get("margin_weight", 1.0))
+    margin = float(cfg.get("margin", 0.5))
+    hold_w = float(cfg.get("replay_weight", 2.0))
+    kl_temp = float(cfg.get("kl_temp", 1.0))
+    use_agem = bool(cfg.get("project", True))
+
+    log(f"learn_gates_seq: {sum(w.numel() for w in flat):,} switches across {len(layers)} FFN layers, {len(lessons)} lessons, {len(rep_trajs)} replay")
+    hist: list[tuple[float, float, float]] = []
+    conflicts = 0
+
+    for step in range(steps):
+        fb_batch = rng.sample(lessons, min(nf, len(lessons)))
+        pos_seqs = [r["pos_tokens"] for r in fb_batch]
+        pos_tgts = [r["pos_targets"] for r in fb_batch]
+        h_pos = _forward_backbone(model, pos_seqs, device, amp, round_to=pad_mult)
+        lp_pos = _seq_mean_logprob(model, h_pos, pos_seqs, pos_tgts)
+        loss_nll = -lp_pos.mean()
+
+        neg_idx = [k for k, r in enumerate(fb_batch) if r["neg_tokens"] is not None]
+        if neg_idx:
+            neg_seqs = [fb_batch[k]["neg_tokens"] for k in neg_idx]
+            neg_tgts = [fb_batch[k]["neg_targets"] for k in neg_idx]
+            h_neg = _forward_backbone(model, neg_seqs, device, amp, round_to=pad_mult)
+            lp_neg = _seq_mean_logprob(model, h_neg, neg_seqs, neg_tgts)
+            loss_margin = torch.nn.functional.softplus(margin - (lp_pos[neg_idx] - lp_neg)).mean()
+        else:
+            loss_margin = torch.zeros((), device=device)
+
+        loss_new = nll_w * loss_nll + margin_w * loss_margin
+
+        if nr > 0:
+            r_ids = rng.sample(range(len(rep_trajs)), min(nr, len(rep_trajs)))
+            r_seqs = [rep_trajs[i][0] for i in r_ids]
+            h_rep = _forward_backbone(model, r_seqs, device, amp, round_to=pad_mult)
+            kl_terms = []
+            for k, i in enumerate(r_ids):
+                tgt = rep_trajs[i][1]
+                pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
+                h_cur = h_rep[k, pos_idx]
+                h_ref = replay_h0[i].to(device=device, dtype=h_cur.dtype)
+                with torch.no_grad():
+                    log_p0 = torch.log_softmax(model.lm_head(h_ref).float() / kl_temp, dim=-1)
+                    p0 = log_p0.exp()
+                log_pc = torch.log_softmax(model.lm_head(h_cur).float() / kl_temp, dim=-1)
+                kl_terms.append((p0 * (log_p0 - log_pc)).sum(dim=-1).mean() * (kl_temp * kl_temp))
+            loss_hold = torch.stack(kl_terms).mean()
+        else:
+            loss_hold = torch.zeros((), device=device)
+
+        opt.zero_grad()
+        if use_agem and nr > 0 and hold_w > 0:
+            scaled_hold = hold_w * loss_hold
+            g_new = torch.autograd.grad(loss_new, flat, retain_graph=True, allow_unused=True)
+            g_old = torch.autograd.grad(scaled_hold, flat, allow_unused=True)
+            g_new = [torch.zeros_like(p) if g is None else g for g, p in zip(g_new, flat)]
+            g_old = [torch.zeros_like(p) if g is None else g for g, p in zip(g_old, flat)]
+            dot = sum((a * b).sum() for a, b in zip(g_new, g_old))
+            if dot < 0:
+                ratio = dot / sum((b * b).sum() for b in g_old).clamp_min(1e-30)
+                g_new = [a - ratio * b for a, b in zip(g_new, g_old)]
+                conflicts += 1
+            for p, a, b in zip(flat, g_new, g_old):
+                p.grad = a + b
+        else:
+            (loss_new + hold_w * loss_hold).backward()
+        opt.step()
+
+        hist.append((float(loss_nll.item()), float(loss_margin.item()), float(loss_hold.item())))
+        if step % max(1, steps // 5) == 0 or step == steps - 1:
+            log(f"learn_gates_seq step {step}/{steps}: nll={hist[-1][0]:.4f} margin={hist[-1][1]:.4f} replay_kl={hist[-1][2]:.5f}")
+
+    for h in hooks:
+        h.remove()
+
+    off, bits, _, m_v3 = _apply_switches_to_file_and_mask(
+        art, art_path, out, layers, theta, switch_mode,
+        mask_in=mask_in or cfg.get("mask_in"), mask_out=mask_out or cfg.get("mask_out"),
+    )
+    art.close()
+    n_off = sum(map(len, off.values()))
+    rec = {
+        "method": "gates_seq",
+        "switch_mode": switch_mode,
+        "steps": steps,
+        "gate_lr": float(cfg.get("gate_lr", 0.05)),
+        "neurons": bits,
+        "off": n_off,
+        "fraction_moved": n_off / max(1, bits),
+        "off_by_layer": {str(k): len(v) for k, v in off.items()},
+        "agem_conflicts": conflicts,
+        "loss_first": hist[0] if hist else None,
+        "loss_last": hist[-1] if hist else None,
+        "n_feedback": len(lessons),
+        "n_replay": len(rep_trajs),
+        "base_sha256": sha256(art_path),
+        "out_sha256": sha256(out),
+        "bytes": Path(out).stat().st_size,
+    }
+    Path(str(out) + ".lineage.json").write_text(json.dumps(rec, indent=1))
+    Path(str(out) + ".switches.json").write_text(json.dumps({str(k): v for k, v in off.items()}))
+    if m_v3 is not None:
+        rec["mask"] = m_v3
     return rec
 
 

@@ -209,8 +209,8 @@ int main(int argc, char ** argv) {
 
         const long n = (long) T.tgt.size();
         tot_n += n; tot_kl += kl_sum; tot_nll_c += nll_c; tot_nll_s += nll_s; tot_top1 += top1;
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s{\"i\":%zu,\"n_tok\":%zu,\"n_tgt\":%ld,\"kl\":%.6g,\"nll_src\":%.6g,\"nll_cand\":%.6g,\"top1\":%.6g}",
+        char buf[320];
+        snprintf(buf, sizeof buf, "%s{\"i\":%zu,\"n_tok\":%zu,\"n_tgt\":%ld,\"kl\":%.9g,\"nll_src\":%.9g,\"nll_cand\":%.9g,\"top1\":%.6g}",
                  ti ? "," : "", ti, T.tok.size(), n, n ? kl_sum / n : 0.0, n ? nll_s / n : 0.0, n ? nll_c / n : 0.0,
                  n ? (double) top1 / n : 0.0);
         per_traj_json += buf;
