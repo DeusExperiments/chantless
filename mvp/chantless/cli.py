@@ -1,4 +1,5 @@
 """python -m chantless.cli run --config configs/X.json [--upto PHASE] [--reset PHASE]
+python -m chantless.cli build --source BASE.gguf --mask MASK.json --out SPECIALIST.gguf [--imatrix IM.gguf] [--hf-dir DIR] [--llama-bin BIN] [--threads N]
 python -m chantless.cli plan --config configs/X.json [--rates R.json] [--source MODEL.gguf]
 python -m chantless.cli learn --config configs/X.json [--fold N]
 python -m chantless.cli anneal --config configs/X.json [--stage setup|sweep|pick|arm|judge|report] [--arm NAME] [--gpu ID] [--lr RATE] [--model MODEL.gguf]"""
@@ -20,6 +21,16 @@ def main():
     r.add_argument("--config", required=True)
     r.add_argument("--upto", choices=PHASES)
     r.add_argument("--reset", choices=PHASES, help="clear this phase marker and all later ones")
+    bd = sub.add_parser("build", help="materialize a standalone GGUF deterministically from frozen source + thin mask")
+    bd.add_argument("--source", required=True, help="frozen BF16/F16 source GGUF")
+    bd.add_argument("--mask", required=True, help="chantless.mask/v3 (or v2/v1) JSON file")
+    bd.add_argument("--out", required=True, help="output specialist GGUF path")
+    bd.add_argument("--imatrix", help="importance-matrix GGUF (required when mask uses IQ tiers or width cuts with IQ)")
+    bd.add_argument("--hf-dir", help="optional HF config directory for shared-KV metadata")
+    bd.add_argument("--llama-bin", default="", help="directory containing llama-quantize")
+    bd.add_argument("--threads", type=int, default=8)
+    bd.add_argument("--shards", type=int, default=0, help="parallel llama-quantize CPU worker shards (0 = auto)")
+    bd.add_argument("--work", help="deterministic scratch directory (defaults next to --out)")
     pl = sub.add_parser("plan", help="estimate moves, episodes, tokens, wall-clock and cost without running")
     pl.add_argument("--config", required=True)
     pl.add_argument("--rates", help="JSON {backend: {field: value}} merged over plan.RATES")
@@ -35,6 +46,23 @@ def main():
     an.add_argument("--lr", type=float, help="the rate for --stage sweep")
     an.add_argument("--model", help="the file for --stage judge; default the arm's entry in the config's rows")
     a = ap.parse_args()
+    if a.cmd == "build":
+        import shutil
+        from . import builder as bmod, gguf_ops, mask as mk
+        from .runtime import Toolchain
+        groups, _ = gguf_ops.adapter_from_gguf(a.source, a.hf_dir)
+        m = mk.load(a.mask)
+        tc = Toolchain(Path(a.llama_bin), Path("/bin/true"), [""])
+        out_p = Path(a.out).resolve()
+        work_p = Path(a.work) if a.work else (out_p.parent / f".work-{out_p.stem}")
+        created_work = not work_p.exists()
+        try:
+            res = bmod.Builder(tc, a.source, groups, a.imatrix, work_p, threads=a.threads, quantize_shards=a.shards).build(m, a.out)
+        finally:
+            if created_work and not a.work:
+                shutil.rmtree(work_p, ignore_errors=True)
+        print(json.dumps(res.to_dict(), indent=2))
+        return
     cfg = json.loads(Path(a.config).read_text())
     if a.cmd == "anneal":
         from .anneal import main as anneal_main

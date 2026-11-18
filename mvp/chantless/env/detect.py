@@ -1,15 +1,10 @@
-"""Detector environment: each task is one document, and an episode is one forward pass of the detector.
+"""Detector environment shared across architectures (Qwen, Gemma 4, etc.): one document -> one forward pass.
 
-Entry point: make_environment(**kwargs). The model reads the document in the ProseLens chat prompt and the
-episode records p(human) from the "human" and "ai" probabilities at the answer position. Success means the
-label at the fixed cutoff is right (AI when p(human) < cutoff). Search and select documents come from the
-WildOutlines validation split, minus the 2,000 documents the detector run used for its loss curve; the exam
-is WildOutlines test plus Beemo. Families are split/source/format/label, so no family crosses splits.
-
-With classifier=True the environment is judged at each model's own operating point instead (see
-CLASSIFIER-CONTRACT.md): a calibration split of the source's 20,000 calibration humans sets the cutoff, the
-evaluator scores tasks in batch through score() and decides with calibrate()/decide(), and Beemo's search
-prompts (sha256(prompt_id) % 10 < 3) join the search and select splits while the other 70% join the exam.
+Entry point: `make_environment(**kwargs)`. Supports both ChatML (`prompt_style="qwen_chatml"`, byte-identical to
+the original Qwen runs) and Hugging Face chat templates (`prompt_style="chat_template"` or `"auto"`, used for
+Gemma 4 and any non-ChatML tokenizer). When scoring a vocabulary-trimmed GGUF (`n_vocab < source_vocab`), `score()`
+automatically resolves the remapped `(human, ai)` token IDs in the candidate's GGUF header and re-tokenizes the
+rendered prompts with the candidate's own vocabulary (`tokdocs` when present, or a pruned BPE fallback).
 """
 from __future__ import annotations
 
@@ -26,11 +21,11 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 
+from .. import vocab as vocabmod
 from .protocol import Episode, Task, Verdict
 
-# ProseLens model-card prompt, as in mvp/detect/common.py
+# ProseLens model-card prompt, as in mvp/detect/common.py and mvp/gemma4/mask/gprompts.py
 SYSTEM = ("Given a document, answer with one word: human if the document was "
           "human-written, ai if it was AI-generated.")
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -50,7 +45,8 @@ def _loss_curve_rows(labels) -> set[int]:
 
 
 def _beemo_rows(path) -> list[dict]:
-    """Every distinct Beemo text, as in mvp/detect/prep.py; split "search" for 30% of prompts (climb_prep.py)."""
+    """Every distinct Beemo text, as in mvp/detect/prep.py; split 'search' for 30% of prompts (climb_prep.py)."""
+    import pyarrow.parquet as pq
     beemo, seen = [], set()
     for r in pq.read_table(path).to_pylist():
         split = "search" if int(hashlib.sha256(str(r["prompt_id"]).encode()).hexdigest(), 16) % 10 < 3 else "exam"
@@ -65,7 +61,7 @@ def _beemo_rows(path) -> list[dict]:
 
 
 def _read_ids(pattern: str) -> set[str]:
-    """Document ids from score files (a path or glob): JSONL rows with an "id", or a .json list of ids."""
+    """Document ids from score files (a path or glob): JSONL rows with an 'id', or a .json list of ids."""
     files = sorted(glob.glob(str(pattern)))
     if not files:
         raise FileNotFoundError(f"no calibration id files match {pattern}")
@@ -78,7 +74,7 @@ def _read_ids(pattern: str) -> set[str]:
     return ids
 
 
-def _sample(rows: list[dict], key, per: int, rng) -> list[dict]:
+def _sample(rows: list[dict], key, per: int | None, rng) -> list[dict]:
     by: dict = {}
     for r in rows:
         by.setdefault(key(r), []).append(r)
@@ -91,7 +87,7 @@ def _sample(rows: list[dict], key, per: int, rng) -> list[dict]:
 
 class DetectEnvironment:
     name = "detect"
-    version = "1"
+    version = "2"
     tools = None
 
     def __init__(self, data_dir: str, hf_dir: str, cutoff: float | None = None, seed: int = 20261029,
@@ -99,7 +95,8 @@ class DetectEnvironment:
                  exam_test_per_cell: int | None = 75, exam_beemo_per_kind: int | None = 200, context: int = 4608,
                  kv_type: str = "f16", max_total_memory_bytes: int | None = None, classifier: bool = False,
                  calibration_ids_file: str | None = None, cache_dir: str | None = None,
-                 search_beemo_per_kind: int | None = None, select_beemo_per_kind: int | None = None):
+                 search_beemo_per_kind: int | None = None, select_beemo_per_kind: int | None = None,
+                 prompt_style: str = "auto"):
         """A per-cell or per-kind size of None takes every document of that cell."""
         from transformers import AutoTokenizer
         self.classifier = bool(classifier)
@@ -109,8 +106,17 @@ class DetectEnvironment:
         self.budget = {"max_tokens": 1, "max_doc_tokens": max_doc_tokens}
         self.deployment = {"context": context, "concurrency": 1, "kv_type": kv_type,
                            "max_total_memory_bytes": max_total_memory_bytes}
+        self.hf_dir = str(hf_dir)
         self.tok = AutoTokenizer.from_pretrained(hf_dir)
         self.max_doc_tokens = max_doc_tokens
+        if prompt_style == "auto":
+            vocab = self.tok.get_vocab()
+            self.prompt_style = "qwen_chatml" if "<|im_start|>" in vocab and "<think>" in vocab else "chat_template"
+        elif prompt_style in ("qwen_chatml", "chat_template"):
+            self.prompt_style = prompt_style
+        else:
+            raise ValueError(f"unknown prompt_style {prompt_style!r}")
+
         d = Path(data_dir)
         rng = np.random.default_rng(seed)
         if self.classifier:
@@ -118,14 +124,17 @@ class DetectEnvironment:
                 raise ValueError("classifier=True needs calibration_ids_file and cache_dir")
             self.cache_dir = Path(cache_dir)
             self.pair = tuple(self._single_id(w) for w in ANSWERS)
-            # Cache identity: the full tokenizer serialisation (vocab, merges, added tokens) when there is one
+            self.source_vocab_size = len(self.tok)
             backend = getattr(self.tok, "backend_tokenizer", None)
             ident = backend.to_str() if backend is not None else f"{Path(hf_dir).resolve()}:{len(self.tok)}"
             self._tok_id = hashlib.sha256(ident.encode()).hexdigest()
+            self._pruned_tok_cache: dict[str, object] = {}
             self._classifier_tasks(d, rng, _read_ids(calibration_ids_file), search_per_cell, select_per_cell,
                                    exam_test_per_cell, search_beemo_per_kind, select_beemo_per_kind,
                                    exam_beemo_per_kind)
             return
+
+        import pyarrow.parquet as pq
         cols = ["id", "text", "label", "format"]
         val = pq.read_table(d / "WildOutlines/data/validation-00000-of-00001.parquet", columns=cols).to_pylist()
         skip = _loss_curve_rows([r["label"] for r in val])
@@ -150,10 +159,19 @@ class DetectEnvironment:
                                         split=split, prompt={"text": text},
                                         meta={"label": r["label"], "kind": kind, "truncated": cut}))
 
+    def render_prompt(self, text: str) -> str:
+        if self.prompt_style == "qwen_chatml":
+            return chat_prompt(text)
+        msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}]
+        try:
+            return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        except TypeError:
+            return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
     def _classifier_tasks(self, d: Path, rng, cal_ids: set[str], search_per_cell, select_per_cell, exam_test_per_cell,
                           search_beemo_per_kind, select_beemo_per_kind, exam_beemo_per_kind) -> None:
-        """Classifier-mode splits. Beemo's search prompts are halved by prompt between search and select, so a
-        prompt's texts stay in one split; the calibration humans are the ids the source's cutoff was set on."""
+        """Classifier-mode splits shared identically across Qwen and Gemma."""
+        import pyarrow.parquet as pq
         cols = ["id", "text", "label", "format"]
         wo = d / "WildOutlines/data"
         val = pq.read_table(wo / "validation-00000-of-00001.parquet", columns=cols).to_pylist()
@@ -197,7 +215,6 @@ class DetectEnvironment:
         return ids[0]
 
     def _heads(self, texts: list[str], chunk: int = 256) -> list[tuple[str, bool]]:
-        """_head over many texts, tokenised in batches (the same cut, faster)."""
         out, n = [], self.max_doc_tokens
         for i in range(0, len(texts), chunk):
             part = texts[i:i + chunk]
@@ -217,43 +234,141 @@ class DetectEnvironment:
 
     # ------------------------------------------------------------------ classifier mode
     def _encoded(self, tasks: list[Task], chunk: int = 256):
-        """Prompt token ids per task, in order: the chat prompt tokenised as one string, as climb_prep.py does."""
+        """Prompt token ids per task, in order: the chat prompt tokenised as one string."""
         for i in range(0, len(tasks), chunk):
-            yield from self.tok([chat_prompt(t.prompt["text"]) for t in tasks[i:i + chunk]],
+            yield from self.tok([self.render_prompt(t.prompt["text"]) for t in tasks[i:i + chunk]],
                                 add_special_tokens=False)["input_ids"]
 
     def _key(self, tasks: list[Task]) -> str:
         """Cache key: tokenizer, answer pair, prompt template, document cut and the ordered task ids."""
-        head = [self._tok_id, repr(self.pair), chat_prompt(""), str(self.max_doc_tokens)]
+        head = [self._tok_id, repr(self.pair), self.render_prompt(""), str(self.max_doc_tokens)]
         return hashlib.sha256("\n".join(head + [t.id for t in tasks]).encode()).hexdigest()[:16]
 
     def _tmp(self, path: Path) -> Path:
         return path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
 
-    def trj_for(self, tasks: list[Task]) -> Path:
-        """A TRJ1 file of these tasks in order, the answer token appended as the one target; cached by task ids."""
-        path = self.cache_dir / f"{self._key(tasks)}.trj"
-        if path.exists():
-            return path
+    def _write_trj_seqs(self, path: Path, seqs, first_ans_id: int) -> Path:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         tmp = self._tmp(path)
+        seqs = list(seqs)
         with open(tmp, "wb") as f:
-            f.write(b"TRJ1" + struct.pack("<I", len(tasks)))
-            for x in self._encoded(tasks):
-                seq = x + [self.pair[0]]
-                f.write(struct.pack("<II", len(seq), 1) + struct.pack(f"<{len(seq)}i", *seq)
-                        + struct.pack("<I", len(x)))
+            f.write(b"TRJ1" + struct.pack("<I", len(seqs)))
+            for x in seqs:
+                arr = np.asarray(x, dtype="<i4")
+                seq = np.append(arr, np.int32(first_ans_id)).astype("<i4")
+                f.write(struct.pack("<II", len(seq), 1) + seq.tobytes() + struct.pack("<I", len(arr)))
         os.replace(tmp, path)
         return path
 
+    def trj_for(self, tasks: list[Task]) -> Path:
+        """A TRJ1 file of these tasks in order for the untrimmed source vocabulary, cached by task ids."""
+        path = self.cache_dir / f"{self._key(tasks)}.trj"
+        if path.exists():
+            return path
+        return self._write_trj_seqs(path, self._encoded(tasks), self.pair[0])
+
+    def _model_vocab_plan(self, model: str) -> tuple[tuple[int, int], str | None, dict | None]:
+        """Inspect `model` GGUF vocabulary: returns `((h_id, a_id), vocab_hash_if_trimmed_else_None, meta)`."""
+        if not os.path.exists(model):
+            return self.pair, None, None
+        try:
+            meta = vocabmod.read_tokenizer(model)
+        except Exception:
+            return self.pair, None, None
+        if meta["vocab_size"] == self.source_vocab_size:
+            return self.pair, None, meta
+        # Resolve exact source answer token byte strings inside the trimmed vocabulary
+        idx = {b: i for i, b in enumerate(meta["tokens"])}
+        src_toks = self._source_token_bytes()
+        remapped = []
+        for w, pid in zip(ANSWERS, self.pair):
+            tb = src_toks[pid]
+            if tb in idx:
+                remapped.append(idx[tb])
+            elif w.encode("utf-8") in idx:
+                remapped.append(idx[w.encode("utf-8")])
+            else:
+                raise RuntimeError(f"trimmed GGUF {model} dropped answer token {pid} ({w!r} / {tb!r})")
+        vh = hashlib.sha256(b"\x00".join(meta["tokens"])).hexdigest()[:12]
+        return (remapped[0], remapped[1]), vh, meta
+
+    def _source_token_bytes(self) -> list[bytes]:
+        if not hasattr(self, "_src_tok_bytes"):
+            # Fallback table mapping source token id -> raw GGUF-style token string bytes
+            vocab = self.tok.get_vocab()
+            inv = [""] * max(len(self.tok), max(vocab.values()) + 1)
+            for s, i in vocab.items():
+                inv[i] = s
+            self._src_tok_bytes = [s.encode("utf-8") for s in inv]
+        return self._src_tok_bytes
+
+    def _pruned_hf_encode(self, vh: str, meta: dict, prompts: list[str]) -> list[list[int]]:
+        """Pure-Python fallback retokenizer when `toolchain.tokdocs` is unavailable (used in CPU tests)."""
+        if vh not in self._pruned_tok_cache:
+            from tokenizers import Tokenizer
+            backend = getattr(self.tok, "backend_tokenizer", None)
+            if backend is None:
+                raise RuntimeError("trimmed-GGUF scoring needs either toolchain.tokdocs or a fast HF tokenizer")
+            spec = json.loads(backend.to_str())
+            kept_strs = [t.decode("utf-8", errors="surrogateescape") for t in meta["tokens"]]
+            new_vocab = {s: i for i, s in enumerate(kept_strs)}
+            if spec.get("model", {}).get("type") == "BPE":
+                spec["model"]["vocab"] = new_vocab
+                spec["model"]["merges"] = [m.decode("utf-8") for m in meta["merges"]]
+            if "added_tokens" in spec:
+                kept_added = []
+                for at in spec["added_tokens"]:
+                    if at["content"] in new_vocab:
+                        at = dict(at)
+                        at["id"] = new_vocab[at["content"]]
+                        kept_added.append(at)
+                spec["added_tokens"] = kept_added
+            self._pruned_tok_cache[vh] = Tokenizer.from_str(json.dumps(spec))
+        tk = self._pruned_tok_cache[vh]
+        return [e.ids for e in tk.encode_batch(prompts, add_special_tokens=False)]
+
+    def trj_for_model(self, tasks: list[Task], model: str, tc=None) -> tuple[Path, tuple[int, int]]:
+        """Return `(trj_path, answer_pair)` matching `model`'s vocabulary (re-tokenizing when trimmed)."""
+        pair, vh, meta = self._model_vocab_plan(model)
+        if vh is None:
+            return self.trj_for(tasks), self.pair
+        path = self.cache_dir / f"{self._key(tasks)}-v{vh}.trj"
+        if path.exists():
+            return path, pair
+        prompts = [self.render_prompt(t.prompt["text"]) for t in tasks]
+        if tc is not None and getattr(tc, "tokdocs", None) is not None:
+            from ..runtime import tokenize_docs
+            seqs = tokenize_docs(tc, model, prompts)
+        else:
+            seqs = self._pruned_hf_encode(vh, meta, prompts)
+        return self._write_trj_seqs(path, seqs, pair[0]), pair
+
     def score(self, tasks: list[Task], model: str, scorer) -> dict[str, float]:
-        """log p(human) - log p(ai) at the answer per task id; lower is more AI-like (the flagged class)."""
+        """log p(human) - log p(ai) at the answer per task id; automatically retokenizes trimmed GGUFs."""
         if not tasks:
             return {}
-        v = np.asarray(scorer.score_trj(str(model), str(self.trj_for(tasks)), self.pair), dtype=float)
+        tc = getattr(scorer, "tc", None)
+        trj_path, pair = self.trj_for_model(tasks, str(model), tc=tc)
+        v = np.asarray(scorer.score_trj(str(model), str(trj_path), pair), dtype=float)
         if v.shape != (len(tasks),) or not np.isfinite(v).all():
             raise RuntimeError(f"scorer returned {v.shape} values for {len(tasks)} tasks, or non-finite ones")
         return {t.id: float(x) for t, x in zip(tasks, v)}
+
+    def fit_token_counts(self, gguf_path: str | None = None, tc=None) -> np.ndarray:
+        """Token occurrence counts on non-exam fit documents (`calibration` + `search` + WildOutlines `select`),
+        matching Qwen and Gemma Rule-P keep-set fitting without touching `exam` or Beemo `select`."""
+        fit_tasks = [
+            t for t in self._tasks
+            if t.split in ("calibration", "search") or (t.split == "select" and t.id.startswith("wo-val:"))
+        ]
+        if gguf_path and tc is not None and getattr(tc, "tokdocs", None) is not None:
+            from ..runtime import tokenize_docs
+            v = vocabmod.read_tokenizer(gguf_path)["vocab_size"]
+            seqs = tokenize_docs(tc, gguf_path, [self.render_prompt(t.prompt["text"]) for t in fit_tasks])
+            return np.bincount(np.concatenate(seqs), minlength=v)
+        v = self.source_vocab_size if hasattr(self, "source_vocab_size") else len(self.tok)
+        all_ids = [np.asarray(x, dtype=np.int64) for x in self._encoded(fit_tasks)]
+        return np.bincount(np.concatenate(all_ids), minlength=v) if all_ids else np.zeros(v, dtype=np.int64)
 
     def calibrate(self, scores: dict[str, float]) -> dict:
         """The cutoff that flags the lowest 1% of this model's calibration humans (flag strictly below)."""
@@ -271,9 +386,7 @@ class DetectEnvironment:
 
     def proxy_spec(self, source_scores: dict[str, float], n_neg: int = 1000, n_pos: int = 600,
                    seed: int = 0) -> list[dict]:
-        """Parts of the log-odds store, in store order: a random sample of calibration humans, and the search
-        split's AI documents whose source scores are closest to the source's cutoff. The humans are a random
-        sample, never the low tail, so the objective can pick each candidate's own hardest ones."""
+        """Parts of the log-odds store, in store order: random calibration humans + near-cutoff search AI docs."""
         cut = self.calibrate(source_scores)["cutoff"]
         cal = [t for t in self._tasks if t.split == "calibration"]
         neg = np.sort(np.random.default_rng(seed).choice(len(cal), min(n_neg, len(cal)), replace=False))
@@ -286,10 +399,10 @@ class DetectEnvironment:
         """n raw prompt strings from the search split (a fixed random sample) for the importance matrix."""
         pool = [t for t in self._tasks if t.split == "search"]
         pick = np.sort(np.random.default_rng(seed).permutation(len(pool))[:n])
-        return [chat_prompt(pool[i].prompt["text"]) for i in pick]
+        return [self.render_prompt(pool[i].prompt["text"]) for i in pick]
 
     def token_counts(self) -> dict[str, dict]:
-        """{split: {"docs", "tokens"}}, tokens being the prompt plus answer token each forward pass reads."""
+        """{split: {'docs', 'tokens'}}, tokens being the prompt plus answer token each forward pass reads."""
         path = None
         if getattr(self, "cache_dir", None):
             path = self.cache_dir / f"tokens-{self._key(self._tasks)}.json"
@@ -309,10 +422,7 @@ class DetectEnvironment:
     def run(self, task: Task, client, seed: int) -> Episode:
         """One forward pass through llama-server's raw completion endpoint; the answer is greedy."""
         t0 = time.time()
-        # The grammar keeps only tokens that start "human" or "ai"; at temperature 1 with every other sampler off,
-        # the post-sampling probabilities are the model's own softmax renormalised over those tokens, so the
-        # human/ai ratio is exact
-        body = {"prompt": chat_prompt(task.prompt["text"]), "n_predict": 1, "n_probs": 10, "temperature": 1.0,
+        body = {"prompt": self.render_prompt(task.prompt["text"]), "n_predict": 1, "n_probs": 10, "temperature": 1.0,
                 "top_k": 0, "top_p": 1.0, "min_p": 0.0, "grammar": GRAMMAR, "post_sampling_probs": True,
                 "seed": int(seed), "cache_prompt": False}
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.prompt["text"]}]
@@ -338,7 +448,6 @@ class DetectEnvironment:
 
 
 def _p_human(entry: dict) -> float:
-    """p(human) over the two answer tokens, from the grammar-restricted post-sampling probabilities."""
     pr = {t["token"]: t["prob"] for t in entry["top_probs"]}
     h, a = pr.get(ANSWERS[0], 0.0), pr.get(ANSWERS[1], 0.0)
     if h + a <= 0:
@@ -347,7 +456,6 @@ def _p_human(entry: dict) -> float:
 
 
 def _sigmoid(x: float) -> float:
-    """1 / (1 + e^-x) without overflow at large |x|."""
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
     z = math.exp(x)

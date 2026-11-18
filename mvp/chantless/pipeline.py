@@ -59,7 +59,11 @@ class Run:
             if pin.exists() and sha256_file(self.src) != read_json(pin)["pins"]["source_gguf_sha256"]:
                 raise RuntimeError("staged source GGUF does not match the pinned sha256")
         self.inv = gguf_ops.inventory(self.src)
-        self.groups = gguf_ops.groups_from_inventory(self.inv)
+        self.groups, self.dead_tensors = gguf_ops.adapter_from_gguf(self.src, cfg["source"].get("hf_dir"))
+        self.probe_src = self.src
+        src0 = self.scratch / "source" / "src0-nodead.gguf"
+        if self.dead_tensors and src0.exists():
+            self.probe_src = str(src0)
         imx = Path(cfg["run_root"]) / cfg["run_id"] / "proxy" / "imatrix.gguf"
         if imx.exists():
             self.annotate_imatrix(imx)
@@ -106,8 +110,7 @@ class Run:
         self.log(f"seeded {len(rec):,} source scores from earlier receipts; {len(sample)} rescored, worst |diff| {worst:.1e}")
 
     def annotate_imatrix(self, path):
-        import gguf
-        names = {t.name.rsplit(".", 1)[0] for t in gguf.GGUFReader(str(path)).tensors}
+        names = {t["name"].rsplit(".", 1)[0] for t in gguf_ops.inventory(path)}
         for g, info in self.groups.items():
             if not g.startswith("_"):
                 info["imatrix_ok"] = all(n in names for n in info["quantizable"])
@@ -173,7 +176,27 @@ class Run:
             splits[t.split][t.family] += 1
         write_json(self.dir / "splits.json", splits)
         write_json(self.dir / "groups.json", self.groups)
+        if self.dead_tensors:
+            write_json(self.dir / "dead.json", self.dead_tensors)
+            self._prepass_dead_tensors()
         self.mark("prepare")
+
+    def _prepass_dead_tensors(self):
+        """Lossless pre-pass: remove dead shared-KV tensors once and verify scores do not move."""
+        src0 = self.scratch / "source" / "src0-nodead.gguf"
+        src0.parent.mkdir(parents=True, exist_ok=True)
+        if not src0.exists():
+            gguf_ops.copy_without(self.src, src0, set(self.dead_tensors))
+        if self.classifier and self.scorer is not None:
+            sample = self.guard.get("search")[:32]
+            if sample:
+                s_full = self.env.score(sample, self.src, self.scorer)
+                s_cut = self.env.score(sample, str(src0), self.scorer)
+                worst = max(abs(s_full[k] - s_cut[k]) for k in s_full)
+                if worst > 1e-5:
+                    raise RuntimeError(f"dead-tensor pre-pass moved scores by {worst:.2e}; aborting lossless removal")
+                self.log(f"pre-pass: removed {len(self.dead_tensors)} dead tensors losslessly (max |diff|={worst:.2e})")
+        self.probe_src = str(src0)
 
     # ------------------------------------------------------------------ pool (reliability screen, source only)
     def phase_pool(self):
@@ -296,7 +319,7 @@ class Run:
             if s["kl"] > tol:
                 raise RuntimeError(f"self-KL check failed for {name}: {s['kl']} > {tol}")
         (pdir / "stats_corpus.txt").write_text("\n\n".join(stats_text + texts[: pc["general_docs"] // 2]))
-        run_imatrix(self.tc, self.src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
+        run_imatrix(self.tc, self.probe_src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
         self.annotate_imatrix(pdir / "imatrix.gguf")
         write_json(self.dir / "groups.json", self.groups)
         out = {"task": meta_t, "general": meta_g, "self_kl": {n: read_json(pdir / f"self_{n}.json")["kl"] for n in ("task", "general")},
@@ -342,7 +365,7 @@ class Run:
         if self_damage > tol.get("task", 1e-5) or sg["kl"] > tol.get("general", 1e-4):
             raise RuntimeError(f"self-check failed: task damage {self_damage}, general KL {sg['kl']}")
         (pdir / "stats_corpus.txt").write_text("\n\n".join(self.env.stats_texts(pc.get("stats_docs", 200)) + texts[: pc["general_docs"] // 2]))
-        run_imatrix(self.tc, self.src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
+        run_imatrix(self.tc, self.probe_src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
         self.annotate_imatrix(pdir / "imatrix.gguf")
         write_json(self.dir / "groups.json", self.groups)
         out = {"task": meta_task, "general": meta_g, "self_kl": {"task": self_damage, "general": sg["kl"]},
@@ -386,8 +409,8 @@ class Run:
     # ------------------------------------------------------------------ sanity: cap curve, floors, initial mask
     def phase_sanity(self):
         sc = self.cfg["sanity"]
-        P = self.make_prober(self.src, "sanity")
-        src_bytes = gguf_ops.file_bytes(self.src)
+        P = self.make_prober(self.probe_src, "sanity")
+        src_bytes = gguf_ops.file_bytes(self.probe_src)
         base = mk.new_mask(self.groups, "BF16", self._source_pin(), self.mode)
         uniform = {}
         um = {t: self.uniform_mask(base, t) for t in self.ladder[1:]}
@@ -618,8 +641,7 @@ class Run:
         init = read_json(self.dir / "sanity" / "sanity_mask.json")
         cd = read_json(self.dir / "sanity" / "cap.json")
         cap = sanity.make_cap("off") if cd.get("kind") == "off" else sanity.SizeMatchedCap([tuple(p) for p in cd["points"]])
-        weights = self.src
-        P = self.make_prober(weights, "search")
+        P = self.make_prober(self.probe_src, "search")
         L = Learner(P, self.groups, self.ladder, cap, self.mode, lc, self.log, self.record)
         S = LearnerState(mask=init)
         last_gate, last_screen = None, init      # source's gate on record is the A/A
@@ -714,7 +736,7 @@ class Run:
             final_weights, lineage, S.mask = self._repair(S.mask, P)
         cand_mask = S.mask
         sel_mask = cand_mask
-        if last_gate is None or json.dumps(last_gate["groups"], sort_keys=True) != json.dumps(cand_mask["groups"], sort_keys=True) or lineage:
+        if last_gate is None or bmod.mask_key(last_gate) != bmod.mask_key(cand_mask) or lineage:
             gb = bmod.Builder(self.tc, final_weights, self.groups, str(self.dir / "proxy" / "imatrix.gguf"), self.scratch / "build" / "final-gate")
             g = self.gate(gb.build(cand_mask, self.scratch / "build" / "final-gate.gguf").path, "final")
             gated = g["pass"]
@@ -734,9 +756,9 @@ class Run:
         self.mark("search", {"stop_reason": stop_reason, "accepted": S.accepted})
 
     def _search_oneshot(self, P, init, lc):
-        """One solve on the sanity solo probes, then one build to check bytes (see oneshot.py)."""
+        """One-shot search: solo + optional Wanda width probes + optional Rule-P vocab trim -> exact-byte solve -> 1 build."""
         import numpy as np
-        from . import oneshot
+        from . import oneshot, vocab as vocabmod
         base = mk.new_mask(self.groups, "BF16", self._source_pin(), self.mode)
         sdir = self.dir / "probe" / "sanity"
         stores = [s for s in P.stores if s.kind == "logodds" and s.name != "general"]
@@ -752,11 +774,14 @@ class Run:
             used.append((s.name, s.weight, oneshot.pauc_store(P._split(s, src), s.meta["parts"], s.meta.get("objective_args", {})), src))
         if not used:
             raise RuntimeError("oneshot needs per-trajectory sanity solo scores on at least one logodds store")
-        options = {}
+
+        default_tiers = lc.get("oneshot_tiers", ["Q8_0", "Q4_K", "IQ2_XS", "IQ1_S"])
+        group_tier_overrides = lc.get("group_tiers", {})
+        allowed_tiers: dict[str, list[str]] = {}
         for g in base["groups"]:
-            o = [t for t in self.ladder[1:] if mk.tier_allowed(self.groups[g], t) and t in lc.get("oneshot_tiers", ["Q8_0", "Q4_K", "IQ1_S"])]
-            o += ["drop"] if self.groups[g]["droppable"] and lc.get("allow_drop", True) else []
-            options[g] = []
+            cand_t = group_tier_overrides.get(g, default_tiers)
+            o = [t for t in self.ladder if (t in cand_t) and mk.tier_allowed(self.groups[g], t)]
+            allowed_tiers[g] = []
             for t in o:
                 shifts = []
                 for name, _, _, src in used:
@@ -764,31 +789,139 @@ class Run:
                     if f.exists():
                         shifts.append(np.load(f) - src)
                 if len(shifts) == len(used):
-                    solo[(g, t)] = np.concatenate(shifts); options[g].append(t)
-                elif t == "Q8_0":      # never solo-probed by default: taken as no shift (uniform Q8_0 task damage is ~0)
-                    options[g].append(t)
-        bm = oneshot.ByteModel(self.src, self.groups)
+                    solo[(g, t)] = np.concatenate(shifts)
+                    allowed_tiers[g].append(t)
+                elif t in ("BF16", "Q8_0"):
+                    allowed_tiers[g].append(t)
+            if self.groups[g]["droppable"] and lc.get("allow_drop", True):
+                shifts = [np.load(sdir / f"p-{bmod.mask_key(mk.apply(base, g, 'drop'))}-{name}.npy") - src
+                          for name, _, _, src in used if (sdir / f"p-{bmod.mask_key(mk.apply(base, g, 'drop'))}-{name}.npy").exists()]
+                if len(shifts) == len(used):
+                    solo[(g, "drop")] = np.concatenate(shifts)
+
+        # Optional Wanda neuron ordering + per-MLP width probes
+        n_ff0 = gguf_ops.ffn_widths(self.probe_src)
+        width_cuts: dict[tuple[int, int], np.ndarray] = {}
+        neuron_order: dict[int, np.ndarray] = {}
+        if lc.get("widths"):
+            order_file = self.dir / "wanda_order.json"
+            if order_file.exists():
+                neuron_order = {int(k): np.asarray(v, dtype=np.int64) for k, v in read_json(order_file).items()}
+            else:
+                neuron_order = gguf_ops.wanda_order(self.probe_src, str(self.dir / "proxy" / "imatrix.gguf"))
+                write_json(order_file, {str(k): v.tolist() for k, v in neuron_order.items()})
+            fracs = lc.get("width_fractions", [0.75, 0.5, 0.25, 0.0625])
+            step = int(lc.get("width_step", 256))
+            w_masks, w_keys = [], []
+            for il, full in sorted(n_ff0.items()):
+                if il not in neuron_order:
+                    continue
+                for f in fracs:
+                    w = int(full * f) // step * step
+                    if 0 < w < full:
+                        mw = copy.deepcopy(base) if "copy" in globals() else json.loads(json.dumps(base))
+                        mw["widths"] = {str(il): mk.pack_bitmap(neuron_order[il][:w], full)}
+                        need = any(not (sdir / f"p-{bmod.mask_key(mw)}-{name}.npy").exists() for name, _, _, _ in used)
+                        if need:
+                            w_masks.append(mw)
+                        w_keys.append((il, w, mw))
+            if w_masks:
+                self.log(f"oneshot: probing {len(w_masks)} MLP width settings")
+                P.probe_many(w_masks, [name for name, _, _, _ in used])
+            for il, w, mw in w_keys:
+                shifts = [np.load(sdir / f"p-{bmod.mask_key(mw)}-{name}.npy") - src
+                          for name, _, _, src in used if (sdir / f"p-{bmod.mask_key(mw)}-{name}.npy").exists()]
+                if len(shifts) == len(used):
+                    width_cuts[(il, w)] = np.concatenate(shifts)
+
+        # Optional Merge-Closed Rule-P vocabulary keep-set (fixed K or automatic fidelity scan)
+        keep_vocab = None
+        vocab_cfg = lc.get("vocab_k")
+        if vocab_cfg:
+            counts = self.env.fit_token_counts(self.probe_src, self.tc)
+            must_keep = list(getattr(self.env, "pair", ()))
+            if vocab_cfg == "auto":
+                cand_ks = lc.get("vocab_candidates", [50000, 65000, 80000, 100000])
+                min_fid = float(lc.get("vocab_min_fidelity", 0.998))
+                parts = read_json(self.dir / "proxy" / "parts.json")
+                proxy_tasks = [self.by_id[i] for p in parts for i in p["ids"]]
+                src_vec = used[0][3]
+                rs = oneshot._rank(src_vec)
+                def _eval_vocab(keep_arr: np.ndarray) -> float:
+                    mv = json.loads(json.dumps(base))
+                    mv["vocab_keep"] = mk.pack_bitmap(keep_arr, vocabmod.read_tokenizer(self.probe_src)["vocab_size"])
+                    built = P.builder.build(mv, self.scratch / "build" / f"vocab-{len(keep_arr)}.gguf").path
+                    try:
+                        sc = self.env.score(proxy_tasks, built, self.scorer)
+                        vec = np.array([sc[t.id] for t in proxy_tasks], dtype=np.float64)
+                        return float((oneshot._rank(vec) * rs).mean())
+                    finally:
+                        Path(built).unlink(missing_ok=True)
+                chosen_k, keep_vocab, v_meas = vocabmod.pick_vocab_k(self.probe_src, counts, cand_ks, _eval_vocab, min_fidelity=min_fid, must_keep=must_keep)
+                self.log(f"oneshot: auto-selected vocab K={chosen_k} (kept={len(keep_vocab)}), fidelities={v_meas}")
+            else:
+                keep_vocab = vocabmod.rule_p_keep_set(self.probe_src, counts, int(vocab_cfg), must_keep=must_keep)
+                self.log(f"oneshot: Rule-P vocab K={vocab_cfg} -> kept {len(keep_vocab)} tokens")
+
+        bm = oneshot.ByteModel(self.probe_src, self.groups)
         u = read_json(self.dir / "sanity" / "uniform.json")
         bm.calibrate(self.uniform_mask(base, "Q4_K"), u["Q4_K"]["bytes"])
-        cost = {}
-        for g, o in options.items():
-            for t in o:
-                m1 = mk.apply(self.uniform_mask(base, "Q8_0"), g, t)
-                cost[(g, t)] = bm(m1) - bm(self.uniform_mask(base, "Q8_0"))
-        ref = bm(self.uniform_mask(base, "Q8_0"))
-        hdr = ref - sum(cost.get((g, "Q8_0"), 0) for g in options)
-        sur = (oneshot.FidelitySurrogate if lc.get("oneshot_objective", "fidelity") == "fidelity" else oneshot.Surrogate)(used, solo)
+        if keep_vocab is not None:
+            bm.set_vocab_trim(keep_vocab)
+
+        use_joint = bool(width_cuts)
+        if use_joint:
+            options = oneshot.build_joint_options(self.groups, allowed_tiers, solo, width_cuts, n_ff0,
+                                                  width_step=int(lc.get("width_step", 256)), allow_drop=lc.get("allow_drop", True))
+            ref_sol = {g: options[g][0] for g in options}
+            ref_t, ref_w = oneshot.unpack_solution(ref_sol)
+            ref_bytes = bm.spec_bytes(ref_t, ref_w)
+            cost = {}
+            for g, o in options.items():
+                for opt in o:
+                    s1 = dict(ref_sol); s1[g] = opt
+                    cost[(g, opt)] = bm.spec_bytes(*oneshot.unpack_solution(s1)) - ref_bytes
+            hdr = ref_bytes
+        else:
+            options = {g: list(allowed_tiers[g]) + (["drop"] if (g, "drop") in solo else []) for g in base["groups"]}
+            cost = {}
+            ref_m = self.uniform_mask(base, "Q8_0")
+            ref_bytes = bm(ref_m)
+            for g, o in options.items():
+                for t in o:
+                    cost[(g, t)] = bm(mk.apply(ref_m, g, t)) - ref_bytes
+            hdr = ref_bytes - sum(cost.get((g, "Q8_0"), 0) for g in options)
+
+        sur_cls = oneshot.FidelitySurrogate if lc.get("oneshot_objective", "fidelity") == "fidelity" else oneshot.Surrogate
+        sur = sur_cls(used, solo, width_cuts=width_cuts, n_ff0=n_ff0)
         budget, target = lc["target_bytes"], lc["target_bytes"]
+        full_vocab_n = vocabmod.read_tokenizer(self.src)["vocab_size"] if keep_vocab is not None else 0
+        final_builder = bmod.Builder(self.tc, self.src, self.groups, str(self.dir / "proxy" / "imatrix.gguf"), self.scratch / "build" / "oneshot-final", log=str(self.dir / "build.log"))
+
         for attempt in range(3):
-            tiers_of = oneshot.solve(sur, options, cost, budget, hdr, log=self.log)
-            m = {**init, "groups": {g: {"tier": t} for g, t in tiers_of.items()}, "floors": {}}
+            sol = oneshot.solve(sur, options, cost, budget, hdr, log=self.log)
+            tiers_of, widths_of = oneshot.unpack_solution(sol)
+            m = mk.upgrade_v2({**init, "groups": {g: {"tier": t} for g, t in tiers_of.items()}, "floors": {}})
+            m["dead_tensors"] = list(self.dead_tensors)
+            m["widths"] = {str(il): mk.pack_bitmap(neuron_order[il][:w], n_ff0[il]) for il, w in sorted(widths_of.items()) if w < n_ff0[il]}
+            if keep_vocab is not None and len(keep_vocab) < full_vocab_n:
+                m["vocab_keep"] = mk.pack_bitmap(keep_vocab, full_vocab_n)
             mk.validate(m, self.groups)
-            r = P.probe(m)
-            self.record("history", {"step": 0, "mask_key": r.key, "bytes": r.bytes, "bpw": r.bpw, "kl": r.kl, "event": "oneshot", "budget": budget})
-            self.log(f"oneshot attempt {attempt + 1}: built {r.bytes} bytes for budget {budget} (target {target}); kl_task={r.kl.get('task', float('nan')):.5f}")
-            if r.bytes <= target:
+            if mk.has_v3_cuts(m):
+                br = final_builder.build(m, self.scratch / "build" / "oneshot-final" / f"attempt-{attempt}.gguf")
+                built_bytes, built_bpw, built_key = br.file_bytes, br.bpw, bmod.mask_key(m)
+                Path(br.path).unlink(missing_ok=True)
+                kl_rec = {}
+            else:
+                r = P.probe(m)
+                built_bytes, built_bpw, built_key, kl_rec = r.bytes, r.bpw, r.key, r.kl
+            self.record("history", {"step": 0, "mask_key": built_key, "bytes": built_bytes, "bpw": built_bpw, "kl": kl_rec, "event": "oneshot", "budget": budget})
+            self.log(f"oneshot attempt {attempt + 1}: built {built_bytes} bytes for budget {budget} (target {target})")
+            if built_bytes <= target:
+                final_builder.cleanup()
                 return m
-            budget -= r.bytes - target
+            budget -= built_bytes - target
+        final_builder.cleanup()
         raise RuntimeError("oneshot: the built file stayed over target after three solves")
 
     def _repair(self, m, P):
