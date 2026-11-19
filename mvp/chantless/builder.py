@@ -9,10 +9,12 @@ Order for a full `chantless.mask/v3` mask:
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import hashlib
 import json
 import os
 import shutil
+import struct
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -188,7 +190,13 @@ class Builder:
 
             if all(t == "BF16" for t in types.values()) and all(self.source_types[n] == "BF16" for n in types):
                 Path(q_dst).unlink(missing_ok=True)
-                if not widths and vocab_spec is None and not has_app:
+                if tmp_var is not None and src == str(tmp_var):
+                    try:
+                        os.replace(src, q_dst)
+                        tmp_var = None
+                    except OSError:
+                        shutil.copyfile(src, q_dst)
+                elif not widths and vocab_spec is None and not has_app:
                     try:
                         os.link(src, q_dst)
                     except OSError:
@@ -245,6 +253,111 @@ class Builder:
     def cleanup(self) -> None:
         for p in self.work.glob("pruned-*.gguf"):
             p.unlink(missing_ok=True)
+
+
+class SpliceProbeBuilder:
+    """Tensor-variant splice cache for fast solo/drop probes.
+
+    Quantizes each ladder tier once into `cache_dir/u-<tier>.gguf`, then materializes any pure
+    tier/drop probe by splicing raw mmap tensor bytes (~0.5s) instead of re-running `llama-quantize`.
+    Masks with widths, vocab trimming, or Apprentice edits fall back to `inner.build(...)`.
+    """
+
+    def __init__(self, inner: Builder, tier_paths: dict[str, Path], cache_dir: Path | None = None):
+        self.inner = inner
+        self.groups = inner.groups
+        self.source_params = inner.source_params
+        self.weights = inner.weights
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.base_h = gguf_ops._Hdr(inner.weights)
+        self.tier_h = {k: gguf_ops._Hdr(v) for k, v in tier_paths.items()}
+        self.tier_map = {k: {t["name"]: t for t in h.tensors} for k, h in self.tier_h.items()}
+
+    @classmethod
+    def from_builder(cls, inner: Builder, base_mask: dict, tiers: list[str], ladder: list[str],
+                     cache_dir: str | os.PathLike, workers: int = 4) -> "SpliceProbeBuilder":
+        cdir = Path(cache_dir)
+        cdir.mkdir(parents=True, exist_ok=True)
+        tier_paths: dict[str, Path] = {}
+
+        def _build_one(tier_name: str) -> tuple[str, Path]:
+            tp = cdir / f"u-{tier_name}.gguf"
+            if not tp.exists():
+                tm = {**base_mask, "groups": {g: {"tier": maskmod.clip(inner.groups[g], tier_name, ladder)} for g in base_mask["groups"]}}
+                inner.build(tm, tp)
+            return tier_name, tp
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(workers, len(tiers)))) as ex:
+            for tn, tp in ex.map(_build_one, tiers):
+                tier_paths[tn] = tp
+        return cls(inner, tier_paths, cache_dir=cdir)
+
+    def build(self, m: dict, out: str | os.PathLike | None = None, keep_pruned: bool = False) -> BuildResult:
+        if m.get("widths") or m.get("vocab_keep") is not None or (m.get("apprentice") or {}).get("switches") or (m.get("apprentice") or {}).get("levels"):
+            return self.inner.build(m, out, keep_pruned=keep_pruned)
+        maskmod.validate(m, self.inner.groups)
+        types, drop = maskmod.tensor_plan(m, self.inner.groups)
+        drop_set = set(drop)
+        for n, t in types.items():
+            if t != "BF16" and (t not in self.tier_map or n not in self.tier_map[t]):
+                return self.inner.build(m, out, keep_pruned=keep_pruned)
+        out_p = Path(out) if out else self.inner.work / f"cand-{mask_key(m)}.gguf"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        bh = self.base_h
+        A = bh.alignment
+        plan = []
+        ti, off = bytearray(), 0
+        fallbacks: dict[str, str] = {}
+        for bt in bh.tensors:
+            nm = bt["name"]
+            if nm in drop_set:
+                continue
+            want_t = types.get(nm, "BF16")
+            if want_t != "BF16" and want_t in self.tier_map and nm in self.tier_map[want_t]:
+                sh = self.tier_h[want_t]
+                st_t = self.tier_map[want_t][nm]
+                if st_t["type"] != want_t.upper():
+                    fallbacks[nm] = st_t["type"]
+            else:
+                sh, st_t = bh, bt
+            nb = nm.encode()
+            ti += struct.pack("<Q", len(nb)) + nb + struct.pack("<I", len(st_t["dims"])) + struct.pack(f"<{len(st_t['dims'])}Q", *st_t["dims"])
+            ti += struct.pack("<IQ", st_t["ttype"], off)
+            plan.append((sh, st_t, off))
+            off = (off + st_t["n_bytes"] + A - 1) // A * A
+        tmp = Path(str(out_p) + ".part")
+        with open(tmp, "wb") as f:
+            f.write(b"GGUF" + struct.pack("<IQQ", bh.version, len(plan), bh.n_kv))
+            f.write(bh.m[bh.kv_start : bh.kv_end])
+            f.write(ti)
+            pos = f.tell()
+            f.write(b"\0" * ((pos + A - 1) // A * A - pos))
+            base_off = f.tell()
+            for sh, st_t, new_off in plan:
+                cur = f.tell() - base_off
+                if new_off > cur:
+                    f.write(b"\0" * (new_off - cur))
+                s = sh.data_start + st_t["offset"]
+                f.write(sh.m[s : s + st_t["n_bytes"]])
+            end_pos = f.tell()
+            f.write(b"\0" * ((end_pos + A - 1) // A * A - end_pos))
+        os.replace(tmp, out_p)
+        fb = gguf_ops.file_bytes(out_p)
+        data_b = sum(st_t["n_bytes"] for _, st_t, _ in plan)
+        return BuildResult(str(out_p), fb, data_b, self.inner.source_params, fb * 8 / self.inner.source_params, types, sorted(drop_set), fallbacks)
+
+    def release_cache(self) -> None:
+        self.base_h.close()
+        for h in self.tier_h.values():
+            h.close()
+        self.tier_h.clear()
+        self.tier_map.clear()
+        if self.cache_dir is not None:
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+
+    def cleanup(self) -> None:
+        self.release_cache()
+        self.inner.cleanup()
 
 
 def kv_bytes(info: dict, n_attn_kept: int, context: int, concurrency: int, kv_type: str) -> int:

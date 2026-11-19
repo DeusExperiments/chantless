@@ -48,8 +48,16 @@ class Run:
         self.guard = SplitGuard(self.env.tasks())
         self.by_id = {t.id: t for t in self.env.tasks()}
         self.src = cfg["source"]["gguf"]
-        self.scratch = Path(cfg["scratch_root"]) / cfg["run_id"] if cfg.get("scratch_root") else self.dir
-        if cfg.get("scratch_root"):
+        sr_cfg = cfg.get("scratch_root")
+        src_sz = Path(self.src).stat().st_size if Path(self.src).exists() else 0
+        if sr_cfg == "auto" or (sr_cfg is None and cfg.get("probe", {}).get("auto_shm", False)):
+            shm_p = Path("/dev/shm")
+            if shm_p.exists() and src_sz > 0 and shutil.disk_usage(shm_p).total >= max(30 << 30, 4 * src_sz):
+                sr_cfg = str(shm_p / "chantless")
+            else:
+                sr_cfg = None
+        self.scratch = Path(sr_cfg) / cfg["run_id"] if sr_cfg else self.dir
+        if sr_cfg:
             # stage the source on fast unencrypted storage; served, quantized and pruned from there
             staged = self.scratch / "source" / Path(self.src).name
             if not staged.exists() or staged.stat().st_size != Path(self.src).stat().st_size:
@@ -302,7 +310,7 @@ class Run:
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "search" and r["success"] and r["task"] in rel_search:
                 try:
-                    rr = R.episode(r["messages"], _tools(self.env))
+                    rr = R.episode(r["messages"], self._task_tools(r.get("task")))
                 except kl.RenderError as e:
                     self.log(f"proxy: reject {r['task']}: {e}")
                     continue
@@ -378,11 +386,20 @@ class Run:
     def make_prober(self, weights: str, tag: str) -> Prober:
         pdir = self.dir / "proxy"
         meta = read_json(pdir / "proxy.json")
-        B = bmod.Builder(self.tc, weights, self.groups, str(pdir / "imatrix.gguf"), self.scratch / "build" / tag, log=str(self.dir / "build.log"))
+        b_dir = self.scratch / "build" / tag
+        c_dir = self.scratch / "cand" / tag
+        shutil.rmtree(b_dir, ignore_errors=True)
+        shutil.rmtree(c_dir, ignore_errors=True)
+        B = bmod.Builder(self.tc, weights, self.groups, str(pdir / "imatrix.gguf"), b_dir, log=str(self.dir / "build.log"))
         B.threads = self.cfg.get("probe", {}).get("quantize_threads", 8)
-        B.max_pruned = self.cfg.get("probe", {}).get("max_pruned", 4)
-        P = Prober(self.tc, B, self.dir / "probe" / tag, str(self.dir / "probe.log"), workers=self.cfg.get("probe", {}).get("workers"),
-                   scratch=self.scratch / "cand" / tag, scorer=self.scorer)
+        B.max_pruned = self.cfg.get("probe", {}).get("max_pruned", 1 if str(self.scratch).startswith("/dev/shm") else 4)
+        workers = self.cfg.get("probe", {}).get("workers")
+        if workers is None and str(self.scratch).startswith("/dev/shm") and Path(weights).exists():
+            w_sz = max(1, Path(weights).stat().st_size)
+            free_b = shutil.disk_usage(self.scratch.parent).free
+            workers = max(1, min(5, int((free_b - w_sz) // int(1.35 * w_sz))))
+        P = Prober(self.tc, B, self.dir / "probe" / tag, str(self.dir / "probe.log"), workers=workers,
+                   scratch=c_dir, scorer=self.scorer)
         if self.cfg.get("probe", {}).get("slots_per_gpu"):   # several concurrent probes per GPU
             P._free = [g for g in self.tc.gpus for _ in range(self.cfg["probe"]["slots_per_gpu"])]
         P.add_store(Store("task", str(pdir / "task.bin"), self._staged(pdir / "store_task"), meta["task"]["n_targets"],
@@ -434,14 +451,52 @@ class Run:
             if selfkl[name] > 0.05 * ref:
                 raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
         solo, masks, keys = {}, [], []
+        tiers_all = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
         for g in base["groups"]:
-            tiers = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
-            for t in [x for x in tiers if mk.tier_allowed(self.groups[g], x)] + (["drop"] if self.groups[g]["droppable"] else []):
+            for t in [x for x in tiers_all if mk.tier_allowed(self.groups[g], x)] + (["drop"] if self.groups[g]["droppable"] else []):
                 masks.append(mk.apply(base, g, t))
                 keys.append((g, t))
         self.log(f"sanity: {len(masks)} solo probes")
-        for (g, t), r in zip(keys, P.probe_many(masks, ["general", "task"] if fkey == "task" else ["general"])):
-            solo.setdefault(g, {})[t] = {"kl_gen": r.kl["general"], "bytes_saved": src_bytes - r.bytes}
+        cap_off = sc.get("cap", "general_kl") == "off"
+        if fkey == "task" and cap_off:
+            want_solo = ["task"]
+        elif fkey == "task" or self.cfg.get("learner", {}).get("algo") == "oneshot":
+            want_solo = ["general", "task"]
+        else:
+            want_solo = ["general"]
+
+        splice_b = None
+        if sc.get("splice_cache", True) and len(masks) >= 16 and Path(self.probe_src).exists():
+            free_b = shutil.disk_usage(self.scratch).free
+            if free_b >= 3 * src_bytes:
+                splice_b = bmod.SpliceProbeBuilder.from_builder(
+                    P.builder, base, [t for t in tiers_all if t != "BF16"], self.ladder,
+                    self.scratch / "tier_cache" / "sanity", workers=min(4, max(1, P.workers)),
+                )
+                P.builder = splice_b
+
+        try:
+            task_tiers = set(sc.get("solo_task_tiers") or [])
+            if task_tiers and want_solo == ["general", "task"]:
+                full_i = [i for i, (_g, t) in enumerate(keys) if t in task_tiers]
+                gen_i = [i for i, (_g, t) in enumerate(keys) if t not in task_tiers]
+                res_map = {}
+                for i, r in zip(full_i, P.probe_many([masks[i] for i in full_i], ["general", "task"])):
+                    res_map[i] = r
+                for i, r in zip(gen_i, P.probe_many([masks[i] for i in gen_i], ["general"])):
+                    res_map[i] = r
+                solo_results = [res_map[i] for i in range(len(keys))]
+            else:
+                solo_results = P.probe_many(masks, want_solo)
+        finally:
+            if splice_b is not None:
+                splice_b.release_cache()
+                P.builder = splice_b.inner
+
+        for (g, t), r in zip(keys, solo_results):
+            solo.setdefault(g, {})[t] = {"kl_gen": r.kl.get("general", 0.0), "bytes_saved": src_bytes - r.bytes}
+            if "task" in r.kl:
+                solo[g][t]["kl_task"] = r.kl["task"]
             if fkey == "task":
                 solo[g][t]["task"] = r.kl["task"]
         floors = (sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"]) if fkey == "kl_gen" else
@@ -500,7 +555,7 @@ class Run:
         n_gate = read_json(self.dir / "aa.json")["n_gate"]
         tasks = self.reliable(split) if split != "exam" else self.exam_pool
         k = min(st["max_eps_per_task"], max(1, math.ceil(n_gate / max(1, len(tasks)))))
-        looks = st["looks"] if split != "exam" else 1
+        looks = min(st["looks"], k) if split != "exam" else 1
         rows, res = [], None
         import contextlib
         stack = contextlib.ExitStack()
@@ -592,7 +647,8 @@ class Run:
         recs = []
         for r in eps_rows:
             try:
-                recs += R.episode(r["messages"], _tools(self.env) if r.get("family") in self._task_families() else None)
+                t_tools = self._task_tools(r.get("task")) if r.get("family") in self._task_families() else None
+                recs += R.episode(r["messages"], t_tools)
             except kl.RenderError:
                 continue
         if not recs:
@@ -636,6 +692,13 @@ class Run:
 
     def _task_families(self):
         return {t.family for t in self.env.tasks()}
+
+    def _task_tools(self, task_id: str | None):
+        if task_id and task_id in self.by_id:
+            p = self.by_id[task_id].prompt
+            if isinstance(p, dict) and "tools" in p:
+                return p["tools"]
+        return _tools(self.env)
 
     def phase_search(self):
         lc = self.cfg["learner"]
@@ -1036,8 +1099,17 @@ class Run:
             src_params = P.builder.source_params
             gen_dvc = {(g, t): gen_sur.shift(g, t) for g, o in options.items() for t in o}
             def _gen_guard(m_cand: dict, b_cand: int) -> float:
+                vs = 0
+                if keep_vocab is not None:
+                    tiers_c, _ = oneshot.unpack_solution(m_cand)
+                    t_tiers = {
+                        tab: tiers_c.get("output" if tab == "output.weight" else "token_embd", "Q4_K")
+                        for tab in ("token_embd.weight", "per_layer_token_embd.weight", "output.weight")
+                        if tab in bm.inv
+                    }
+                    vs = vocabmod.vocab_trim_byte_savings(self.probe_src, keep_vocab, t_tiers)
                 gx = gen_sur.src + sum(gen_dvc[(g, t)] for g, t in m_cand.items())
-                return float(gen_sur.damage(gx) - cap(bmod_bpw(b_cand, src_params)))
+                return float(gen_sur.damage(gx) - cap(bmod_bpw(b_cand + vs, src_params)))
             guard_fn = _gen_guard
 
         budget, target = lc["target_bytes"], lc["target_bytes"]
@@ -1078,7 +1150,7 @@ class Run:
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "train" and r["success"]:
                 try:
-                    recs += R.episode(r["messages"], _tools(self.env))
+                    recs += R.episode(r["messages"], self._task_tools(r.get("task")))
                 except kl.RenderError:
                     pass
         if not recs:

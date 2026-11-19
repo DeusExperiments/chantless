@@ -27,7 +27,7 @@ from . import lattice, mask as maskmod
 
 LAYER_NAMES = {
     "attn_norm": "input_layernorm.weight", "post_attention_norm": "post_attention_layernorm.weight",
-    "ffn_norm": "post_attention_layernorm.weight",
+    "ffn_norm": "post_attention_layernorm.weight", "post_ffw_norm": "post_feedforward_layernorm.weight",
     "ffn_gate": "mlp.gate_proj.weight", "ffn_up": "mlp.up_proj.weight", "ffn_down": "mlp.down_proj.weight",
     "attn_q": "self_attn.q_proj.weight", "attn_k": "self_attn.k_proj.weight", "attn_v": "self_attn.v_proj.weight",
     "attn_output": "self_attn.o_proj.weight", "attn_q_norm": "self_attn.q_norm.weight", "attn_k_norm": "self_attn.k_norm.weight",
@@ -35,6 +35,16 @@ LAYER_NAMES = {
     "ssm_alpha": "linear_attn.in_proj_a.weight", "ssm_beta": "linear_attn.in_proj_b.weight",
     "ssm_out": "linear_attn.out_proj.weight", "ssm_norm": "linear_attn.norm.weight",
     "ssm_conv1d": "linear_attn.conv1d.weight", "ssm_a": "linear_attn.A_log", "ssm_dt": "linear_attn.dt_bias",
+    "inp_gate": "per_layer_input_gate.weight", "proj": "per_layer_projection.weight",
+    "post_norm": "post_per_layer_input_norm.weight", "layer_output_scale": "layer_scalar",
+}
+TOPLEVEL_NAMES = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "output.weight": "lm_head.weight",
+    "per_layer_token_embd.weight": "model.embed_tokens_per_layer.weight",
+    "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
+    "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
 }
 
 _GGML_LIBS_CACHE: dict[str, list[ctypes.CDLL]] = {}
@@ -87,14 +97,12 @@ class OnGrid(nn.Module):
         return w + (self.lo + self.step * self.levels(w) - w).detach()
 
 
-def hf_name(gg: str) -> str:
-    if gg == "token_embd.weight":
-        return "model.embed_tokens.weight"
-    if gg == "output_norm.weight":
-        return "model.norm.weight"
-    if gg == "output.weight":
-        return "lm_head.weight"
+def hf_name(gg: str, is_gemma4: bool = False) -> str:
+    if gg in TOPLEVEL_NAMES:
+        return TOPLEVEL_NAMES[gg]
     p = gg.split(".")
+    if is_gemma4 and p[2] == "ffn_norm":
+        return f"model.layers.{p[1]}.pre_feedforward_layernorm.weight"
     return f"model.layers.{p[1]}.{LAYER_NAMES[p[2]]}"
 
 
@@ -109,14 +117,20 @@ def floats(art: lattice.Artifact, name: str, ggml_lib: str | None) -> np.ndarray
         return (np.frombuffer(art.raw(name), dtype="<u2").astype("<u4") << 16).view("<f4").reshape(shape)
     if t["type"] in lattice.TOP:
         return art.grid(name).values().reshape(shape)
-    sym = f"dequantize_row_{t['type'].lower()}"
+    low = t["type"].lower()
+    syms = [f"dequantize_row_{low}"]
+    if t["type"].endswith("_K"):
+        syms.append(f"dequantize_row_{low[:-1]}K")
     fn = None
     for lib in _load_ggml_libs(ggml_lib):
-        fn = getattr(lib, sym, None)
+        for s in syms:
+            fn = getattr(lib, s, None)
+            if fn is not None:
+                break
         if fn is not None:
             break
     if fn is None:
-        raise RuntimeError(f"could not find {sym} in {ggml_lib}")
+        raise RuntimeError(f"could not find {syms[0]} in {ggml_lib}")
     fn.argtypes, fn.restype = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int64], None
     y = np.empty(t["n_elements"], np.float32)
     fn(bytes(art.raw(name)), y.ctypes.data, t["n_elements"])
@@ -157,9 +171,12 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
     elif hasattr(conf, "text_config"):
         conf = conf.text_config
     conf.vocab_size = art.tensors["token_embd.weight"]["dims"][1]
+    if "per_layer_token_embd.weight" in art.tensors and hasattr(conf, "vocab_size_per_layer_input"):
+        conf.vocab_size_per_layer_input = art.tensors["per_layer_token_embd.weight"]["dims"][1]
     conf.use_cache = False
+    is_gemma4 = getattr(art.h, "arch", "") == "gemma4" or "per_layer_token_embd.weight" in art.tensors or any(n.endswith(".post_ffw_norm.weight") for n in art.tensors)
     model = AutoModelForCausalLM.from_config(conf, dtype=torch.float32)
-    # `(1 + weight)` RMSNorm models (`Qwen3_5`, `Gemma`) init `norm.weight` to zeros; standard `RMSNorm` (`Qwen3`) inits to ones.
+    # `(1 + weight)` RMSNorm models (`Qwen3_5`) init `norm.weight` to zeros; standard `RMSNorm` (`Qwen3`, `Gemma4`) inits to ones.
     norm_offset = 1.0 if float(model.model.norm.weight.detach().abs().max()) == 0.0 else 0.0
     num_k_heads = int(getattr(conf, "linear_num_key_heads", 0) or 0)
     num_v_heads = int(getattr(conf, "linear_num_value_heads", 0) or 0)
@@ -191,13 +208,23 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
                 layer.linear_attn = Zero(False)
             else:
                 layer.self_attn = Zero(True)
+        if hasattr(layer, "per_layer_input_gate") and f"blk.{il}.inp_gate.weight" not in art.tensors:
+            layer.hidden_size_per_layer_input = 0
     params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
     for name in art.tensors:
-        hfn = hf_name(name)
+        if name == "rope_freqs.weight":
+            continue
+        hfn = hf_name(name, is_gemma4=is_gemma4)
         if hfn == "lm_head.weight" and hfn not in params:
             model.lm_head = nn.Linear(art.shape(name)[1], art.shape(name)[0], bias=False)
             params[hfn] = model.lm_head.weight
-        p, v = params[hfn], torch.from_numpy(floats(art, name, ggml_lib).copy())
+        v = torch.from_numpy(floats(art, name, ggml_lib).copy())
+        if hfn in buffers and hfn not in params:
+            b = buffers[hfn]
+            b.copy_(v.reshape(b.shape))
+            continue
+        p = params[hfn]
         # conversion to GGUF adjustments (conversion/qwen.py, Qwen3NextModel & _LinearAttentionVReorderBase)
         if "ssm_conv1d" in name:
             v = v.unsqueeze(1)
@@ -227,7 +254,7 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
     grids = {}
     for name in train:
         g = art.grid(name)
-        path = hf_name(name).rsplit(".", 1)[0]
+        path = hf_name(name, is_gemma4=is_gemma4).rsplit(".", 1)[0]
         m, shape = mods[path], art.shape(name)
         fq = OnGrid(torch.from_numpy(g.lo).reshape(shape).to(device), torch.from_numpy(g.step).reshape(shape).to(device), g.top)
         if latents is not None:
@@ -275,19 +302,27 @@ def scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, am
     import torch
     ids, m = collate(docs, device)
     with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
-        logits = model(input_ids=ids, attention_mask=m, logits_to_keep=1).logits[:, -1]
-    x = logits[:, list(pair)].float()
+        h = model.model(input_ids=ids, attention_mask=m, use_cache=False).last_hidden_state[:, -1]
+        x = _head_logits(model, h)[:, list(pair)]
     return x[:, 0] - x[:, 1]
 
 
+def _head_logits(model, h):
+    import torch
+    lg = model.lm_head(h).float()
+    cap = getattr(getattr(model, "config", None), "final_logit_softcapping", None)
+    if cap:
+        lg = torch.tanh(lg / float(cap)) * float(cap)
+    return lg
+
+
 def vec_scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool):
-    """The score and the final 1,024-number state, from which the whole output distribution follows."""
+    """The score and the final hidden state, from which the whole output distribution follows."""
     import torch
     ids, m = collate(docs, device)
     with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
-        h = model.model(input_ids=ids, attention_mask=m).last_hidden_state[:, -1]
-        x = model.lm_head(h)[:, list(pair)]
-    x = x.float()
+        h = model.model(input_ids=ids, attention_mask=m, use_cache=False).last_hidden_state[:, -1]
+        x = _head_logits(model, h)[:, list(pair)]
     return x[:, 0] - x[:, 1], h.float()
 
 
@@ -382,7 +417,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
     else:
         base = torch.from_numpy(np.asarray(anchor["base"], dtype=np.float32)).to(device)
         assert len(base) == len(replay)
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0, eps=float(cfg.get("adam_eps", 1e-8)))
     flat = [w for g in params for w in g["params"]] if isinstance(params[0], dict) else params
     rng = random.Random(cfg.get("seed", 20261031))
     steps, nf, nr = cfg.get("steps", 200), cfg.get("feedback_batch", 8), cfg.get("replay_batch", 16)
@@ -405,7 +440,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
     names_s, names_f = sorted(pools), sorted(shares)
     guard = cfg.get("guard_weight", 0.0)
     log(f"learn: {sum(w.numel() for w in flat):,} parameters, {len(feedback)} feedback, {len(pairs)} pairs, {len(replay)} replay")
-    kind, cap = cfg.get("hold_kind"), cfg.get("train_budget")
+    kind, cap = cfg.get("hold_kind"), cfg.get("train_budget", 3072 if amp else None)
     vec = kind == "klvec"
     if vec:
         if anchor is not None and "h0" in anchor:
@@ -613,6 +648,50 @@ def _switchable_layers(art: lattice.Artifact, n_layers: int, switch_mode: str, l
     return layers
 
 
+def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
+    """Auto-enable gradient checkpointing on <55 GiB GPUs or pure-PyTorch Qwen3.5 GDN when unset."""
+    if "checkpointing" in cfg:
+        return bool(cfg["checkpointing"])
+    if not device.startswith("cuda"):
+        return False
+    import torch
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < (55 << 30):
+        return True
+    mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if mtype.startswith("qwen3_5"):
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            return True
+    return False
+
+
+def _default_seq_batch(model, device: str) -> int:
+    if device.startswith("cuda") and str(getattr(getattr(model, "config", None), "model_type", "")).lower().startswith("qwen3_5"):
+        try:
+            import fla  # noqa: F401
+        except ImportError:
+            return 2
+    return 4
+
+
+def make_shuffled_classifier_labels(feedback: list[dict], seed: int = 20261118) -> list[dict]:
+    """Build a non-degenerate random-label control for binary classifier feedback.
+
+    When all feedback mistakes share a single class label, permuting them would reproduce the
+    learned labels identically; fall back to balanced 50/50 random labels in that case.
+    """
+    import random as _rnd
+    lbls = [r["label"] for r in feedback]
+    if len(set(lbls)) <= 1:
+        n_half = len(feedback) // 2
+        pool = ["human"] * (len(feedback) - n_half) + ["ai"] * n_half
+    else:
+        pool = list(lbls)
+    _rnd.Random(seed).shuffle(pool)
+    return [{**r, "label": pool[i]} for i, r in enumerate(feedback)]
+
+
 def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int] | None = None,
                 cutoff: float = 0.0, out: str = "", cfg: dict | None = None, log=print, device: str | None = None,
                 strata: list[str] | None = None, mask_in: dict | str | Path | None = None, mask_out: str | Path | None = None) -> dict:
@@ -633,7 +712,7 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     switch_mode = cfg.get("switch_mode", "up_row_zero")
     art = lattice.Artifact(art_path)
     model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
-    if cfg.get("checkpointing", True) and amp:
+    if _auto_checkpointing(model, cfg, device) and amp:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
     layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
@@ -657,6 +736,11 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
         mask_in=mask_in or cfg.get("mask_in"), mask_out=mask_out or cfg.get("mask_out"),
     )
     art.close()
+    del model
+    import gc
+    gc.collect()
+    if amp:
+        torch.cuda.empty_cache()
     n = sum(map(len, off.values()))
     rec = {"method": "gates", "switch_mode": switch_mode, "steps": cfg.get("steps", 200), "gate_lr": cfg.get("gate_lr", 0.03),
            "neurons": bits, "off": n, "fraction_moved": n / max(1, bits), "off_by_layer": {str(k): len(v) for k, v in off.items()},
@@ -753,7 +837,7 @@ def _seq_mean_logprob(model, h_batch, seqs: list[np.ndarray], tgts: list[np.ndar
     for k, (tok, tgt) in enumerate(zip(seqs, tgts)):
         pos_idx = torch.from_numpy(tgt - 1).to(h_batch.device, dtype=torch.long)
         lbl = torch.from_numpy(tok[tgt]).to(h_batch.device, dtype=torch.long)
-        logits = model.lm_head(h_batch[k, pos_idx]).float()
+        logits = _head_logits(model, h_batch[k, pos_idx])
         logp = torch.log_softmax(logits, dim=-1)
         picked = logp.gather(-1, lbl.unsqueeze(-1)).squeeze(-1)
         out.append(picked.mean())
@@ -771,7 +855,7 @@ def student_traj_nll(model, trajs: list[tuple[np.ndarray, np.ndarray]], device: 
             h = _forward_backbone(model, [tok], device, amp, round_to=1)[0]
             pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
             lbl = torch.from_numpy(tok[tgt]).to(device, dtype=torch.long)
-            logits = model.lm_head(h[pos_idx]).float()
+            logits = _head_logits(model, h[pos_idx])
             logp = torch.log_softmax(logits, dim=-1)
             nll = float(-logp.gather(-1, lbl.unsqueeze(-1)).squeeze(-1).mean().item())
             top1 = float((logits.argmax(dim=-1) == lbl).float().mean().item())
@@ -808,13 +892,13 @@ def learn_gates_seq(
     pad_mult = int(cfg.get("pad_multiple", 32))
 
     lessons = [_norm_seq_lesson(r) for r in feedback]
-    if not lessons:
-        raise ValueError("learn_gates_seq requires at least one feedback lesson")
     rep_trajs = [_norm_replay_traj(x) for x in replay]
+    if not lessons and not rep_trajs:
+        raise ValueError("learn_gates_seq requires at least one feedback lesson or replay trajectory")
 
     art = lattice.Artifact(art_path)
     model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
-    if cfg.get("checkpointing", False) and amp:
+    if _auto_checkpointing(model, cfg, device) and amp:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
 
@@ -832,7 +916,7 @@ def learn_gates_seq(
         for tok, tgt in rep_trajs:
             h = _forward_backbone(model, [tok], device, amp, round_to=pad_mult)[0]
             pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
-            replay_h0.append(h[pos_idx].detach().to(torch.bfloat16 if amp else torch.float32).cpu())
+            replay_h0.append(h[pos_idx].detach().float().cpu())
 
     def hook(il):
         def f(mod, args):
@@ -843,12 +927,13 @@ def learn_gates_seq(
 
     hooks = [model.model.layers[il].mlp.down_proj.register_forward_pre_hook(hook(il)) for il in layers]
     flat = list(theta.values())
-    opt = torch.optim.AdamW(flat, lr=float(cfg.get("gate_lr", 0.05)), weight_decay=0.0)
+    opt = torch.optim.AdamW(flat, lr=float(cfg.get("gate_lr", 0.05)), weight_decay=0.0, eps=float(cfg.get("adam_eps", 1e-4)))
     rng = random.Random(cfg.get("seed", 20261031))
 
     steps = int(cfg.get("steps", 80))
-    nf = int(cfg.get("feedback_batch", min(4, len(lessons))))
-    nr = int(cfg.get("replay_batch", min(4, len(rep_trajs)))) if rep_trajs else 0
+    def_bs = _default_seq_batch(model, device)
+    nf = int(cfg.get("feedback_batch", min(def_bs, len(lessons))))
+    nr = int(cfg.get("replay_batch", min(def_bs, len(rep_trajs)))) if rep_trajs else 0
     nll_w = float(cfg.get("nll_weight", 1.0))
     margin_w = float(cfg.get("margin_weight", 1.0))
     margin = float(cfg.get("margin", 0.5))
@@ -861,24 +946,28 @@ def learn_gates_seq(
     conflicts = 0
 
     for step in range(steps):
-        fb_batch = rng.sample(lessons, min(nf, len(lessons)))
-        pos_seqs = [r["pos_tokens"] for r in fb_batch]
-        pos_tgts = [r["pos_targets"] for r in fb_batch]
-        h_pos = _forward_backbone(model, pos_seqs, device, amp, round_to=pad_mult)
-        lp_pos = _seq_mean_logprob(model, h_pos, pos_seqs, pos_tgts)
-        loss_nll = -lp_pos.mean()
+        if lessons and (nll_w > 0 or margin_w > 0):
+            fb_batch = rng.sample(lessons, min(nf, len(lessons)))
+            pos_seqs = [r["pos_tokens"] for r in fb_batch]
+            pos_tgts = [r["pos_targets"] for r in fb_batch]
+            h_pos = _forward_backbone(model, pos_seqs, device, amp, round_to=pad_mult)
+            lp_pos = _seq_mean_logprob(model, h_pos, pos_seqs, pos_tgts)
+            loss_nll = -lp_pos.mean()
 
-        neg_idx = [k for k, r in enumerate(fb_batch) if r["neg_tokens"] is not None]
-        if neg_idx:
-            neg_seqs = [fb_batch[k]["neg_tokens"] for k in neg_idx]
-            neg_tgts = [fb_batch[k]["neg_targets"] for k in neg_idx]
-            h_neg = _forward_backbone(model, neg_seqs, device, amp, round_to=pad_mult)
-            lp_neg = _seq_mean_logprob(model, h_neg, neg_seqs, neg_tgts)
-            loss_margin = torch.nn.functional.softplus(margin - (lp_pos[neg_idx] - lp_neg)).mean()
+            neg_idx = [k for k, r in enumerate(fb_batch) if r["neg_tokens"] is not None]
+            if neg_idx and margin_w > 0:
+                neg_seqs = [fb_batch[k]["neg_tokens"] for k in neg_idx]
+                neg_tgts = [fb_batch[k]["neg_targets"] for k in neg_idx]
+                h_neg = _forward_backbone(model, neg_seqs, device, amp, round_to=pad_mult)
+                lp_neg = _seq_mean_logprob(model, h_neg, neg_seqs, neg_tgts)
+                loss_margin = torch.nn.functional.softplus(margin - (lp_pos[neg_idx] - lp_neg)).mean()
+            else:
+                loss_margin = torch.zeros((), device=device)
+            loss_new = nll_w * loss_nll + margin_w * loss_margin
         else:
+            loss_nll = torch.zeros((), device=device)
             loss_margin = torch.zeros((), device=device)
-
-        loss_new = nll_w * loss_nll + margin_w * loss_margin
+            loss_new = torch.zeros((), device=device)
 
         if nr > 0:
             r_ids = rng.sample(range(len(rep_trajs)), min(nr, len(rep_trajs)))
@@ -891,16 +980,18 @@ def learn_gates_seq(
                 h_cur = h_rep[k, pos_idx]
                 h_ref = replay_h0[i].to(device=device, dtype=h_cur.dtype)
                 with torch.no_grad():
-                    log_p0 = torch.log_softmax(model.lm_head(h_ref).float() / kl_temp, dim=-1)
+                    log_p0 = torch.log_softmax(_head_logits(model, h_ref) / kl_temp, dim=-1)
                     p0 = log_p0.exp()
-                log_pc = torch.log_softmax(model.lm_head(h_cur).float() / kl_temp, dim=-1)
+                log_pc = torch.log_softmax(_head_logits(model, h_cur) / kl_temp, dim=-1)
                 kl_terms.append((p0 * (log_p0 - log_pc)).sum(dim=-1).mean() * (kl_temp * kl_temp))
             loss_hold = torch.stack(kl_terms).mean()
         else:
             loss_hold = torch.zeros((), device=device)
 
         opt.zero_grad()
-        if use_agem and nr > 0 and hold_w > 0:
+        has_new = bool(loss_new.requires_grad)
+        has_hold = bool(nr > 0 and hold_w > 0 and loss_hold.requires_grad)
+        if use_agem and has_new and has_hold:
             scaled_hold = hold_w * loss_hold
             g_new = torch.autograd.grad(loss_new, flat, retain_graph=True, allow_unused=True)
             g_old = torch.autograd.grad(scaled_hold, flat, allow_unused=True)
@@ -913,9 +1004,11 @@ def learn_gates_seq(
                 conflicts += 1
             for p, a, b in zip(flat, g_new, g_old):
                 p.grad = a + b
-        else:
-            (loss_new + hold_w * loss_hold).backward()
-        opt.step()
+            opt.step()
+        elif has_new or has_hold:
+            tot = (loss_new if has_new else 0.0) + (hold_w * loss_hold if has_hold else 0.0)
+            tot.backward()
+            opt.step()
 
         hist.append((float(loss_nll.item()), float(loss_margin.item()), float(loss_hold.item())))
         if step % max(1, steps // 5) == 0 or step == steps - 1:
@@ -929,6 +1022,11 @@ def learn_gates_seq(
         mask_in=mask_in or cfg.get("mask_in"), mask_out=mask_out or cfg.get("mask_out"),
     )
     art.close()
+    del model
+    import gc
+    gc.collect()
+    if amp:
+        torch.cuda.empty_cache()
     n_off = sum(map(len, off.values()))
     rec = {
         "method": "gates_seq",
@@ -1097,8 +1195,230 @@ def judge(model: str, c: dict, scorer, rows: list[dict], fb: list[dict], hold: l
     return out
 
 
+def _load_json_or_jsonl(path_or_list) -> list[dict]:
+    if isinstance(path_or_list, list):
+        return list(path_or_list)
+    p = Path(path_or_list)
+    txt = p.read_text().strip()
+    if not txt:
+        return []
+    if txt[0] == "[":
+        return json.loads(txt)
+    return [json.loads(line) for line in txt.splitlines() if line.strip()]
+
+
+def _tokenize_seq_lessons(tc, model_gguf: str, raw_rows: list[dict], threads: int = 8) -> list[dict]:
+    from . import runtime
+    need_str = [i for i, r in enumerate(raw_rows) if "prompt_tokens" not in r and "pos_tokens" not in r]
+    if not need_str:
+        return [dict(r) for r in raw_rows]
+    strs: list[str] = []
+    for i in need_str:
+        r = raw_rows[i]
+        pr = str(r["prompt"])
+        good_s = str(r["corrected"])
+        bad_s = str(r.get("mistaken") or "")
+        strs.extend([pr, pr + good_s, good_s, (pr + bad_s) if bad_s else "", bad_s])
+    toks = [x.tolist() for x in runtime.tokenize_docs(tc, model_gguf, strs, threads=threads)]
+    out = [dict(r) for r in raw_rows]
+    for k, i in enumerate(need_str):
+        pr, pr_good, good_raw, pr_bad, bad_raw = toks[5 * k : 5 * k + 5]
+        good = pr_good[len(pr):] if (len(pr_good) > len(pr) and pr_good[: len(pr)] == pr) else good_raw
+        bad = (pr_bad[len(pr):] if (len(pr_bad) > len(pr) and pr_bad[: len(pr)] == pr) else bad_raw) if bad_raw else []
+        out[i]["prompt_tokens"] = pr
+        out[i]["corrected_tokens"] = good
+        if bad:
+            out[i]["mistaken_tokens"] = bad
+    return out
+
+
+def _load_replay_trajs(tc, model_gguf: str, spec, threads: int = 8) -> list[tuple[np.ndarray, np.ndarray]]:
+    from . import runtime
+    if not spec:
+        return []
+    if isinstance(spec, (str, Path)) and str(spec).endswith((".bin", ".trj")):
+        return read_trj_multi(spec)
+    rows = _load_json_or_jsonl(spec)
+    if not rows:
+        return []
+    if "tokens" in rows[0] and "targets" in rows[0]:
+        return [(np.asarray(r["tokens"], dtype=np.int32), np.asarray(r["targets"], dtype=np.uint32)) for r in rows]
+    strs = []
+    for r in rows:
+        pr = str(r["prompt"])
+        full = pr + str(r["completion"])
+        strs.extend([pr, full])
+    toks = [x.tolist() for x in runtime.tokenize_docs(tc, model_gguf, strs, threads=threads)]
+    out = []
+    for k in range(0, len(toks), 2):
+        pre, full = toks[k], toks[k + 1]
+        if len(full) > len(pre) and full[: len(pre)] == pre:
+            out.append((np.asarray(full, dtype=np.int32), np.arange(len(pre), len(full), dtype=np.uint32)))
+    return out
+
+
+def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
+    """`chantless learn` for generative / tool-calling models (`learn_gates_seq` + `empty`/`flipped`/`shuffled` controls)."""
+    from . import builder as bmod, gguf_ops, kl, stats, util
+    from .env.protocol import load_environment
+    from .evaluator import Evaluator, ok_rows
+    from .runtime import Toolchain
+
+    c = cfg["learn"]
+    tc = Toolchain.from_config(cfg["toolchain"])
+    out_dir = Path(c["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_model = str(c["model"])
+    config_dir = str(c["config_dir"])
+    ggml_lib = str(c.get("ggml_lib") or cfg["toolchain"]["llama_bin"])
+    base_cfg = {**c, "ggml_lib": ggml_lib, "switch_mode": c.get("switch_mode", "up_row_zero")}
+
+    all_lessons = _tokenize_seq_lessons(tc, base_model, _load_json_or_jsonl(c["lessons"]))
+    train_lessons = [r for r in all_lessons if fold is None or r.get("fold") != fold]
+    held_lessons = [r for r in all_lessons if fold is not None and r.get("fold") == fold]
+    if len(train_lessons) > int(c.get("max_lessons", 25)):
+        train_lessons = train_lessons[: int(c.get("max_lessons", 25))]
+    replay_trajs = _load_replay_trajs(tc, base_model, c.get("replay"))
+
+    tag = "all" if fold is None else f"fold{fold}"
+    learned_gguf = str(out_dir / f"apprentice-{tag}.gguf")
+    learned_mask = str(c.get("mask_out") or (out_dir / f"apprentice-{tag}.mask.json"))
+    rec_learned = learn_gates_seq(
+        base_model, config_dir, train_lessons, replay_trajs, learned_gguf,
+        cfg=base_cfg, log=log, mask_in=c.get("mask_in"), mask_out=learned_mask if c.get("mask_in") else None,
+    )
+
+    if c.get("source_gguf") and c.get("mask_in"):
+        groups, _ = gguf_ops.adapter_from_gguf(c["source_gguf"], config_dir)
+        chk_p = out_dir / f"rebuild-check-{tag}.gguf"
+        bmod.Builder(tc, c["source_gguf"], groups, c.get("imatrix"), out_dir / ".work-rebuild").build(maskmod.load(learned_mask), chk_p)
+        if sha256(str(chk_p)) != sha256(learned_gguf):
+            raise RuntimeError("rebuilt GGUF from exported v3 apprentice mask did not match in-place switched GGUF")
+        chk_p.unlink(missing_ok=True)
+
+    arms = {"base": base_model, "learned": learned_gguf}
+    control_recs = {}
+    if c.get("controls", True):
+        # 1. Empty control (0 lessons, replay/init only)
+        emp_gguf = str(out_dir / f"control-empty-{tag}.gguf")
+        emp_cfg = {**base_cfg, "nll_weight": 0.0, "margin_weight": 0.0}
+        emp_cfg.pop("mask_in", None); emp_cfg.pop("mask_out", None)
+        control_recs["empty"] = learn_gates_seq(base_model, config_dir, [], replay_trajs or [(np.array([1, 2, 3], dtype=np.int32), np.array([1, 2], dtype=np.uint32))], emp_gguf, cfg=emp_cfg, log=log)
+        arms["empty"] = emp_gguf
+
+        # 2. Flipped control (swap corrected <-> mistaken on lessons that carry mistaken_tokens)
+        flipped_lessons = []
+        for r in train_lessons:
+            if r.get("mistaken_tokens"):
+                flipped_lessons.append({**r, "corrected_tokens": r["mistaken_tokens"], "mistaken_tokens": r["corrected_tokens"]})
+        if flipped_lessons:
+            flp_gguf = str(out_dir / f"control-flipped-{tag}.gguf")
+            flp_cfg = dict(base_cfg); flp_cfg.pop("mask_in", None); flp_cfg.pop("mask_out", None)
+            control_recs["flipped"] = learn_gates_seq(base_model, config_dir, flipped_lessons, replay_trajs, flp_gguf, cfg=flp_cfg, log=log)
+            arms["flipped"] = flp_gguf
+
+        # 3. Shuffled control (cyclic shift of `(corrected_tokens, mistaken_tokens)` pairs together across prompts)
+        if len(train_lessons) >= 2:
+            shuf_lessons = []
+            for i, r in enumerate(train_lessons):
+                other = train_lessons[(i + 1) % len(train_lessons)]
+                shuf_lessons.append({
+                    **r,
+                    "corrected_tokens": other["corrected_tokens"],
+                    "mistaken_tokens": other.get("mistaken_tokens"),
+                })
+            shf_gguf = str(out_dir / f"control-shuffled-{tag}.gguf")
+            shf_cfg = dict(base_cfg); shf_cfg.pop("mask_in", None); shf_cfg.pop("mask_out", None)
+            control_recs["shuffled"] = learn_gates_seq(base_model, config_dir, shuf_lessons, replay_trajs, shf_gguf, cfg=shf_cfg, log=log)
+            arms["shuffled"] = shf_gguf
+
+    # Score C++ `traj-kl` NLL / margin across all arms on held-out (or train) lessons
+    probe_lessons = held_lessons or train_lessons
+    trj_eval = out_dir / f"eval-lessons-{tag}.bin"
+    eval_recs = []
+    pair_indices = []
+    for r in probe_lessons:
+        nl = _norm_seq_lesson(r)
+        i_pos = len(eval_recs)
+        eval_recs.append((nl["pos_tokens"].tolist(), nl["pos_targets"].tolist()))
+        i_neg = None
+        if nl["neg_tokens"] is not None:
+            i_neg = len(eval_recs)
+            eval_recs.append((nl["neg_tokens"].tolist(), nl["neg_targets"].tolist()))
+        pair_indices.append((i_pos, i_neg))
+    kl.write_trj(trj_eval, eval_recs)
+    kl.traj_kl(tc, "base", base_model, str(trj_eval), str(out_dir / "store_eval"), str(out_dir / "base_eval.json"), str(out_dir / "kl.log"), gpu=tc.gpus[0])
+
+    cpp_metrics = {}
+    for arm_name, arm_path in arms.items():
+        r_kl = kl.traj_kl(tc, "kl", arm_path, str(trj_eval), str(out_dir / "store_eval"), str(out_dir / f"kl-{arm_name}.json"), str(out_dir / "kl.log"), gpu=tc.gpus[0])
+        pos_nlls = [r_kl["trajs"][ip]["nll_cand"] for ip, _ in pair_indices]
+        margins = [(-r_kl["trajs"][ip]["nll_cand"]) - (-r_kl["trajs"][ineg]["nll_cand"]) for ip, ineg in pair_indices if ineg is not None]
+        cpp_metrics[arm_name] = {
+            "bytes": Path(arm_path).stat().st_size,
+            "sha256": sha256(arm_path),
+            "pos_nll_mean": float(np.mean(pos_nlls)) if pos_nlls else None,
+            "margin_mean": float(np.mean(margins)) if margins else None,
+            "pairs_won": int(sum(m > 0 for m in margins)) if margins else None,
+            "n_pairs": len(margins),
+        }
+
+    # Optional live `Evaluator` task evaluation (`heldout_ids` + `select` side-1 retention gate)
+    env_metrics = {}
+    accepted = bool(cpp_metrics["learned"]["pos_nll_mean"] < cpp_metrics["base"]["pos_nll_mean"])
+    if cfg.get("env"):
+        env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
+        by_id = {t.id: t for t in env.tasks()}
+        ev = Evaluator(tc, env, cfg.get("decoding", {"temperature": 0.0}),
+                       cfg.get("serving", {}).get("slots_per_gpu", 4),
+                       cfg.get("serving", {}).get("ctx_per_slot", env.deployment["context"]),
+                       env.deployment["kv_type"], out_dir / "episodes")
+        held_ids = c.get("heldout_ids") or [t.id for t in env.tasks() if t.split == "train" and _side(t.id) == 1]
+        held_tasks = [by_id[i] for i in held_ids if i in by_id]
+        sel_tasks = [t for t in env.tasks() if t.split == "select" and _side(t.id) == 1]
+        if c.get("select_limit"):
+            sel_tasks = sel_tasks[: int(c["select_limit"])]
+        ref_model = str(c.get("gate_ref_model") or base_model)
+        ref_sel = ok_rows(ev.run(ref_model, [(t, util.stable_seed("learn-sel", t.id)) for t in sel_tasks], "learn-ref-sel", "src")) if sel_tasks else []
+
+        for arm_name, arm_path in arms.items():
+            h_rows = ok_rows(ev.run(arm_path, [(t, util.stable_seed("learn-held", t.id)) for t in held_tasks], f"learn-{arm_name}-held", "cand")) if held_tasks else []
+            s_rows = ok_rows(ev.run(arm_path, [(t, util.stable_seed("learn-sel", t.id)) for t in sel_tasks], f"learn-{arm_name}-sel", "cand")) if sel_tasks else []
+            bnd = stats.delta_and_bounds(s_rows + ref_sel, float(c.get("alpha", 0.05))) if (s_rows and ref_sel) else {"delta": 0.0, "L": 0.0, "U": 0.0}
+            env_metrics[arm_name] = {
+                "heldout_n": len(h_rows),
+                "heldout_passed": int(sum(bool(r["success"]) for r in h_rows)),
+                "heldout_rate": float(sum(bool(r["success"]) for r in h_rows) / max(1, len(h_rows))) if h_rows else None,
+                "select_n": len(s_rows),
+                "select_rate": float(sum(bool(r["success"]) for r in s_rows) / max(1, len(s_rows))) if s_rows else None,
+                "select_delta": bnd["delta"],
+                "select_L": bnd["L"],
+                "gate_pass": bool(bnd["L"] > -float(c.get("gate_margin", 0.03))),
+            }
+        if held_tasks:
+            l_rate = env_metrics["learned"]["heldout_rate"]
+            ctrl_rates = [env_metrics[k]["heldout_rate"] for k in ("base", "empty", "flipped", "shuffled") if k in env_metrics and env_metrics[k]["heldout_rate"] is not None]
+            accepted = bool(env_metrics["learned"]["gate_pass"] and all(l_rate > cr for cr in ctrl_rates))
+
+    res = {
+        "accepted": accepted,
+        "fold": fold,
+        "lineage": rec_learned,
+        "controls_lineage": control_recs,
+        "cpp_traj_kl": cpp_metrics,
+        "env_eval": env_metrics,
+        "mask_out": learned_mask if c.get("mask_in") else None,
+    }
+    (out_dir / f"result-{tag}.json").write_text(json.dumps(res, indent=2))
+    log(f"learn_generative {tag}: accepted={accepted} cpp={cpp_metrics} env={env_metrics}")
+    return res
+
+
 def run(cfg: dict, fold: int | None = None, log=print) -> dict:
-    """`chantless.cli learn`: train on feedback, build by writing levels, judge the real file, accept or reject."""
+    """`chantless.cli learn`: train on feedback, materialize switches/levels, judge the real file + controls."""
+    c = cfg["learn"]
+    if c.get("mode") == "generative" or c.get("method") == "gates_seq":
+        return run_generative(cfg, fold=fold, log=log)
     from .runtime import BatchScorer, Toolchain
 
     c = cfg["learn"]

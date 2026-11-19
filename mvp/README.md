@@ -31,8 +31,10 @@ This is a small but complete implementation of the tuned Chantless spec (`../exp
 ## Run
 
 ```bash
-python -m chantless.cli run --config configs/local-smoke.json   # tiny integration run on a laptop
-python -m chantless.cli run --config configs/box.json           # full MVP run on 8 GPUs
+chantless extract --config configs/local-smoke.json   # tiny integration run on a laptop
+chantless extract --config configs/box.json           # full feedback-learner run on 8 GPUs
+chantless build   --source BASE.gguf --mask ../masks/qwen3-4b-bfcl-apprentice-mask.json --out out.gguf
+chantless learn   --config learn-config.json --out-mask apprentice-mask.json
 ```
 
 Phases resume from `runs/<id>/phases/*.done`. Run `--reset PHASE` to redo a phase and all later ones.
@@ -41,5 +43,5 @@ Phases resume from `runs/<id>/phases/*.done`. Run `--reset PHASE` to redo a phas
 
 - Weight repair trains without simulating quantisation. The loop measures the real built artifact, and repair is accepted only if it helps.
 - The dynquant baseline is our K94-style recipe re-implemented on this model, measured once on the same proxy. It is not the original Qwen3.8 pipeline.
-- Speedups, such as a tensor-variant cache and cached move rankings beyond the top-16 schedule, are deliberately absent. Every probe requantises the whole model.
-- Removal operators exist for `qwen3` and `qwen35`. The `qwen35` path compiles but has not been run on a real model. MTP heads and the vision encoder are left out of the converted GGUF.
+- Solo/drop probing uses `SpliceProbeBuilder` (one-time per-tier quantization + `~0.5s` mmap tensor byte splicing), zero-copy `os.replace` BF16 width handoff, optional `/dev/shm` scratch auto-sizing, exact store-filtered probing, and VRAM-aware auto-checkpointing in `learn.py`. Cached move rankings beyond the top-16 greedy schedule remain omitted.
+- Removal, Wanda width-slicing, Rule-P vocabulary trimming, and 0-byte `up_row_zero` Switch Apprentice operators are verified end to end across `qwen3`, `qwen35`, and `gemma4` on `llama.cpp` `a01dff9` (`patches/llama-cpp-a01dff9-chantless.patch`); see `../masks/README.md` for exported stock-model thin masks and SHA256 receipts. MTP heads and the vision encoder are left out of the converted text GGUF.

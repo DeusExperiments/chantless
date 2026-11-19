@@ -4,32 +4,86 @@
 
 Your taste. Multiplied.
 
-Chantless starts from a frozen reference model and learns a mask (precision tiers, sub-block drops, MLP neuron widths, vocabulary keep-set, grid-level moves and neuron switches) that turns the frozen base into a compact standalone specialist and lets it keep learning from labelled examples.
+Chantless starts from a frozen open-weight reference model and learns a thin `chantless.mask/v3` prescription (`6–80 KB` JSON: precision tiers, sub-block drops, lossless dead shared-KV stripping, Wanda MLP neuron widths, merge-closed Rule-P vocabulary keep-sets, and post-build `up_row_zero` MLP neuron switches) that compiles the frozen base into a compact standalone GGUF specialist—and lets that quantized specialist keep learning from `<= 25` labelled mistakes at **zero extra bytes** without touching float weights.
 
-## Current state
+---
 
-- **Qwen3.5-0.8B detector & Learned Apprentice** ([mvp/README.md](mvp/README.md), [mvp/detect/](mvp/detect/)): `qwen35` sub-block removal verified (Issue #1 closed). First full pass (`detect-cls-400mb-001`, 396.5 MB) passed both the select gate and the single-use 50,808-document sealed exam. Further compressed to 200,296,000 B (`q4cut50`: mixed tiers, sub-block drops, 50% MLP width cut, 80k vocabulary trim). Trained on 20 lesson passages from 10 Fold-0 articles plus replay, the Learned Apprentice (`combo.gguf`, 200,296,000 B) improved from 8/25 to 25/25 on held-out fresh AI passages with 0/25 human originals flagged.
-- **Classifier one-shot rank-fidelity search** ([mvp/chantless/oneshot.py](mvp/chantless/oneshot.py), [explainer/design-notes.md](explainer/design-notes.md)): single-group solo probes + additive score prediction + Spearman rank-fidelity solve under exact byte pricing reproduced the 200 MB specialist in a single build (`f200`, 200,240,128 B, 47 select documents lost vs 46 hand-built).
-- **Gemma 4 E2B 10% mask & Learned Apprentice** ([mvp/gemma4/README.md](mvp/gemma4/README.md)): Issue #2 closed. One-shot mask (`gemma4-e2b-detector-mask10.gguf`, 930,971,136 B = 10.00% of the 9.31 GB BF16 GGUF) passed both the select gate (42 / 14,227 lost, L = −0.0055) and the single-use 51,066-document sealed exam (99.76% agreement, L = −0.0037). On the same 20 lesson passages, the neuron switch mask (`i1`, 3,569 of 96,768 neurons switched off, zero weight values changed) moved from 8/25 to 18/25 on the 25 held-out fresh AI passages with 0/50 human texts flagged while passing the select gate.
-- **Unified `chantless.mask/v3` pipeline & `cli build`** ([mvp/chantless/](mvp/chantless/), [explainer/design-notes.md](explainer/design-notes.md)): Issue #3 closed. Architecture adapter (`qwen3`, `qwen35`, `gemma4`), lossless dead-tensor pre-pass, Wanda MLP width slicing, merge-closed Rule-P vocabulary trimming (`tokdocs`), Apprentice switches/sparse grid deltas, sharded bit-exact `parallel_quantize`, and packed FlashAttention `logodds` all run from one codebase; thin `v3` masks (`31–77 KB`) deterministically materialize Qwen `f200` (`200,240,128 B`, 47 lost) and Gemma `mask10` (`930,971,136 B`, $L = -0.0056$) via `python -m chantless.cli build`.
-- **Earlier MVP & paused pilot:** `box-mvp-001` ([mvp/README.md](mvp/README.md)) ran the generative loop end to end on Qwen3-0.6B (`codetasks` regression environment). The MiMo 9B SWE-bench precision-search pilot remains paused since September 27 (`runs/search-pilot/STATUS.md`).
-- **Next:** extend one-shot extraction (`traj-kl`) and switch Apprentice (`learn_gates`) + unified `llama.cpp` patch to generative environments ([Issue #4](https://github.com/DeusExperiments/chantless/issues/4)), then prove `<=10%` mask + switch Apprentice on stock Apache-2.0 `Qwen3.5-4B` and prepare release ([Issue #5](https://github.com/DeusExperiments/chantless/issues/5)).
+## Quickstart
 
-## Reading map
+### 1. Build the Unified Runtime (`llama.cpp` `a01dff9`) & Install `chantless`
 
-- [Current design](explainer/design-notes.md), [detailed explainer](explainer/explainer-detailed.html), [project overview](work/chantless-project-overview/chantless-project-map.html).
-- [Replication spec](.local/replication/CHANTLESS-REPLICATION.md), [interactive map](.local/replication/chantless-map.html) and [23-stage wiring map](.local/replication/chantless-wiring-map.html).
-- [Qwen & one-shot receipts](.local/detect/), [Gemma 4 receipts](.local/gemma4/), [MVP run notes](.local/mvp/RUN_NOTES.md) and [box-mvp-001 receipts](.local/mvp/box-runs/box-mvp-001/).
-- [Dynamic-quantization library](prism-dynquant-work/README.md): current evidence, mechanisms, original recipes, results and model cards.
-- [Artifact catalog](prism-dynquant-work/remote-artifacts/artifact-catalog.json): retained model and evaluation links.
-- [Local demo and film viewer](.local/krishna-handoff-20261005/viewer/index.html): Minecraft, Lego, website and kernel demos, plus film assets.
-- [Experiment manual](manual/MANUAL.md) and [paused pilot status](runs/search-pilot/STATUS.md).
-- [Current local destinations](.local/current-context-links.md) and [cleanup receipt](.local/cleanup-receipt.json).
+All supported architectures (`qwen3`, `qwen35` hybrid Gated DeltaNet + Full Attention, and `gemma4` Per-Layer Embeddings + Shared-KV) build and serve from a single `llama.cpp` patch:
 
-## Workspace boundary
+```bash
+git clone https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp && git checkout a01dff9
+git apply /path/to/Chantless/mvp/patches/llama-cpp-a01dff9-chantless.patch
+cmake -B build -DGGML_CUDA=ON   # or -DGGML_METAL=ON on macOS
+cmake --build build --config Release -j --target llama-server llama-quantize llama-imatrix
+```
 
-Private origin: [DeusExperiments/chantless](https://github.com/DeusExperiments/chantless). This is a fresh Git repository without imported history. The original OnlySkills folder and old Git backup were removed on October 5, 2026; their deletion receipts remain in `.local/`.
+Install the Python package and CLI (`chantless`):
 
-`references/prism-dynquant-work` points to the curated local library. Keep `references/`, `prism-dynquant-work/` and `.local/` ignored. Do not force-add or publish private source snapshots, credentials or restricted weights. Retained source pins, recipes, scores and metric denominators remain explicit. New commits, pushes, publication and paid compute require separate authorization.
+```bash
+pip install -e ".[train,dev]"
+```
 
-The 2026-10-12 curation removes earlier research from this checkout and regenerates navigation around dynamic quantization. Original records are recoverable outside the checkout; the exact removal and edit manifest is referenced by the cleanup receipt. Curation is not a new experimental result. The 2026-10-27 cleanup moved regenerable MVP scratch to the Trash; see `.local/cleanup-receipt-20261027.json`.
+### 2. Core CLI (`extract`, `build`, `learn`)
+
+```bash
+# 1. Rebuild a standalone GGUF deterministically from stock HF BF16 + a thin v3 mask:
+chantless build \
+  --source qwen3-4b-bf16.gguf \
+  --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
+  --llama-bin /path/to/llama.cpp/build/bin \
+  --out qwen3-4b-bfcl-apprentice.gguf
+
+# 2. Extract a new specialist mask under an exact byte budget and sequential select gate:
+chantless extract --config mvp/configs/local-smoke.json --out-mask specialist-mask.json
+
+# 3. Teach an already-built quantized GGUF from <=25 mistakes at 0 extra bytes:
+chantless learn --config learn-config.json --out-mask apprentice-mask.json
+```
+
+---
+
+## Empirical Matrix (`3 Architectures × 3 Modalities × {Extract, Build, Learn}` — `18 / 18` Masks Exported)
+
+Every specialist and Apprentice artifact below has `weights.lineage = []` (zero float fine-tuning or LoRA repair) and verified `cli_rebuild_sha256_equal == true` from unmodified stock checkpoints:
+- **Classifiers (`ClsBench`):** `<= 10.00%` of BF16 GGUF bytes (`logodds` Spearman rank-fidelity one-shot solver + Rule-P vocabulary trim + Wanda widths).
+- **Tool Calling (`BFCL`) & Math Reasoning (`DeepMath`):** Pure mask-only non-inferiority (`traj-kl` one-shot solver + Wanda late-layer width cuts + control-tag-safe Rule-P vocabulary trim).
+- **Switch Apprentice (`Learn`):** Trains `up_row_zero` MLP neuron switches on `25` specialist mistakes (`float32` `replay_h0` full-vocabulary token-KL guard) and evaluates unseen held-out mistakes against `4` matched-byte controls (`base`, `empty`, `flipped`, `shuffled`), with `empty.sha256 == base.sha256` on all `9/9` pairs.
+
+All `18` thin masks and exact SHA256 receipts are in [`masks/README.md`](masks/README.md):
+
+| Model (`Pinned HF Revision`) | Task | Built GGUF (`%` BF16, `bpw`) | Locked Exam vs Uniform Quant | Switch Apprentice (`25` ex → Unseen Fixed vs `base / empty / flip / shuf`) |
+| :--- | :--- | :---: | :--- | :--- |
+| **`Qwen/Qwen3.5-4B`** (`851bf6e8`) | `ClsBench` | `837.2 MB` (**`9.94%`**, `1.59`) | **`93.40%`** vs `46.66% IQ1_S` (**`+46.73` pts**) | **`33 / 60`** vs `4 / 4 / 5 / 20` (`92.79%` vs `88.72%` `sel1`) |
+| **`Qwen/Qwen3.5-4B`** (`851bf6e8`) | `BFCL` | `2.191 GB` (**`26.01%`**, `4.17`) | **`92.39%`** vs `92.39% Q3_K` (`+0.00` pts) | **`29 / 60`** vs `0 / 0 / 2 / 19` (`83.22%` `sel1`) |
+| **`Qwen/Qwen3.5-4B`** (`851bf6e8`) | `DeepMath` | `2.192 GB` (**`26.02%`**, `4.17`) | **`82.27%`** vs `51.77% Q3_K` (**`+30.50` pts**) | `9 / 60` vs `10 / 8 / 10 / 11` (`61.67%` `sel1`, eval-variance cluster) |
+| **`google/gemma-4-E2B-it`** (`4adf1574`) | `ClsBench` | `928.7 MB` (**`9.97%`**, `1.60`) | **`99.21%`** vs `49.43% IQ1_S` (**`+49.78` pts**) | **`15 / 60`** vs `3 / 3 / 2 / 8` (`99.40%` vs `99.15%` `sel1`) |
+| **`google/gemma-4-E2B-it`** (`4adf1574`) | `BFCL` | `1.948 GB` (**`20.92%`**, `3.35`) | **`97.13%`** vs `53.11% Q2_K` (**`+44.02` pts**) | **`26 / 60`** vs `0 / 0 / 0 / 7` (`83.33%` `sel1`) |
+| **`google/gemma-4-E2B-it`** (`4adf1574`) | `DeepMath` | `2.128 GB` (**`22.85%`**, `3.66`) | **`75.00%`** vs `0.00% Q3_K` (**`+75.00` pts**) | **`10 / 60`** vs `3 / 3 / 4 / 4` (`80.00%` vs `40.00%` `sel1`) |
+| **`Qwen/Qwen3-4B`** (`1cfa9a72`) | `ClsBench` | `800.2 MB` (**`9.94%`**, `1.59`) | **`60.96%`** vs `45.44% IQ1_S` (**`+15.51` pts**) | **`16 / 60`** vs `4 / 4 / 4 / 15` (`49.70%` vs `43.38%` `sel1`) |
+| **`Qwen/Qwen3-4B`** (`1cfa9a72`) | `BFCL` | `1.972 GB` (**`24.50%`**, `3.92`) | **`92.31%`** vs `86.44% Q3_K` (**`+5.87` pts**) | **`22 / 60`** vs `3 / 3 / 1 / 12` (`87.29%` `sel1`) |
+| **`Qwen/Qwen3-4B`** (`1cfa9a72`) | `DeepMath` | `2.172 GB` (**`26.98%`**, `4.32`) | **`76.62%`** vs `67.66% Q3_K` (**`+8.96` pts**) | `20 / 49` vs `9 / 9 / 14 / 20` (ties `shuffled`; `61.33%` `sel1`) |
+
+*(See [`masks/README.md`](masks/README.md) for control details on `qwen35-4b-clsbench` balanced-label `shuffled` and `qwen35-4b-bfcl`/`deepmath` pair-shuffled controls.)*
+
+---
+
+## Earlier Milestones & Provenance
+
+- **Qwen3.5-0.8B 200 MB Detector & Apprentice** ([mvp/README.md](mvp/README.md), [mvp/detect/](mvp/detect/)): One-shot rank-fidelity mask (`f200`, `200,240,128 B`, `47 / 14,161` select docs lost) and `396.5 MB` sealed exam (`50,808` docs); `20`-lesson Apprentice (`200,296,000 B`) improved from `8/25` to `25/25` on fresh AI passages with `0/25` human originals flagged.
+- **Gemma 4 E2B 10.00% Detector & Apprentice** ([mvp/gemma4/README.md](mvp/gemma4/README.md)): `mask10` (`930,971,136 B` = `10.00%` of `9.31 GB` BF16, `7 B` off `ByteModel`) achieved `99.76%` agreement on the `51,066`-document sealed exam (`L = -0.0037`); zero-extra-byte switch mask (`i1`, `3,569 / 96,768` switches off) improved from `8/25` to `18/25` (`0/50` human flagged) and fixed `241` unseen mistakes vs `36` for the flipped-label control.
+- **Generative Feedback Loop MVP & Paused Pilot:** `box-mvp-001` ([mvp/README.md](mvp/README.md)) verified iterative failure-feedback search on `Qwen3-0.6B` (`codetasks`). The earlier MiMo 9B SWE-bench precision-search pilot remains paused ([runs/search-pilot/STATUS.md](runs/search-pilot/STATUS.md)).
+
+## Documentation Map
+
+- [Thin Masks & SHA256 Reproduction Guide](masks/README.md)
+- [Architecture & Design Notes](explainer/design-notes.md) · [Detailed Explainer](explainer/explainer-detailed.html) · [Project Overview Map](work/chantless-project-overview/chantless-project-map.html)
+- [Engine & Module Reference](mvp/README.md) · [Experiment Manual](manual/MANUAL.md) · [Paused Pilot Status](runs/search-pilot/STATUS.md)
+
+## Repository Hygiene
+
+Private origin: [DeusExperiments/chantless](https://github.com/DeusExperiments/chantless). Local scratch, reference libraries, credentials, archives, and model weights (`*.gguf`, `*.safetensors`) are excluded via `.gitignore` and are never committed or published; only source code, patches, tests, documentation, and thin `chantless.mask/v3` JSON masks are tracked.

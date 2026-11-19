@@ -19,16 +19,23 @@ class RenderError(ValueError):
 
 
 class Renderer:
-    """Qwen3 chat-template rendering through the HF tokenizer, non-thinking mode."""
+    """Multi-family chat-template rendering through the HF tokenizer (`Qwen3`, `Qwen3.5`, `Gemma 4`), non-thinking mode."""
 
     def __init__(self, hf_dir: str):
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(hf_dir)
-        self.im_end = self.tok.convert_tokens_to_ids("<|im_end|>")
+        vocab = self.tok.get_vocab()
+        self.end_ids = [int(vocab[t]) for t in ("<|im_end|>", "<turn|>", "<end_of_turn>") if t in vocab]
+        if not self.end_ids and self.tok.eos_token_id is not None:
+            self.end_ids = [int(self.tok.eos_token_id)]
+        self.im_end = self.end_ids[0] if self.end_ids else None
 
     def _render(self, msgs, tools, gen: bool) -> str:
-        return self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=gen, tokenize=False,
-                                            enable_thinking=False)
+        try:
+            return self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=gen, tokenize=False,
+                                                enable_thinking=False)
+        except TypeError:
+            return self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=gen, tokenize=False)
 
     def ids(self, text: str) -> list[int]:
         return self.tok(text, add_special_tokens=False)["input_ids"]
@@ -36,10 +43,9 @@ class Renderer:
     def episode(self, messages: list[dict], tools: list[dict] | None) -> list[tuple[list[int], list[int]]]:
         """One scored sequence per assistant turn, rendered exactly as the model saw it at generation time.
 
-        Qwen3's template drops the empty think block from earlier assistant turns when re-rendering history,
-        so a single whole-conversation render would not match what was generated. Each turn i is therefore
-        rendered as messages[:i+1] (turn i last), whose prefix must equal the generation prompt for messages[:i].
-        Targets run from the end of that prompt through the turn's <|im_end|>.
+        Templates like Qwen3/Qwen3.5/Gemma4 strip empty reasoning blocks from earlier assistant turns when re-rendering
+        history, so each turn i is rendered as messages[:i+1] (turn i last), whose prefix must equal the generation
+        prompt for messages[:i]. Targets run from the end of that prompt through the turn-end delimiter.
         """
         msgs = _normalise(messages)
         recs = []
@@ -50,10 +56,16 @@ class Renderer:
             pre = self.ids(self._render(msgs[:i], tools, True))
             if seq[: len(pre)] != pre:
                 raise RenderError(f"prefix mismatch at message {i}")
-            try:
-                end = seq.index(self.im_end, len(pre))
-            except ValueError:
-                raise RenderError(f"no <|im_end|> after assistant message {i}")
+            end = None
+            for eid in self.end_ids:
+                try:
+                    cand = seq.index(eid, len(pre))
+                    if end is None or cand < end:
+                        end = cand
+                except ValueError:
+                    pass
+            if end is None:
+                raise RenderError(f"no turn-end token after assistant message {i}")
             recs.append((seq[: end + 1], list(range(len(pre), end + 1))))
         if not recs:
             raise RenderError("no assistant targets")

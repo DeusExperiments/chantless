@@ -48,3 +48,34 @@ class ChatClient:
                 last = e
                 time.sleep(1.0 + attempt)
         raise InfraError(f"chat failed after {self.retries} attempts: {last!r}")
+
+    def complete(self, prompt: str, seed: int, max_tokens: int, stop: list[str] | None = None) -> dict:
+        """Unconstrained `/v1/completions` call on an already-rendered template prompt (no automatic GBNF tool grammar)."""
+        body = {
+            "prompt": prompt,
+            "seed": int(seed),
+            "max_tokens": int(max_tokens),
+            **{k: v for k, v in self.decoding.items() if k != "enable_thinking"},
+        }
+        if stop:
+            body["stop"] = stop
+        last = None
+        for attempt in range(self.retries):
+            try:
+                req = urllib.request.Request(
+                    self.base_url + "/v1/completions",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    out = json.loads(r.read())
+                choice = out["choices"][0]
+                return {
+                    "text": choice.get("text", ""),
+                    "finish_reason": choice.get("finish_reason"),
+                    "completion_tokens": (out.get("usage") or {}).get("completion_tokens", 0),
+                }
+            except (urllib.error.URLError, ConnectionError, TimeoutError, KeyError, json.JSONDecodeError) as e:
+                last = e
+                time.sleep(1.0 + attempt)
+        raise InfraError(f"completion failed after {self.retries} attempts: {last!r}")

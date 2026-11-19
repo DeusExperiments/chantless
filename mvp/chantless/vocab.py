@@ -87,18 +87,18 @@ def _ascii_punct(tok_bytes: bytes) -> bool:
 
 
 def _is_chat_or_tool_tag(tok_bytes: bytes) -> bool:
-    """Protect `<tool_call>`, `</tool_call>`, `<think>`, `</think>`, `<|...|>` tags even if marked normal (`ttype == 1`)."""
+    """Protect Qwen & Gemma chat/tool/reasoning markers (`<tool_call>`, `<|im_end|>`, `<|turn>`, `<turn|>`, `<|"|>`, etc.)."""
     if len(tok_bytes) < 3 or len(tok_bytes) > 64 or not (tok_bytes.startswith(b"<") and tok_bytes.endswith(b">")):
         return False
     if b" " in tok_bytes or b"\n" in tok_bytes or b"\t" in tok_bytes:
         return False
     inner = tok_bytes[1:-1]
-    if inner.startswith(b"|") and inner.endswith(b"|"):
+    if inner.startswith(b"|") or inner.endswith(b"|"):
         return True
     return inner in (
         b"tool_call", b"/tool_call", b"tool_response", b"/tool_response",
         b"think", b"/think", b"function", b"/function", b"parameter", b"/parameter",
-        b"tools", b"/tools",
+        b"tools", b"/tools", b"start_of_turn", b"end_of_turn",
     )
 
 

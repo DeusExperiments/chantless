@@ -1,0 +1,259 @@
+{
+ "schema": "chantless.mask/v3",
+ "source": {
+  "repo": "Qwen/Qwen3-4B",
+  "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "gguf_sha256": "99038d3c282d8249b9804a94aea50fd3b30c6b5d56931474042ede9982602337"
+ },
+ "objective_mode": "preserve",
+ "groups": {
+  "token_embd": {
+   "tier": "Q4_K"
+  },
+  "blk.0.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.0.ffn": {
+   "tier": "Q3_K"
+  },
+  "blk.1.attn": {
+   "tier": "Q3_K"
+  },
+  "blk.1.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.10.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.10.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.11.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.11.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.12.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.12.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.13.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.13.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.14.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.14.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.15.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.15.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.2.attn": {
+   "tier": "Q3_K"
+  },
+  "blk.2.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.3.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.3.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.4.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.4.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.5.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.5.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.6.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.6.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.7.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.7.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.8.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.8.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.9.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.9.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.16.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.16.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.17.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.17.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.18.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.18.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.19.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.19.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.20.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.20.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.21.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.21.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.22.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.22.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.23.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.23.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.24.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.24.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.25.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.25.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.26.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.26.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.27.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.27.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.28.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.28.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.29.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.29.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.30.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.30.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.31.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.31.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.32.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.32.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.33.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.33.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.34.attn": {
+   "tier": "Q4_K"
+  },
+  "blk.34.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.35.ffn": {
+   "tier": "Q4_K"
+  },
+  "blk.35.attn": {
+   "tier": "Q4_K"
+  }
+ },
+ "tensors": {},
+ "floors": {},
+ "weights": {
+  "lineage": []
+ },
+ "deployment": {
+  "context": 4096,
+  "concurrency": 1,
+  "kv_type": "f16",
+  "max_total_memory_bytes": null
+ },
+ "measured": {
+  "file_bytes": 2172241312,
+  "bpw": 4.3202158677854685,
+  "pct_of_bf16": 26.9801
+ },
+ "dead_tensors": [],
+ "widths": {},
+ "vocab_keep": {
+  "n": 151936,
+  "count": 98000,
+  "enc": "packbits+zlib",
+  "b64": "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"
+ },
+ "apprentice": {
+  "switches": {},
+  "levels": {},
+  "decision": {}
+ }
+}

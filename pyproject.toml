@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chantless"
+version = "0.3.0"
+description = "Budgeted precision/structural mask extraction and 0-byte post-build Switch Apprentice for open-weight LLMs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.4",
+    "transformers>=4.51",
+    "datasets>=2.19",
+    "gguf>=0.10",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+chantless = "chantless.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "mvp"}
+
+[tool.setuptools.packages.find]
+where = ["mvp"]
+include = ["chantless*"]

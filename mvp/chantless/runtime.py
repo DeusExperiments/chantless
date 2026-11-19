@@ -103,11 +103,12 @@ class LlamaServer:
             return json.loads(r.read())
 
 
-def run(cmd: list[str], log: str | os.PathLike | None, env: dict | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run(cmd: list[str], log: str | os.PathLike | None, env: dict | None = None, check: bool = True,
+        cwd: str | os.PathLike | None = None) -> subprocess.CompletedProcess:
     with open(log, "a") if log else open(os.devnull, "w") as f:
         f.write("$ " + " ".join(map(str, cmd)) + "\n")
         f.flush()
-        p = subprocess.run(list(map(str, cmd)), stdout=f, stderr=subprocess.STDOUT, env=env)
+        p = subprocess.run(list(map(str, cmd)), stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd)
     if check and p.returncode != 0:
         raise RuntimeError(f"command failed ({p.returncode}): {' '.join(map(str, cmd[:3]))} ... see {log}")
     return p
@@ -115,16 +116,27 @@ def run(cmd: list[str], log: str | os.PathLike | None, env: dict | None = None, 
 
 def quantize(tc: Toolchain, src: str, dst: str, base_type: str, overrides: dict[str, str], token_embd_type: str | None,
              imatrix: str | None, log: str | None, threads: int = 8) -> None:
-    tt = Path(dst).with_suffix(".tensor-types.txt")
+    src_abs = str(Path(src).resolve())
+    dst_abs = str(Path(dst).resolve())
+    log_abs = str(Path(log).resolve()) if log else None
+    bin_abs = str((Path(tc.llama_bin) / "llama-quantize").resolve())
+    tt = Path(dst_abs).with_suffix(".tensor-types.txt")
     tt.write_text("\n".join(f"^{name.replace('.', chr(92) + '.')}$={t.lower()}" for name, t in sorted(overrides.items())) + "\n")
-    cmd = [tc.llama_bin / "llama-quantize", "--pure", "--tensor-type-file", tt]
+    cmd = [bin_abs, "--pure", "--tensor-type-file", str(tt)]
     if token_embd_type:
         cmd += ["--token-embedding-type", token_embd_type.lower()]
-    if imatrix:
-        cmd += ["--imatrix", imatrix]
-    cmd += [src, dst, base_type.upper(), str(threads)]
-    run(cmd, log, env=tc.env_for(""))
-    tt.unlink(missing_ok=True)
+    try:
+        if imatrix:
+            im_abs = Path(imatrix).resolve()
+            with tempfile.TemporaryDirectory(prefix="chantless-imcwd-") as im_cwd:
+                os.symlink(im_abs, Path(im_cwd) / "imatrix.gguf")
+                cmd_im = [*cmd, "--imatrix", "imatrix.gguf", src_abs, dst_abs, base_type.upper(), str(threads)]
+                run(cmd_im, log_abs, env=tc.env_for(""), cwd=im_cwd)
+        else:
+            cmd += [src_abs, dst_abs, base_type.upper(), str(threads)]
+            run(cmd, log_abs, env=tc.env_for(""))
+    finally:
+        tt.unlink(missing_ok=True)
 
 
 def parallel_quantize(
