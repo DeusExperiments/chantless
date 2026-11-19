@@ -32,9 +32,11 @@ class NoServer:
 
 class Evaluator:
     def __init__(self, tc: Toolchain, env, decoding: dict, slots_per_gpu: int, ctx_per_slot: int, kv_type: str,
-                 log_dir: str | Path, infra_retries: int = 2, scorer: BatchScorer | None = None):
+                 log_dir: str | Path, infra_retries: int = 2, scorer: BatchScorer | None = None,
+                 cache_prompt: bool = True):
         self.tc, self.env, self.decoding = tc, env, decoding
         self.slots, self.ctx, self.kv = slots_per_gpu, ctx_per_slot, kv_type
+        self.cache_prompt = cache_prompt
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.retries = infra_retries
@@ -54,7 +56,8 @@ class Evaluator:
             return
         with contextlib.ExitStack() as st:
             srvs = [st.enter_context(LlamaServer(self.tc, model, gpu=g, slots=self.slots, ctx_per_slot=self.ctx,
-                                                 kv_type=self.kv, log=self.log_dir / f"server-gpu{g or 0}.log"))
+                                                 kv_type=self.kv, log=self.log_dir / f"server-gpu{g or 0}.log",
+                                                 cache_prompt=self.cache_prompt))
                     for g in self.tc.gpus]
             yield srvs
 

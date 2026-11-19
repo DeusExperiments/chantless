@@ -160,7 +160,44 @@ def main():
     bn = sub.add_parser("bench", help="benchmark a built GGUF or thin mask and emit JSON telemetry receipt")
     _add_serve_args(bn, default_bench=True)
 
+    dr = sub.add_parser("doctor", help="validate llama.cpp@a01dff9 binaries, C++ tools, CUDA/Metal, Python deps, and /dev/shm")
+    dr.add_argument("--config", help="optional extract/learn config JSON/YAML to read toolchain paths from")
+    dr.add_argument("--llama-bin", help="directory containing llama-server, llama-quantize, llama-imatrix")
+    dr.add_argument("--traj-kl", help="path to traj-kl binary")
+    dr.add_argument("--logodds", help="path to logodds binary")
+    dr.add_argument("--tokdocs", help="path to tokdocs binary")
+    dr.add_argument("--run-root", default=".", help="directory to check disk headroom against")
+    dr.add_argument("--model-gb", type=float, help="optional BF16 model size in GiB to preview #12 scratch/tier_cache layout")
+    dr.add_argument("--require-classifier", action="store_true", help="require logodds and tokdocs binaries")
+    dr.add_argument("--require-cuda", action="store_true", help="require NVIDIA CUDA availability")
+
     a = ap.parse_args()
+    if a.cmd == "doctor":
+        from . import config as cfgmod, doctor as drmod
+        llama_bin, traj_kl, logodds, tokdocs, run_root = a.llama_bin, a.traj_kl, a.logodds, a.tokdocs, a.run_root
+        if a.config:
+            raw = cfgmod.load_raw_with_extends(a.config)
+            tc = raw.get("toolchain") or {}
+            llama_bin = llama_bin or tc.get("llama_bin")
+            traj_kl = traj_kl or tc.get("traj_kl")
+            logodds = logodds or tc.get("logodds")
+            tokdocs = tokdocs or tc.get("tokdocs")
+            if run_root == "." and raw.get("run_root"):
+                run_root = raw["run_root"]
+        res = drmod.run_doctor(
+            llama_bin=llama_bin,
+            traj_kl=traj_kl,
+            logodds=logodds,
+            tokdocs=tokdocs,
+            run_root=run_root,
+            model_gb=a.model_gb,
+            require_classifier=a.require_classifier,
+            require_cuda=a.require_cuda,
+        )
+        print(json.dumps(res, indent=2))
+        if not res["ok"]:
+            raise SystemExit(1)
+        return
     if a.cmd in ("serve", "bench"):
         from . import serve as svmod
         try:

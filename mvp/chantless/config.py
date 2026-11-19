@@ -330,6 +330,8 @@ class LearnSpecConfig(StrictModel):
     tail_n: int = 500
     near_n: int = 300
     slots_per_gpu: int = 2
+    judge_slots: int = Field(default=1, ge=1)
+    judge_cache_prompt: bool = False
     max_human_rise: float = 0.01
     max_ai_drop: float = 0.02
     side_seed: int | None = None

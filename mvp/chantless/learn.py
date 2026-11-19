@@ -1774,9 +1774,10 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
         env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
         by_id = {t.id: t for t in env.tasks()}
         ev = Evaluator(tc, env, cfg.get("decoding", {"temperature": 0.0}),
-                       cfg.get("serving", {}).get("slots_per_gpu", 4),
+                       int(c.get("judge_slots", 1)),
                        cfg.get("serving", {}).get("ctx_per_slot", env.deployment["context"]),
-                       env.deployment["kv_type"], out_dir / "episodes")
+                       env.deployment["kv_type"], out_dir / "episodes",
+                       cache_prompt=bool(c.get("judge_cache_prompt", False)))
         held_ids = c.get("heldout_ids") or [t.id for t in env.tasks() if t.split == "train" and _side(t.id) == 1]
         held_tasks = [by_id[i] for i in held_ids if i in by_id]
         sel_tasks = [t for t in env.tasks() if t.split == "select" and _side(t.id) == 1]
