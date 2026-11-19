@@ -147,7 +147,7 @@ def train_names(art: lattice.Artifact, cfg: dict) -> list[str]:
 
 
 def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml_lib: str | None, device: str = "cpu",
-                  latents: dict[str, np.ndarray] | None = None):
+                  latents: dict[str, np.ndarray] | None = None, frozen_bf16: bool = False):
     """The file as a PyTorch model. `latents` holds float32 arrays in torch shape, one per `train` tensor, the floats this file
     was built from: they sit behind its grids in place of the grid centres, so what training learned below one level survives
     a rebuild. The rounded student must still equal the file, level for level."""
@@ -249,6 +249,10 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
         p.requires_grad_(False)
     if "output.weight" not in art.tensors:
         model.lm_head.weight = model.model.embed_tokens.weight
+    if frozen_bf16 and not train:
+        for p in model.parameters():
+            if p.ndim >= 2 and p.dtype == torch.float32:
+                p.data = p.data.to(torch.bfloat16)
     model.to(device)
     mods = dict(model.named_modules())
     grids = {}
@@ -298,8 +302,15 @@ def collate(docs: list[np.ndarray], device: str, round_to: int = 256):
     return ids.to(device), m.to(device)
 
 
-def scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool):
+def scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool, prefix_cache=None):
     import torch
+    if prefix_cache is not None:
+        h_seq = prefix_cache.forward_tail(model, docs, device, amp, round_to=32)
+        idx = torch.tensor([len(d) - 1 for d in docs], device=h_seq.device, dtype=torch.long)
+        h = h_seq[torch.arange(len(docs), device=h_seq.device), idx]
+        with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
+            x = _head_logits(model, h)[:, list(pair)]
+        return x[:, 0] - x[:, 1]
     ids, m = collate(docs, device)
     with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
         h = model.model(input_ids=ids, attention_mask=m, use_cache=False).last_hidden_state[:, -1]
@@ -309,16 +320,23 @@ def scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, am
 
 def _head_logits(model, h):
     import torch
-    lg = model.lm_head(h).float()
+    lg = model.lm_head(h.to(model.lm_head.weight.dtype)).float()
     cap = getattr(getattr(model, "config", None), "final_logit_softcapping", None)
     if cap:
         lg = torch.tanh(lg / float(cap)) * float(cap)
     return lg
 
 
-def vec_scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool):
+def vec_scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool, prefix_cache=None):
     """The score and the final hidden state, from which the whole output distribution follows."""
     import torch
+    if prefix_cache is not None:
+        h_seq = prefix_cache.forward_tail(model, docs, device, amp, round_to=32)
+        idx = torch.tensor([len(d) - 1 for d in docs], device=h_seq.device, dtype=torch.long)
+        h = h_seq[torch.arange(len(docs), device=h_seq.device), idx]
+        with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
+            x = _head_logits(model, h)[:, list(pair)]
+        return x[:, 0] - x[:, 1], h.float()
     ids, m = collate(docs, device)
     with torch.autocast(device.split(":")[0], dtype=torch.bfloat16, enabled=amp):
         h = model.model(input_ids=ids, attention_mask=m, use_cache=False).last_hidden_state[:, -1]
@@ -326,12 +344,12 @@ def vec_scores(model, docs: list[np.ndarray], pair: tuple[int, int], device: str
     return x[:, 0] - x[:, 1], h.float()
 
 
-def capped(fn, model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool, cap: int):
+def capped(fn, model, docs: list[np.ndarray], pair: tuple[int, int], device: str, amp: bool, cap: int, prefix_cache=None):
     """`fn` (scores or vec_scores) in sub-batches of at most `cap` padded tokens, longest first, back in the order of `docs`.
     One graph spans them, so a single backward sees the same loss while padding and peak memory both fall."""
     import torch
     parts = batches(docs, cap, len(docs))
-    out = [fn(model, [docs[i] for i in b], pair, device, amp) for b in parts]
+    out = [fn(model, [docs[i] for i in b], pair, device, amp, prefix_cache=prefix_cache) for b in parts]
     back = torch.from_numpy(np.argsort([i for b in parts for i in b])).to(device)
     return tuple(torch.cat(x)[back] for x in zip(*out)) if isinstance(out[0], tuple) else torch.cat(out)[back]
 
@@ -351,12 +369,12 @@ def batches(docs: list[np.ndarray], budget: int, maxbs: int = 64) -> list[list[i
     return out + [cur] if cur else out
 
 
-def score_all(model, docs, pair, device, amp, budget=40000) -> np.ndarray:
+def score_all(model, docs, pair, device, amp, budget=40000, prefix_cache=None) -> np.ndarray:
     import torch
     v = np.full(len(docs), np.nan)
     with torch.no_grad():
         for idx in batches(docs, budget):
-            v[idx] = scores(model, [docs[i] for i in idx], pair, device, amp).cpu().numpy()
+            v[idx] = scores(model, [docs[i] for i in idx], pair, device, amp, prefix_cache=prefix_cache).cpu().numpy()
     assert np.isfinite(v).all()
     return v
 
@@ -370,8 +388,9 @@ def margin_loss(s, y, cutoff, margin):
 def kl_vector(model, h, target_h, temp):
     """KL between whole output distributions, softened by `temp` so the mass beyond the two answer tokens counts."""
     import torch
-    logq = torch.log_softmax(model.lm_head(h).float() / temp, -1)
-    t = torch.softmax(model.lm_head(target_h).float() / temp, -1)
+    dt = model.lm_head.weight.dtype
+    logq = torch.log_softmax(model.lm_head(h.to(dt)).float() / temp, -1)
+    t = torch.softmax(model.lm_head(target_h.to(dt)).float() / temp, -1)
     return (t * (t.clamp_min(1e-12).log() - logq)).sum(-1).mean() * temp * temp
 
 
@@ -399,7 +418,7 @@ def pair_loss(s_human, s_ai, margin):
     return torch.nn.functional.softplus(margin - (s_human - s_ai)).mean()
 
 
-def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, lr, anchor=None, on_step=None) -> list[tuple]:
+def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, lr, anchor=None, on_step=None, prefix_cache=None) -> list[tuple]:
     """The shared loop: feedback margin, contrastive pairs, replay held near its start, known documents kept on their side.
 
     All of these are opt-in. `params` may be AdamW parameter groups, when gates and weights take different rates. `anchor` is a
@@ -413,7 +432,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
 
     budget = cfg.get("score_budget", 40000)
     if anchor is None:
-        base = torch.from_numpy(score_all(model, replay, pair, device, amp, budget)).float().to(device)
+        base = torch.from_numpy(score_all(model, replay, pair, device, amp, budget, prefix_cache=prefix_cache)).float().to(device)
     else:
         base = torch.from_numpy(np.asarray(anchor["base"], dtype=np.float32)).to(device)
         assert len(base) == len(replay)
@@ -449,7 +468,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
             hs = []
             with torch.no_grad():
                 for b in batches(replay, budget):
-                    hs.append((b, vec_scores(model, [replay[i] for i in b], pair, device, amp)[1]))
+                    hs.append((b, vec_scores(model, [replay[i] for i in b], pair, device, amp, prefix_cache=prefix_cache)[1]))
             h0 = torch.zeros(len(replay), hs[0][1].shape[1], device=device)
             for b, h in hs:
                 h0[b] = h
@@ -472,14 +491,14 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         if cap:
             # one pass, longest first: padding is what a step spends its time on, and four small batches each pad to their own longest
             sizes = [len(fd), len(hd), len(ad), len(rd)]
-            out = capped(vec_scores if vec else scores, model, fd + hd + ad + rd, pair, device, amp, cap)
+            out = capped(vec_scores if vec else scores, model, fd + hd + ad + rd, pair, device, amp, cap, prefix_cache=prefix_cache)
             s, sh, sa, sr = (out[0] if vec else out).split(sizes)
             hf, _, _, hr = out[1].split(sizes) if vec else (None,) * 4
         else:
-            s, hf = vec_scores(model, fd, pair, device, amp) if vec else (scores(model, fd, pair, device, amp), None)
+            s, hf = vec_scores(model, fd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, fd, pair, device, amp, prefix_cache=prefix_cache), None)
             if ps:
-                sh, sa = scores(model, hd, pair, device, amp), scores(model, ad, pair, device, amp)
-            sr, hr = vec_scores(model, rd, pair, device, amp) if vec else (scores(model, rd, pair, device, amp), None)
+                sh, sa = scores(model, hd, pair, device, amp, prefix_cache=prefix_cache), scores(model, ad, pair, device, amp, prefix_cache=prefix_cache)
+            sr, hr = vec_scores(model, rd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, rd, pair, device, amp, prefix_cache=prefix_cache), None)
         s, sr = unit(s), unit(sr)
         y = torch.tensor([1.0 if r["label"] == "human" else -1.0 for r in fb], device=device)
         loss_fb = margin_loss(s, y, cutoff, margin)
@@ -649,13 +668,12 @@ def _switchable_layers(art: lattice.Artifact, n_layers: int, switch_mode: str, l
 
 
 def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
-    """Auto-enable gradient checkpointing on <55 GiB GPUs or pure-PyTorch Qwen3.5 GDN when unset."""
     if "checkpointing" in cfg:
         return bool(cfg["checkpointing"])
     if not device.startswith("cuda"):
         return False
     import torch
-    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < (55 << 30):
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(torch.device(device)).total_memory < (55 << 30):
         return True
     mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
     if mtype.startswith("qwen3_5"):
@@ -664,6 +682,20 @@ def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
         except ImportError:
             return True
     return False
+
+
+def _should_stream_prefix(art: lattice.Artifact, cfg: dict, device: str, frozen_bf16: bool) -> bool:
+    sp = cfg.get("stream_prefix", "auto")
+    if sp is True:
+        return True
+    if sp is False or not device.startswith("cuda"):
+        return False
+    import torch
+    if not torch.cuda.is_available():
+        return False
+    est_bytes = sum(int(t["n"]) for t in art.tensors.values()) * (2 if frozen_bf16 else 4)
+    total_vram = torch.cuda.get_device_properties(torch.device(device)).total_memory
+    return est_bytes > int(0.65 * total_vram)
 
 
 def _default_seq_batch(model, device: str) -> int:
@@ -711,11 +743,17 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     amp = device.startswith("cuda")
     switch_mode = cfg.get("switch_mode", "up_row_zero")
     art = lattice.Artifact(art_path)
-    model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
+    frozen_bf16 = bool(cfg.get("frozen_bf16", amp))
+    stream_pref = _should_stream_prefix(art, cfg, device, frozen_bf16)
+    model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), "cpu" if stream_pref else device, frozen_bf16=frozen_bf16)
+    layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
+    all_seqs = [r["tokens"] for r in feedback] + list(replay)
+    prefix_cache = PrefixCache.build(model, all_seqs, min(layers), device, amp, cfg, log=log, stream_prefix=stream_pref) if layers else None
+    if stream_pref and prefix_cache is None:
+        model.to(device)
     if _auto_checkpointing(model, cfg, device) and amp:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
-    layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
     init_val = float(cfg.get("gate_init", 1.0))
     theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
 
@@ -728,7 +766,7 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
 
     hooks = [model.model.layers[il].mlp.down_proj.register_forward_pre_hook(hook(il)) for il in layers]
     params = list(theta.values())
-    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, cfg.get("gate_lr", 0.03))
+    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, cfg.get("gate_lr", 0.03), prefix_cache=prefix_cache)
     for h in hooks:
         h.remove()
     off, bits, _, m_v3 = _apply_switches_to_file_and_mask(
@@ -820,8 +858,369 @@ def collate_right(seqs: list[np.ndarray], device: str, round_to: int = 32):
     return ids.to(device), mask.to(device)
 
 
-def _forward_backbone(model, seqs: list[np.ndarray], device: str, amp: bool, round_to: int = 32):
+class _PrefixEntry:
+    __slots__ = ("length", "h", "ple", "skv")
+
+    def __init__(self, length: int, h, ple=None, skv=None):
+        self.length = length
+        self.h = h
+        self.ple = ple
+        self.skv = skv
+
+
+class PrefixCache:
+    def __init__(self, start_layer: int, kind: str, entries: dict[bytes, _PrefixEntry], offloaded: list[str], total_bytes: int):
+        self.start_layer = start_layer
+        self.kind = kind
+        self.entries = entries
+        self.offloaded = offloaded
+        self.total_bytes = total_bytes
+
+    @staticmethod
+    def _key(seq: np.ndarray) -> bytes:
+        return np.asarray(seq, dtype=np.int64).tobytes()
+
+    @staticmethod
+    def _arch_kind(model) -> str:
+        inner = model.model
+        cfg = inner.config
+        if hasattr(inner, "unique_layer_types") and hasattr(inner, "get_per_layer_inputs"):
+            return "gemma4"
+        if hasattr(cfg, "layer_types") and "linear_attention" in (cfg.layer_types or ()):
+            return "qwen35"
+        return "decoder"
+
+    @staticmethod
+    def _free_prefix(model, start_layer: int, kind: str) -> list[str]:
+        inner = model.model
+        freed: list[str] = []
+        for i in range(start_layer):
+            inner.layers[i] = nn.Identity()
+        freed.append(f"layers[0:{start_layer}]")
+        if kind == "gemma4":
+            for attr in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
+                if getattr(inner, attr, None) is not None:
+                    setattr(inner, attr, None)
+                    freed.append(attr)
+        if getattr(inner, "embed_tokens", None) is not None and model.lm_head.weight.data_ptr() != inner.embed_tokens.weight.data_ptr():
+            inner.embed_tokens = None
+            freed.append("embed_tokens")
+        return freed
+
+    @classmethod
+    def build(cls, model, seqs: list[np.ndarray], start_layer: int, device: str, amp: bool, cfg: dict | None = None, log=print, stream_prefix: bool = False):
+        import gc
+        from collections import UserDict
+        import torch
+        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+        cfg = cfg or {}
+        if cfg.get("prefix_cache") is False or start_layer <= 0 or not seqs:
+            if stream_prefix:
+                model.to(device)
+            return None
+        inner = model.model
+        mcfg = inner.config
+        n_layers = int(mcfg.num_hidden_layers)
+        if start_layer >= n_layers:
+            if stream_prefix:
+                model.to(device)
+            return None
+
+        uniq: dict[bytes, np.ndarray] = {}
+        for s in seqs:
+            arr = np.asarray(s, dtype=np.int64)
+            uniq.setdefault(arr.tobytes(), arr)
+
+        kind = cls._arch_kind(model)
+        dev_type = device.split(":")[0]
+        has_bf16 = any(p.dtype == torch.bfloat16 for p in model.parameters())
+        use_amp = bool((amp and dev_type == "cuda") or has_bf16)
+        pin = bool(dev_type == "cuda")
+        store_dtype = torch.bfloat16 if use_amp else torch.float32
+        elem_b = 2 if store_dtype == torch.bfloat16 else 4
+        total_tok = sum(len(a) for a in uniq.values())
+        per_tok_elems = int(mcfg.hidden_size)
+        if kind == "gemma4":
+            d_ple = int(getattr(inner, "hidden_size_per_layer_input", 0) or 0)
+            if d_ple:
+                per_tok_elems += (n_layers - start_layer) * d_ple
+            n_kv = int(getattr(mcfg, "num_key_value_heads", 0) or 0)
+            hd_full = int(getattr(mcfg, "global_head_dim", getattr(mcfg, "head_dim", 0)) or 0)
+            hd_slide = int(getattr(mcfg, "head_dim", 0) or 0)
+            per_tok_elems += 2 * n_kv * (hd_full + hd_slide)
+        est_mb = (total_tok * per_tok_elems * elem_b) / (1024 * 1024)
+        max_mb = float(cfg.get("prefix_cache_max_mb", 4096))
+        if est_mb > max_mb:
+            log(f"prefix_cache: skipped ({est_mb:.1f} MB > limit {max_mb:.1f} MB)")
+            if stream_prefix:
+                model.to(device)
+            return None
+
+        if kind == "qwen35":
+            from transformers.models.qwen3_5.modeling_qwen3_5 import create_recurrent_attention_mask
+
+        def _to_host(t):
+            out = t.detach().to("cpu", store_dtype).contiguous()
+            return out.pin_memory() if pin else out
+
+        def _clear_dev():
+            gc.collect()
+            if dev_type == "cuda":
+                torch.cuda.empty_cache()
+            elif dev_type == "mps":
+                torch.mps.empty_cache()
+
+        entries: dict[bytes, _PrefixEntry] = {}
+        actual_bytes = 0
+        free_prefix = bool(cfg.get("free_prefix", True))
+        freed: list[str] = []
+
+        if stream_prefix:
+            keys = list(uniq.keys())
+            inner.rotary_emb.to(device)
+            inner.embed_tokens.to(device)
+            if kind == "gemma4":
+                for attr in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
+                    mod = getattr(inner, attr, None)
+                    if mod is not None and hasattr(mod, "to"):
+                        mod.to(device)
+            hs_cpu: dict[bytes, torch.Tensor] = {}
+            ple_pref_cpu: dict[bytes, torch.Tensor | None] = {}
+            ple_tail_cpu: dict[bytes, torch.Tensor | None] = {}
+            skv_cpu_map: dict[bytes, dict] = {k: {} for k in keys}
+            with torch.no_grad():
+                for key in keys:
+                    arr = uniq[key]
+                    ids = torch.from_numpy(arr).unsqueeze(0).to(device)
+                    with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
+                        emb = inner.embed_tokens(ids)
+                        hs_cpu[key] = emb[0].detach().to("cpu", store_dtype).contiguous()
+                        if kind == "gemma4" and getattr(inner, "hidden_size_per_layer_input", 0):
+                            pli_all = inner.project_per_layer_inputs(emb, inner.get_per_layer_inputs(ids, emb))
+                            ple_pref_cpu[key] = pli_all[0, :, :start_layer, :].detach().to("cpu", store_dtype).contiguous()
+                            ple_tail_cpu[key] = _to_host(pli_all[0, :, start_layer:, :])
+                            actual_bytes += ple_tail_cpu[key].numel() * ple_tail_cpu[key].element_size()
+                        else:
+                            ple_pref_cpu[key] = None
+                            ple_tail_cpu[key] = None
+            if kind == "gemma4":
+                for attr in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
+                    if getattr(inner, attr, None) is not None:
+                        setattr(inner, attr, None)
+                        freed.append(attr)
+            if model.lm_head.weight.data_ptr() != inner.embed_tokens.weight.data_ptr():
+                inner.embed_tokens = None
+                freed.append("embed_tokens")
+            else:
+                inner.embed_tokens.to("cpu")
+            _clear_dev()
+
+            with torch.no_grad():
+                for i in range(start_layer):
+                    layer_mod = inner.layers[i].to(device)
+                    for key in keys:
+                        h_i = hs_cpu[key].unsqueeze(0).to(device, non_blocking=pin)
+                        L = h_i.shape[1]
+                        attn = torch.ones((1, L), dtype=torch.long, device=device)
+                        with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
+                            if kind == "gemma4":
+                                position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                lt = mcfg.layer_types[i]
+                                cm = create_causal_mask(**mk) if lt == "full_attention" else create_sliding_window_causal_mask(**mk)
+                                pe = inner.rotary_emb(h_i, position_ids, lt)
+                                pli = ple_pref_cpu[key][:, i, :].unsqueeze(0).to(device, non_blocking=pin) if ple_pref_cpu[key] is not None else None
+                                skv = UserDict({t_lt: (kv[0].unsqueeze(0).to(device, non_blocking=pin), kv[1].unsqueeze(0).to(device, non_blocking=pin)) for t_lt, kv in skv_cpu_map[key].items()})
+                                h_out = layer_mod(h_i, pli, shared_kv_states=skv, position_embeddings=pe, attention_mask=cm, position_ids=position_ids, past_key_values=None)
+                                if getattr(getattr(layer_mod, "self_attn", None), "store_full_length_kv", False):
+                                    skv_cpu_map[key][lt] = (skv[lt][0][0].detach().to("cpu", store_dtype).contiguous(), skv[lt][1][0].detach().to("cpu", store_dtype).contiguous())
+                            elif kind == "qwen35":
+                                position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
+                                text_pos, mrope_pos = position_ids[0], position_ids[1:]
+                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
+                                lt = mcfg.layer_types[i]
+                                cm = create_causal_mask(**mk) if lt == "full_attention" else create_recurrent_attention_mask(**mk)
+                                pe = inner.rotary_emb(h_i, mrope_pos)
+                                h_out = layer_mod(h_i, position_embeddings=pe, attention_mask=cm, position_ids=text_pos, past_key_values=None, use_cache=False)
+                            else:
+                                position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                ltypes = getattr(mcfg, "layer_types", None)
+                                lt = ltypes[i] if ltypes else "full_attention"
+                                cm = create_sliding_window_causal_mask(**mk) if lt == "sliding_attention" else create_causal_mask(**mk)
+                                pe = inner.rotary_emb(h_i, position_ids)
+                                h_out = layer_mod(h_i, attention_mask=cm, position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+                        hs_cpu[key] = h_out[0].detach().to("cpu", store_dtype).contiguous()
+                    inner.layers[i] = nn.Identity()
+                    del layer_mod
+                    _clear_dev()
+            freed.append(f"layers[0:{start_layer}]")
+            for key in keys:
+                hc = _to_host(hs_cpu.pop(key))
+                actual_bytes += hc.numel() * hc.element_size()
+                skv_final = None
+                if kind == "gemma4":
+                    skv_final = {}
+                    for t_lt, (kc, vc) in skv_cpu_map[key].items():
+                        kp, vp = _to_host(kc), _to_host(vc)
+                        skv_final[t_lt] = (kp, vp)
+                        actual_bytes += (kp.numel() + vp.numel()) * kp.element_size()
+                entries[key] = _PrefixEntry(len(uniq[key]), hc, ple=ple_tail_cpu.get(key), skv=skv_final)
+            for i in range(start_layer, n_layers):
+                inner.layers[i].to(device)
+            inner.norm.to(device)
+            model.lm_head.to(device)
+            _clear_dev()
+        else:
+            with torch.no_grad():
+                for key, arr in uniq.items():
+                    L = len(arr)
+                    ids = torch.from_numpy(arr).unsqueeze(0).to(device)
+                    attn = torch.ones((1, L), dtype=torch.long, device=device)
+                    with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
+                        inputs_embeds = inner.embed_tokens(ids)
+                        h = inputs_embeds
+                        ple_tail = None
+                        skv_cpu = None
+                        if kind == "gemma4":
+                            per_layer_inputs = None
+                            if getattr(inner, "hidden_size_per_layer_input", 0):
+                                per_layer_inputs = inner.get_per_layer_inputs(ids, inputs_embeds)
+                                per_layer_inputs = inner.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+                            position_ids = torch.arange(L, device=device).unsqueeze(0)
+                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                            cmm = {"full_attention": create_causal_mask(**mk), "sliding_attention": create_sliding_window_causal_mask(**mk)}
+                            pe = {lt: inner.rotary_emb(h, position_ids, lt) for lt in inner.unique_layer_types}
+                            skv = UserDict()
+                            for i in range(start_layer):
+                                pli = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+                                lt = mcfg.layer_types[i]
+                                h = inner.layers[i](h, pli, shared_kv_states=skv, position_embeddings=pe[lt], attention_mask=cmm[lt], position_ids=position_ids, past_key_values=None)
+                            if per_layer_inputs is not None:
+                                ple_tail = _to_host(per_layer_inputs[0, :, start_layer:, :])
+                                actual_bytes += ple_tail.numel() * ple_tail.element_size()
+                            skv_cpu = {}
+                            for lt, kv in skv.items():
+                                kc, vc = _to_host(kv[0][0]), _to_host(kv[1][0])
+                                skv_cpu[lt] = (kc, vc)
+                                actual_bytes += (kc.numel() + vc.numel()) * kc.element_size()
+                        elif kind == "qwen35":
+                            position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
+                            text_pos = position_ids[0]
+                            mrope_pos = position_ids[1:]
+                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
+                            cmm = {"full_attention": create_causal_mask(**mk), "linear_attention": create_recurrent_attention_mask(**mk)}
+                            pe = inner.rotary_emb(h, mrope_pos)
+                            for i in range(start_layer):
+                                h = inner.layers[i](h, position_embeddings=pe, attention_mask=cmm[mcfg.layer_types[i]], position_ids=text_pos, past_key_values=None, use_cache=False)
+                        else:
+                            position_ids = torch.arange(L, device=device).unsqueeze(0)
+                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                            cmm = {"full_attention": create_causal_mask(**mk)}
+                            if getattr(inner, "has_sliding_layers", False):
+                                cmm["sliding_attention"] = create_sliding_window_causal_mask(**mk)
+                            pe = inner.rotary_emb(h, position_ids)
+                            ltypes = getattr(mcfg, "layer_types", None)
+                            for i in range(start_layer):
+                                lt = ltypes[i] if ltypes else "full_attention"
+                                h = inner.layers[i](h, attention_mask=cmm[lt], position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+                        h_cpu = _to_host(h[0])
+                        actual_bytes += h_cpu.numel() * h_cpu.element_size()
+                    entries[key] = _PrefixEntry(L, h_cpu, ple=ple_tail, skv=skv_cpu)
+
+            if free_prefix:
+                freed = cls._free_prefix(model, start_layer, kind)
+                _clear_dev()
+
+        log(f"prefix_cache: cached {len(entries)} seqs at layer {start_layer}/{n_layers} ({actual_bytes / (1024 * 1024):.1f} MB, stream={stream_prefix}, freed={freed})")
+        return cls(start_layer, kind, entries, freed, actual_bytes)
+
+    def forward_tail(self, model, seqs: list[np.ndarray], device: str, amp: bool, round_to: int = 32):
+        from collections import UserDict
+        import torch
+        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+        ents = [self.entries[self._key(s)] for s in seqs]
+        B = len(ents)
+        max_l = max(e.length for e in ents)
+        n = int(-(-max_l // round_to) * round_to) if round_to > 1 else max_l
+        dev_type = device.split(":")[0]
+        nb = bool(dev_type == "cuda")
+        h_dtype = ents[0].h.dtype
+        d = ents[0].h.shape[1]
+        h_buf = torch.zeros((B, n, d), dtype=h_dtype)
+        attn_buf = torch.zeros((B, n), dtype=torch.long)
+        for k, e in enumerate(ents):
+            h_buf[k, :e.length] = e.h
+            attn_buf[k, :e.length] = 1
+        h = h_buf.to(device, non_blocking=nb)
+        attn = attn_buf.to(device, non_blocking=nb)
+        if torch.is_grad_enabled() and getattr(model, "is_gradient_checkpointing", False):
+            h.requires_grad_(True)
+
+        inner = model.model
+        mcfg = inner.config
+        n_layers = int(mcfg.num_hidden_layers)
+        use_amp = bool((amp and dev_type == "cuda") or ents[0].h.dtype == torch.bfloat16)
+
+        with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
+            if self.kind == "gemma4":
+                ple = None
+                if ents[0].ple is not None:
+                    n_tail, d_ple = ents[0].ple.shape[1], ents[0].ple.shape[2]
+                    ple_buf = torch.zeros((B, n, n_tail, d_ple), dtype=ents[0].ple.dtype)
+                    for k, e in enumerate(ents):
+                        ple_buf[k, :e.length] = e.ple
+                    ple = ple_buf.to(device, non_blocking=nb)
+                skv = UserDict()
+                if ents[0].skv:
+                    for lt in ents[0].skv:
+                        k0 = ents[0].skv[lt][0]
+                        n_kv, _, hd = k0.shape
+                        kb = torch.zeros((B, n_kv, n, hd), dtype=k0.dtype)
+                        vb = torch.zeros((B, n_kv, n, hd), dtype=k0.dtype)
+                        for k, e in enumerate(ents):
+                            ek, ev = e.skv[lt]
+                            kb[k, :, :e.length, :] = ek
+                            vb[k, :, :e.length, :] = ev
+                        skv[lt] = (kb.to(device, non_blocking=nb), vb.to(device, non_blocking=nb))
+                position_ids = torch.arange(n, device=device).unsqueeze(0)
+                mk = {"config": mcfg, "inputs_embeds": h, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                cmm = {"full_attention": create_causal_mask(**mk), "sliding_attention": create_sliding_window_causal_mask(**mk)}
+                pe = {lt: inner.rotary_emb(h, position_ids, lt) for lt in inner.unique_layer_types}
+                for i in range(self.start_layer, n_layers):
+                    pli = ple[:, :, i - self.start_layer, :] if ple is not None else None
+                    lt = mcfg.layer_types[i]
+                    h = inner.layers[i](h, pli, shared_kv_states=skv, position_embeddings=pe[lt], attention_mask=cmm[lt], position_ids=position_ids, past_key_values=None)
+            elif self.kind == "qwen35":
+                from transformers.models.qwen3_5.modeling_qwen3_5 import create_recurrent_attention_mask
+                position_ids = torch.arange(n, device=device).view(1, 1, -1).expand(4, B, -1)
+                text_pos = position_ids[0]
+                mrope_pos = position_ids[1:]
+                mk = {"config": mcfg, "inputs_embeds": h, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
+                cmm = {"full_attention": create_causal_mask(**mk), "linear_attention": create_recurrent_attention_mask(**mk)}
+                pe = inner.rotary_emb(h, mrope_pos)
+                for i in range(self.start_layer, n_layers):
+                    h = inner.layers[i](h, position_embeddings=pe, attention_mask=cmm[mcfg.layer_types[i]], position_ids=text_pos, past_key_values=None, use_cache=False)
+            else:
+                position_ids = torch.arange(n, device=device).unsqueeze(0)
+                mk = {"config": mcfg, "inputs_embeds": h, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                cmm = {"full_attention": create_causal_mask(**mk)}
+                if getattr(inner, "has_sliding_layers", False):
+                    cmm["sliding_attention"] = create_sliding_window_causal_mask(**mk)
+                pe = inner.rotary_emb(h, position_ids)
+                ltypes = getattr(mcfg, "layer_types", None)
+                for i in range(self.start_layer, n_layers):
+                    lt = ltypes[i] if ltypes else "full_attention"
+                    h = inner.layers[i](h, attention_mask=cmm[lt], position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+            return inner.norm(h)
+
+
+def _forward_backbone(model, seqs: list[np.ndarray], device: str, amp: bool, round_to: int = 32, prefix_cache=None):
     import torch
+    if prefix_cache is not None:
+        return prefix_cache.forward_tail(model, seqs, device, amp, round_to=round_to)
     ids, attn = collate_right(seqs, device, round_to=round_to)
     dev_type = device.split(":")[0]
     if amp and dev_type == "cuda":
@@ -897,24 +1296,29 @@ def learn_gates_seq(
         raise ValueError("learn_gates_seq requires at least one feedback lesson or replay trajectory")
 
     art = lattice.Artifact(art_path)
-    model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), device)
-    if _auto_checkpointing(model, cfg, device) and amp:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.train()
-
+    frozen_bf16 = bool(cfg.get("frozen_bf16", amp))
+    stream_pref = _should_stream_prefix(art, cfg, device, frozen_bf16)
+    model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), "cpu" if stream_pref else device, frozen_bf16=frozen_bf16)
     layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
     if not layers:
         art.close()
         raise RuntimeError(f"no switchable FFN layers found in {art_path} under switch_mode={switch_mode!r}")
 
+    all_seqs = [r["pos_tokens"] for r in lessons] + [r["neg_tokens"] for r in lessons if r["neg_tokens"] is not None] + [t for t, _ in rep_trajs]
+    prefix_cache = PrefixCache.build(model, all_seqs, min(layers), device, amp, cfg, log=log, stream_prefix=stream_pref)
+    if stream_pref and prefix_cache is None:
+        model.to(device)
+    if _auto_checkpointing(model, cfg, device) and amp:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.train()
+
     init_val = float(cfg.get("gate_init", 1.0))
     theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
 
-    # Cache frozen starting model's pre-`lm_head` hidden states `h0` at replay target positions (100x smaller than full-vocab logits!)
     replay_h0: list[torch.Tensor] = []
     with torch.no_grad():
         for tok, tgt in rep_trajs:
-            h = _forward_backbone(model, [tok], device, amp, round_to=pad_mult)[0]
+            h = _forward_backbone(model, [tok], device, amp, round_to=pad_mult, prefix_cache=prefix_cache)[0]
             pos_idx = torch.from_numpy(tgt - 1).to(device, dtype=torch.long)
             replay_h0.append(h[pos_idx].detach().float().cpu())
 
@@ -950,7 +1354,7 @@ def learn_gates_seq(
             fb_batch = rng.sample(lessons, min(nf, len(lessons)))
             pos_seqs = [r["pos_tokens"] for r in fb_batch]
             pos_tgts = [r["pos_targets"] for r in fb_batch]
-            h_pos = _forward_backbone(model, pos_seqs, device, amp, round_to=pad_mult)
+            h_pos = _forward_backbone(model, pos_seqs, device, amp, round_to=pad_mult, prefix_cache=prefix_cache)
             lp_pos = _seq_mean_logprob(model, h_pos, pos_seqs, pos_tgts)
             loss_nll = -lp_pos.mean()
 
@@ -958,7 +1362,7 @@ def learn_gates_seq(
             if neg_idx and margin_w > 0:
                 neg_seqs = [fb_batch[k]["neg_tokens"] for k in neg_idx]
                 neg_tgts = [fb_batch[k]["neg_targets"] for k in neg_idx]
-                h_neg = _forward_backbone(model, neg_seqs, device, amp, round_to=pad_mult)
+                h_neg = _forward_backbone(model, neg_seqs, device, amp, round_to=pad_mult, prefix_cache=prefix_cache)
                 lp_neg = _seq_mean_logprob(model, h_neg, neg_seqs, neg_tgts)
                 loss_margin = torch.nn.functional.softplus(margin - (lp_pos[neg_idx] - lp_neg)).mean()
             else:
@@ -972,7 +1376,7 @@ def learn_gates_seq(
         if nr > 0:
             r_ids = rng.sample(range(len(rep_trajs)), min(nr, len(rep_trajs)))
             r_seqs = [rep_trajs[i][0] for i in r_ids]
-            h_rep = _forward_backbone(model, r_seqs, device, amp, round_to=pad_mult)
+            h_rep = _forward_backbone(model, r_seqs, device, amp, round_to=pad_mult, prefix_cache=prefix_cache)
             kl_terms = []
             for k, i in enumerate(r_ids):
                 tgt = rep_trajs[i][1]
