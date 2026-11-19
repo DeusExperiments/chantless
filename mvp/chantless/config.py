@@ -114,6 +114,8 @@ class SanityConfig(StrictModel):
     cap: str | float | bool | None = "off"
     floor_key: str = "task"
     solo_tiers: list[str] | None = None
+    solo_task_tiers: list[str] | None = None
+    splice_cache: bool | None = None
     allow_drop: bool = True
     enforce_general_cap: bool = True
 
@@ -194,7 +196,10 @@ class ProbeConfig(StrictModel):
     quantize_threads: int = Field(default=8, ge=1)
     max_pruned: int = Field(default=64, ge=0)
     auto_shm: bool = False
+    stage_source: bool | Literal["auto"] = "auto"
+    clamp_workers: bool = True
     splice_cache: bool = True
+    tier_cache_dir: str | None = None
     want_solo: list[str] | None = None
     solo_task_tiers: list[str] | None = None
 

@@ -26,6 +26,103 @@ from .util import Log, append_jsonl, read_json, read_jsonl, sha256_file, stable_
 PHASES = ["prepare", "pool", "aa", "proxy", "sanity", "search", "freeze", "exam", "report"]
 
 
+def choose_scratch_layout(
+    sr_cfg: str | None,
+    src_sz: int,
+    run_dir: Path,
+    run_id: str,
+    auto_shm: bool = False,
+    stage_source: bool | None = None,
+    shm_path: Path = Path("/dev/shm"),
+    shm_free: int | None = None,
+) -> tuple[Path, bool]:
+    def _shm_free() -> int:
+        if shm_free is not None:
+            return shm_free
+        return shutil.disk_usage(shm_path).free if shm_path.exists() else 0
+
+    if sr_cfg == "auto" or (sr_cfg is None and auto_shm):
+        free_b = _shm_free() if src_sz > 0 else 0
+        if src_sz > 0 and free_b >= max(30 << 30, int(3.5 * src_sz)):
+            return shm_path / "chantless" / run_id, (True if stage_source is None else bool(stage_source))
+        if src_sz > 0 and free_b >= int(1.5 * src_sz):
+            return shm_path / "chantless" / run_id, bool(stage_source)
+        return run_dir, False
+
+    if sr_cfg:
+        scratch = Path(sr_cfg) / run_id
+        if stage_source is not None:
+            return scratch, bool(stage_source)
+        if str(scratch).startswith(str(shm_path)):
+            return scratch, (src_sz > 0 and _shm_free() >= max(30 << 30, int(3.5 * src_sz)))
+        return scratch, True
+
+    return run_dir, False
+
+
+def clamp_probe_workers(
+    requested: int | None,
+    scratch_dir: Path,
+    weights_sz: int,
+    n_gpus: int = 1,
+    clamp_enabled: bool = True,
+    max_auto: int = 5,
+    free_bytes: int | None = None,
+) -> tuple[int, int, int]:
+    probe_path = scratch_dir if scratch_dir.exists() else scratch_dir.parent
+    if free_bytes is not None:
+        free_b = free_bytes
+    else:
+        while not probe_path.exists() and probe_path != probe_path.parent:
+            probe_path = probe_path.parent
+        free_b = shutil.disk_usage(probe_path).free
+    if weights_sz <= 0:
+        eff = requested if requested is not None else max(1, n_gpus)
+        return eff, eff, free_b
+    cand_bytes = max(1, int(1.05 * weights_sz))
+    cap = max(1, int(free_b * 0.85 // cand_bytes))
+    is_shm = str(scratch_dir).startswith("/dev/shm")
+    if requested is None:
+        if is_shm:
+            eff = min(max_auto, cap) if clamp_enabled else max(1, n_gpus)
+        else:
+            default_w = max(1, n_gpus)
+            eff = min(default_w, cap) if clamp_enabled else default_w
+    else:
+        eff = min(requested, cap) if clamp_enabled else requested
+    return max(1, eff), cap, free_b
+
+
+def choose_tier_cache_dir(
+    scratch_dir: Path,
+    run_dir: Path,
+    src_bytes: int,
+    tiers: list[str],
+    cfg_dir: str | None = None,
+    shm_path: Path = Path("/dev/shm"),
+    shm_free: int | None = None,
+    nvme_free: int | None = None,
+) -> tuple[Path | None, int, str]:
+    est = bmod.estimate_tier_cache_bytes(src_bytes, tiers)
+    cand_bytes = max(1, int(1.05 * src_bytes))
+    need_shm = est + 2 * cand_bytes
+    need_nvme = est + cand_bytes
+    if cfg_dir:
+        p = Path(cfg_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        free_b = nvme_free if nvme_free is not None else shutil.disk_usage(p).free
+        if free_b >= need_nvme:
+            return p, est, "explicit"
+        return None, est, f"explicit_insufficient_free({free_b}<{need_nvme})"
+    s_free = shm_free if shm_free is not None else (shutil.disk_usage(shm_path).free if shm_path.exists() else 0)
+    if s_free >= need_shm:
+        return shm_path / "chantless" / run_dir.name / "tier_cache" / "sanity", est, "shm"
+    n_free = nvme_free if nvme_free is not None else shutil.disk_usage(run_dir).free
+    if n_free >= need_nvme:
+        return run_dir / "tier_cache" / "sanity", est, "nvme"
+    return None, est, f"insufficient_disk(shm={s_free},nvme={n_free},need={need_nvme})"
+
+
 class SplitGuard:
     def __init__(self, tasks):
         self.tasks = tasks
@@ -49,16 +146,14 @@ class Run:
         self.by_id = {t.id: t for t in self.env.tasks()}
         self.src = cfg["source"]["gguf"]
         sr_cfg = cfg.get("scratch_root")
+        probe_cfg = cfg.get("probe", {})
         src_sz = Path(self.src).stat().st_size if Path(self.src).exists() else 0
-        if sr_cfg == "auto" or (sr_cfg is None and cfg.get("probe", {}).get("auto_shm", False)):
-            shm_p = Path("/dev/shm")
-            if shm_p.exists() and src_sz > 0 and shutil.disk_usage(shm_p).total >= max(30 << 30, 4 * src_sz):
-                sr_cfg = str(shm_p / "chantless")
-            else:
-                sr_cfg = None
-        self.scratch = Path(sr_cfg) / cfg["run_id"] if sr_cfg else self.dir
-        if sr_cfg:
-            # stage the source on fast unencrypted storage; served, quantized and pruned from there
+        self.scratch, should_stage = choose_scratch_layout(
+            sr_cfg, src_sz, self.dir, cfg["run_id"],
+            auto_shm=bool(probe_cfg.get("auto_shm", False)),
+            stage_source=probe_cfg.get("stage_source"),
+        )
+        if should_stage and self.scratch != self.dir:
             staged = self.scratch / "source" / Path(self.src).name
             if not staged.exists() or staged.stat().st_size != Path(self.src).stat().st_size:
                 staged.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +162,8 @@ class Run:
             pin = self.dir / "run.json"
             if pin.exists() and sha256_file(self.src) != read_json(pin)["pins"]["source_gguf_sha256"]:
                 raise RuntimeError("staged source GGUF does not match the pinned sha256")
+        if self.scratch != self.dir:
+            self.log(f"scratch: {self.scratch} (stage_source={should_stage})")
         self.inv = gguf_ops.inventory(self.src)
         self.groups, self.dead_tensors = gguf_ops.adapter_from_gguf(self.src, cfg["source"].get("hf_dir"))
         self.probe_src = self.src
@@ -391,13 +488,17 @@ class Run:
         shutil.rmtree(b_dir, ignore_errors=True)
         shutil.rmtree(c_dir, ignore_errors=True)
         B = bmod.Builder(self.tc, weights, self.groups, str(pdir / "imatrix.gguf"), b_dir, log=str(self.dir / "build.log"))
-        B.threads = self.cfg.get("probe", {}).get("quantize_threads", 8)
-        B.max_pruned = self.cfg.get("probe", {}).get("max_pruned", 1 if str(self.scratch).startswith("/dev/shm") else 4)
-        workers = self.cfg.get("probe", {}).get("workers")
-        if workers is None and str(self.scratch).startswith("/dev/shm") and Path(weights).exists():
-            w_sz = max(1, Path(weights).stat().st_size)
-            free_b = shutil.disk_usage(self.scratch.parent).free
-            workers = max(1, min(5, int((free_b - w_sz) // int(1.35 * w_sz))))
+        probe_cfg = self.cfg.get("probe", {})
+        B.threads = probe_cfg.get("quantize_threads", 8)
+        B.max_pruned = probe_cfg.get("max_pruned", 1 if str(self.scratch).startswith("/dev/shm") else 4)
+        req_workers = probe_cfg.get("workers")
+        clamp_enabled = probe_cfg.get("clamp_workers", True)
+        w_sz = Path(weights).stat().st_size if Path(weights).exists() else 0
+        workers, cap, free_b = clamp_probe_workers(
+            req_workers, self.scratch, w_sz, n_gpus=max(1, len(self.tc.gpus)), clamp_enabled=clamp_enabled,
+        )
+        if req_workers is not None and workers < req_workers:
+            self.log(f"probe({tag}): clamped workers {req_workers} -> {workers} (cap={cap}, free={free_b / (1 << 30):.1f} GiB)")
         P = Prober(self.tc, B, self.dir / "probe" / tag, str(self.dir / "probe.log"), workers=workers,
                    scratch=c_dir, scorer=self.scorer)
         if self.cfg.get("probe", {}).get("slots_per_gpu"):   # several concurrent probes per GPU
@@ -427,36 +528,20 @@ class Run:
     # ------------------------------------------------------------------ sanity: cap curve, floors, initial mask
     def phase_sanity(self):
         sc = self.cfg["sanity"]
+        probe_cfg = self.cfg.get("probe", {})
         P = self.make_prober(self.probe_src, "sanity")
         src_bytes = gguf_ops.file_bytes(self.probe_src)
         base = mk.new_mask(self.groups, "BF16", self._source_pin(), self.mode)
         uniform = {}
         um = {t: self.uniform_mask(base, t) for t in self.ladder[1:]}
-        for t, r in zip(um, P.probe_many(list(um.values()), ["general", "task"])):
-            uniform[t] = {"kl_gen": r.kl["general"], "kl_task": r.kl["task"], "bytes": r.bytes, "bpw": r.bpw, "bytes_saved": src_bytes - r.bytes}
-        pts = [(bmod_bpw(src_bytes, P.builder.source_params), 0.0)] + [(u["bpw"], u["kl_gen"]) for u in uniform.values()]
-        cap = sanity.make_cap(sc.get("cap", "general_kl"), pts)
-        fkey = sc.get("floor_key", "kl_gen")   # "task": floors from the task proxy (classifier objectives)
-        if fkey == "task":
-            for u in uniform.values():
-                u["task"] = u["kl_task"]
-        selfkl = read_json(self.dir / "proxy" / "proxy.json")["self_kl"]
-        # The floor is judged against the first rung the search can move to; a search that starts at Q8_0 and
-        # steps straight to Q4_K never has to resolve BF16-vs-Q8_0 differences
-        ft = self.cfg["proxy"].get("floor_tier", "Q8_0")
-        for name, key in (("general", "kl_gen"), ("task", "kl_task")):
-            ref = uniform[ft][key]
-            if self.classifier and name == "task":   # a damage, not a KL: it can be near zero or negative
-                ref = abs(ref)
-            if selfkl[name] > 0.05 * ref:
-                raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
+
         solo, masks, keys = {}, [], []
-        tiers_all = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
+        tiers_all = sc.get("solo_tiers") or self.ladder[1:]
         for g in base["groups"]:
             for t in [x for x in tiers_all if mk.tier_allowed(self.groups[g], x)] + (["drop"] if self.groups[g]["droppable"] else []):
                 masks.append(mk.apply(base, g, t))
                 keys.append((g, t))
-        self.log(f"sanity: {len(masks)} solo probes")
+        fkey = sc.get("floor_key", "kl_gen")
         cap_off = sc.get("cap", "general_kl") == "off"
         if fkey == "task" and cap_off:
             want_solo = ["task"]
@@ -465,18 +550,45 @@ class Run:
         else:
             want_solo = ["general"]
 
+        splice_flag = probe_cfg["splice_cache"] if "splice_cache" in probe_cfg else sc.get("splice_cache", True)
+        solo_needed = bmod.reachable_tiers(masks, self.groups, self.ladder)
         splice_b = None
-        if sc.get("splice_cache", True) and len(masks) >= 16 and Path(self.probe_src).exists():
-            free_b = shutil.disk_usage(self.scratch).free
-            if free_b >= 3 * src_bytes:
+        if splice_flag and len(masks) >= 16 and solo_needed and Path(self.probe_src).exists():
+            tc_dir, est_b, tc_where = choose_tier_cache_dir(
+                self.scratch, self.dir, src_bytes, solo_needed, cfg_dir=probe_cfg.get("tier_cache_dir"),
+            )
+            if tc_dir is not None:
+                self.log(f"sanity: splice tier_cache on {tc_where} ({tc_dir}) for {solo_needed} (~{est_b / (1 << 30):.2f} GiB)")
                 splice_b = bmod.SpliceProbeBuilder.from_builder(
-                    P.builder, base, [t for t in tiers_all if t != "BF16"], self.ladder,
-                    self.scratch / "tier_cache" / "sanity", workers=min(4, max(1, P.workers)),
+                    P.builder, base, solo_needed, self.ladder, tc_dir, workers=min(4, max(1, P.workers)),
                 )
                 P.builder = splice_b
+            else:
+                self.log(f"sanity: splice tier_cache disabled ({tc_where}; est ~{est_b / (1 << 30):.2f} GiB)")
 
+        um_hits = um_fb = 0
         try:
-            task_tiers = set(sc.get("solo_task_tiers") or [])
+            for t, r in zip(um, P.probe_many(list(um.values()), ["general", "task"])):
+                uniform[t] = {"kl_gen": r.kl["general"], "kl_task": r.kl["task"], "bytes": r.bytes, "bpw": r.bpw, "bytes_saved": src_bytes - r.bytes}
+            um_hits = splice_b.hits if splice_b is not None else 0
+            um_fb = splice_b.fallbacks if splice_b is not None else 0
+            pts = [(bmod_bpw(src_bytes, P.builder.source_params), 0.0)] + [(u["bpw"], u["kl_gen"]) for u in uniform.values()]
+            cap = sanity.make_cap(sc.get("cap", "general_kl"), pts)
+            if fkey == "task":
+                for u in uniform.values():
+                    u["task"] = u["kl_task"]
+            selfkl = read_json(self.dir / "proxy" / "proxy.json")["self_kl"]
+            ft = self.cfg["proxy"].get("floor_tier", "Q8_0")
+            for name, key in (("general", "kl_gen"), ("task", "kl_task")):
+                ref = uniform[ft][key]
+                if self.classifier and name == "task":
+                    ref = abs(ref)
+                if selfkl[name] > 0.05 * ref:
+                    raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
+            self.log(f"sanity: {len(masks)} solo probes")
+
+            raw_task_tiers = probe_cfg.get("solo_task_tiers") if probe_cfg.get("solo_task_tiers") is not None else sc.get("solo_task_tiers")
+            task_tiers = set(raw_task_tiers or [])
             if task_tiers and want_solo == ["general", "task"]:
                 full_i = [i for i, (_g, t) in enumerate(keys) if t in task_tiers]
                 gen_i = [i for i, (_g, t) in enumerate(keys) if t not in task_tiers]
@@ -490,6 +602,10 @@ class Run:
                 solo_results = P.probe_many(masks, want_solo)
         finally:
             if splice_b is not None:
+                self.log(
+                    f"sanity: splice_cache hits={splice_b.hits} fallbacks={splice_b.fallbacks} "
+                    f"(uniform_hits={um_hits} solo_hits={splice_b.hits - um_hits} solo_fallbacks={splice_b.fallbacks - um_fb})"
+                )
                 splice_b.release_cache()
                 P.builder = splice_b.inner
 

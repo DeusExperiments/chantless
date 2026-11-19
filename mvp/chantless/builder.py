@@ -255,52 +255,100 @@ class Builder:
             p.unlink(missing_ok=True)
 
 
+TIER_BPW = {
+    "BF16": 16.0, "F16": 16.0, "Q8_0": 8.5, "Q6_K": 6.6, "Q5_K": 5.7,
+    "Q4_K": 4.9, "Q3_K": 3.9, "Q2_K": 3.3, "IQ2_XS": 2.4, "IQ1_S": 1.6,
+}
+
+
+def estimate_tier_cache_bytes(src_bytes: int, tiers: list[str]) -> int:
+    total = 0.0
+    for t in set(tiers):
+        if t in ("BF16", "F16", maskmod.DROP):
+            continue
+        total += src_bytes * (TIER_BPW.get(t.upper(), 6.0) / 16.0) * 1.10
+    return int(total)
+
+
+def reachable_tiers(masks: list[dict], groups: dict[str, dict], ladder: list[str]) -> list[str]:
+    need: set[str] = set()
+    for m in masks:
+        types, _ = maskmod.tensor_plan(m, groups)
+        for t in types.values():
+            if t not in ("BF16", "F16", maskmod.DROP):
+                need.add(t)
+    order = {t: i for i, t in enumerate(ladder)}
+    return sorted(need, key=lambda t: order.get(t, 999))
+
+
 class SpliceProbeBuilder:
-    """Tensor-variant splice cache for fast solo/drop probes.
-
-    Quantizes each ladder tier once into `cache_dir/u-<tier>.gguf`, then materializes any pure
-    tier/drop probe by splicing raw mmap tensor bytes (~0.5s) instead of re-running `llama-quantize`.
-    Masks with widths, vocab trimming, or Apprentice edits fall back to `inner.build(...)`.
-    """
-
-    def __init__(self, inner: Builder, tier_paths: dict[str, Path], cache_dir: Path | None = None):
+    def __init__(self, inner: Builder, tier_paths: dict[str, Path], cache_dir: Path | None = None,
+                 exact_paths: dict[str, tuple[str, Path]] | None = None):
         self.inner = inner
         self.groups = inner.groups
         self.source_params = inner.source_params
         self.weights = inner.weights
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.tier_paths = dict(tier_paths)
+        self.exact_paths = dict(exact_paths or {})
         self.base_h = gguf_ops._Hdr(inner.weights)
         self.tier_h = {k: gguf_ops._Hdr(v) for k, v in tier_paths.items()}
         self.tier_map = {k: {t["name"]: t for t in h.tensors} for k, h in self.tier_h.items()}
+        self.hits = 0
+        self.fallbacks = 0
 
     @classmethod
     def from_builder(cls, inner: Builder, base_mask: dict, tiers: list[str], ladder: list[str],
-                     cache_dir: str | os.PathLike, workers: int = 4) -> "SpliceProbeBuilder":
+                     cache_dir: str | os.PathLike, workers: int = 4,
+                     existing_paths: dict[str, Path] | None = None) -> "SpliceProbeBuilder":
         cdir = Path(cache_dir)
         cdir.mkdir(parents=True, exist_ok=True)
-        tier_paths: dict[str, Path] = {}
+        tier_paths: dict[str, Path] = dict(existing_paths or {})
+        req_tiers = [t for t in dict.fromkeys(tiers) if t not in ("BF16", "F16", maskmod.DROP)]
+        to_build = [t for t in req_tiers if t not in tier_paths]
+
+        def _uniform_mask(tier_name: str) -> dict:
+            return {**base_mask, "groups": {g: {"tier": maskmod.clip(inner.groups[g], tier_name, ladder)} for g in base_mask["groups"]}}
 
         def _build_one(tier_name: str) -> tuple[str, Path]:
             tp = cdir / f"u-{tier_name}.gguf"
             if not tp.exists():
-                tm = {**base_mask, "groups": {g: {"tier": maskmod.clip(inner.groups[g], tier_name, ladder)} for g in base_mask["groups"]}}
-                inner.build(tm, tp)
+                inner.build(_uniform_mask(tier_name), tp)
             return tier_name, tp
 
-        with cf.ThreadPoolExecutor(max_workers=max(1, min(workers, len(tiers)))) as ex:
-            for tn, tp in ex.map(_build_one, tiers):
-                tier_paths[tn] = tp
-        return cls(inner, tier_paths, cache_dir=cdir)
+        if to_build:
+            with cf.ThreadPoolExecutor(max_workers=max(1, min(workers, len(to_build)))) as ex:
+                for tn, tp in ex.map(_build_one, to_build):
+                    tier_paths[tn] = tp
+        exact_paths = {mask_key(_uniform_mask(tn)): (tn, tp) for tn, tp in tier_paths.items()}
+        return cls(inner, tier_paths, cache_dir=cdir, exact_paths=exact_paths)
 
     def build(self, m: dict, out: str | os.PathLike | None = None, keep_pruned: bool = False) -> BuildResult:
         if m.get("widths") or m.get("vocab_keep") is not None or (m.get("apprentice") or {}).get("switches") or (m.get("apprentice") or {}).get("levels"):
+            self.fallbacks += 1
             return self.inner.build(m, out, keep_pruned=keep_pruned)
         maskmod.validate(m, self.inner.groups)
         types, drop = maskmod.tensor_plan(m, self.inner.groups)
         drop_set = set(drop)
+        mkey = mask_key(m)
+        if mkey in self.exact_paths and not drop_set:
+            tn, tp = self.exact_paths[mkey]
+            self.hits += 1
+            out_p = Path(out) if out else self.inner.work / f"cand-{mkey}.gguf"
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            if out_p.exists() or out_p.is_symlink():
+                out_p.unlink()
+            os.symlink(tp.resolve(), out_p)
+            sh = self.tier_h[tn]
+            fb = gguf_ops.file_bytes(tp)
+            data_b = sum(t["n_bytes"] for t in sh.tensors)
+            fallbacks = {t["name"]: t["type"] for t in sh.tensors if t["name"] in types and t["type"] != types[t["name"]].upper()}
+            return BuildResult(str(out_p), fb, data_b, self.inner.source_params, fb * 8 / self.inner.source_params, types, [], fallbacks)
         for n, t in types.items():
             if t != "BF16" and (t not in self.tier_map or n not in self.tier_map[t]):
+                self.fallbacks += 1
                 return self.inner.build(m, out, keep_pruned=keep_pruned)
+        self.hits += 1
         out_p = Path(out) if out else self.inner.work / f"cand-{mask_key(m)}.gguf"
         out_p.parent.mkdir(parents=True, exist_ok=True)
         bh = self.base_h
