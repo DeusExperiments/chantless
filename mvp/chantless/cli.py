@@ -19,11 +19,22 @@ from .pipeline import PHASES, Run
 
 
 def _add_extract_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--config", required=True, help="extraction run configuration JSON")
+    p.add_argument("--config", required=True, help="extraction run configuration JSON/YAML")
+    p.add_argument("--set", dest="overrides", action="append", default=[], help="repeatable key.path=value override")
     p.add_argument("--upto", choices=PHASES, help="stop after completing this phase")
     p.add_argument("--reset", choices=PHASES, help="clear this phase marker and all later ones")
     p.add_argument("--out-mask", help="optional path to export the resulting chantless.mask/v3 JSON")
     p.add_argument("--out", help="optional path to export the built specialist GGUF")
+
+
+def _load_validated(path: str, kind: str, overrides: list[str] | None):
+    from pydantic import ValidationError
+    from .config import load_config
+
+    try:
+        return load_config(path, kind, overrides=overrides)
+    except (ValidationError, ValueError, FileNotFoundError) as e:
+        raise SystemExit(f"config validation failed ({path}):\n{e}")
 
 
 def main():
@@ -49,24 +60,82 @@ def main():
 
     pl = sub.add_parser("plan", help="estimate moves, episodes, tokens, wall-clock and cost without running")
     pl.add_argument("--config", required=True)
+    pl.add_argument("--set", dest="overrides", action="append", default=[])
     pl.add_argument("--rates", help="JSON {backend: {field: value}} merged over plan.RATES")
     pl.add_argument("--source", help="local copy of the source GGUF, read for its header in place of the config's path")
 
     ln = sub.add_parser("learn", help="teach a built specialist from <=25 examples via switches/grid moves and judge controls")
     ln.add_argument("--config", required=True)
+    ln.add_argument("--set", dest="overrides", action="append", default=[])
     ln.add_argument("--fold", type=int, help="hold this feedback fold out of training; default trains on all of it")
     ln.add_argument("--out-mask", help="optional path to export the updated chantless.mask/v3 JSON")
     ln.add_argument("--out", help="optional path to export the updated specialist GGUF")
 
     an = sub.add_parser("anneal", help="train the whole source while cuts arrive in steps, then judge the real files")
     an.add_argument("--config", required=True)
+    an.add_argument("--set", dest="overrides", action="append", default=[])
     an.add_argument("--stage", choices=("setup", "sweep", "pick", "arm", "judge", "report"), default="arm")
     an.add_argument("--arm", help="the arm to run, or the name a judged file goes under")
     an.add_argument("--gpu", default="0", help="the real GPU id, for the scorer; the caller isolates the process with CUDA_VISIBLE_DEVICES")
     an.add_argument("--lr", type=float, help="the rate for --stage sweep")
     an.add_argument("--model", help="the file for --stage judge; default the arm's entry in the config's rows")
 
+    sw = sub.add_parser("sweep", help="run a declarative multi-cell sweep across local GPUs or pluggable cloud launchers")
+    sw.add_argument("--config", required=True, help="sweep configuration YAML/JSON")
+    sw.add_argument("--set", dest="overrides", action="append", default=[])
+    sw.add_argument("--launcher", help="override launcher backend (local, ssh, modal, colab, or registered custom)")
+    sw.add_argument("--export-dir", help="override durable per-cell export directory")
+    sw.add_argument("--dry-run", action="store_true", help="expand and validate all cells, print launch plan, do not execute")
+    sw.add_argument("--no-resume", action="store_true", help="ignore existing per-cell done.json receipts")
+    sw.add_argument("--stop-on-failure", action="store_true", help="halt scheduling remaining cells after first failure")
+
+    sc = sub.add_parser("schema", help="export Pydantic v2 JSON Schema for Chantless config files")
+    sc.add_argument("kind", nargs="?", default="all", choices=("extract", "learn", "sweep", "all"))
+    sc.add_argument("--out", help="optional output path for schema JSON")
+
+    vl = sub.add_parser("validate", help="strictly validate a Chantless JSON/YAML config file (with extends and --set)")
+    vl.add_argument("--config", required=True)
+    vl.add_argument("--kind", default="extract", choices=("extract", "learn", "sweep", "anneal"))
+    vl.add_argument("--set", dest="overrides", action="append", default=[])
+
     a = ap.parse_args()
+    if a.cmd == "schema":
+        from .config import export_json_schema
+        text = json.dumps(export_json_schema(a.kind), indent=2)
+        if a.out:
+            Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.out).write_text(text + "\n", encoding="utf-8")
+        else:
+            print(text)
+        return
+
+    if a.cmd == "validate":
+        model = _load_validated(a.config, a.kind, a.overrides)
+        if a.kind == "sweep":
+            from .sweep import expand_cells
+            cells = expand_cells(model, sweep_file=a.config)
+            print(json.dumps({"valid": True, "kind": a.kind, "sweep_id": model.sweep_id, "cells": len(cells)}, indent=2))
+        else:
+            print(json.dumps({"valid": True, "kind": a.kind}, indent=2))
+        return
+
+    if a.cmd == "sweep":
+        from .sweep import run_sweep
+        sw_cfg = _load_validated(a.config, "sweep", a.overrides)
+        res = run_sweep(
+            sw_cfg,
+            sweep_file=a.config,
+            launcher_override=a.launcher,
+            export_dir_override=a.export_dir,
+            dry_run=a.dry_run,
+            resume_override=False if a.no_resume else None,
+            stop_on_failure_override=True if a.stop_on_failure else None,
+        )
+        print(json.dumps(res, indent=2))
+        if not a.dry_run and not res.get("ok", False):
+            raise SystemExit(1)
+        return
+
     if a.cmd == "build":
         from . import builder as bmod, gguf_ops, mask as mk
         from .runtime import Toolchain
@@ -84,7 +153,7 @@ def main():
         print(json.dumps(res.to_dict(), indent=2))
         return
 
-    cfg = json.loads(Path(a.config).read_text())
+    cfg = _load_validated(a.config, a.cmd, getattr(a, "overrides", None)).to_raw_dict()
     if a.cmd == "anneal":
         from .anneal import main as anneal_main
         anneal_main(cfg, a)
