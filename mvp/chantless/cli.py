@@ -98,7 +98,55 @@ def main():
     vl.add_argument("--kind", default="extract", choices=("extract", "learn", "sweep", "anneal"))
     vl.add_argument("--set", dest="overrides", action="append", default=[])
 
+    mkp = sub.add_parser("mask", help="inspect, diff, fork, merge, or pull chantless.mask/v3 thin masks")
+    mk_sub = mkp.add_subparsers(dest="mask_cmd", required=True)
+
+    mk_i = mk_sub.add_parser("inspect", help="summarize a chantless.mask/v3 JSON file")
+    mk_i.add_argument("mask", help="path to mask JSON")
+
+    mk_d = mk_sub.add_parser("diff", help="diff two chantless.mask/v3 JSON files")
+    mk_d.add_argument("mask_a", help="first mask JSON")
+    mk_d.add_argument("mask_b", help="second mask JSON")
+
+    mk_f = mk_sub.add_parser("fork", help="clone a thin mask with parent provenance metadata")
+    mk_f.add_argument("base", help="parent mask JSON")
+    mk_f.add_argument("--out", required=True, help="child mask JSON path")
+    mk_f.add_argument("--note", help="optional fork note")
+
+    mk_m = mk_sub.add_parser("merge", help="merge two thin masks from the same frozen source checkpoint")
+    mk_m.add_argument("mask_a", help="first mask JSON")
+    mk_m.add_argument("mask_b", help="second mask JSON")
+    mk_m.add_argument("--mode", default="apprentice", choices=("apprentice", "specialist"))
+    mk_m.add_argument("--op", default="union", choices=("union", "intersection"), help="switch merge op for --mode apprentice")
+    mk_m.add_argument("--out", required=True, help="merged mask JSON path")
+
+    mk_p = mk_sub.add_parser("pull", help="fetch a remote thin mask (https:// or hf://) with SHA256 verification")
+    mk_p.add_argument("uri", help="https://... or hf://<org>/<repo>/<path>[@<rev>]")
+    mk_p.add_argument("--out", required=True, help="local destination JSON path")
+    mk_p.add_argument("--sha256", help="expected SHA256 hex digest (required unless --allow-unpinned)")
+    mk_p.add_argument("--allow-unpinned", action="store_true", help="allow pull without --sha256")
+    mk_p.add_argument("--allow-http", action="store_true", help="allow plain http:// (for localhost verification)")
+
     a = ap.parse_args()
+    if a.cmd == "mask":
+        from . import mask as mk
+        try:
+            if a.mask_cmd == "inspect":
+                out = mk.inspect_mask(a.mask)
+            elif a.mask_cmd == "diff":
+                out = mk.diff_masks(a.mask_a, a.mask_b)
+            elif a.mask_cmd == "fork":
+                out = mk.fork_mask(a.base, a.out, note=a.note)
+            elif a.mask_cmd == "merge":
+                out = mk.merge_masks(a.mask_a, a.mask_b, a.out, mode=a.mode, op=a.op)
+            elif a.mask_cmd == "pull":
+                out = mk.pull_mask(a.uri, a.out, expected_sha256=a.sha256, allow_unpinned=a.allow_unpinned, allow_http=a.allow_http)
+            else:
+                raise SystemExit(f"unknown mask subcommand {a.mask_cmd!r}")
+        except (mk.MaskError, FileNotFoundError, ValueError) as e:
+            raise SystemExit(f"mask {a.mask_cmd} failed: {e}")
+        print(json.dumps(out, indent=2))
+        return
     if a.cmd == "schema":
         from .config import export_json_schema
         text = json.dumps(export_json_schema(a.kind), indent=2)
