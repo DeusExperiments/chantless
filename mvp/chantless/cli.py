@@ -127,7 +127,87 @@ def main():
     mk_p.add_argument("--allow-unpinned", action="store_true", help="allow pull without --sha256")
     mk_p.add_argument("--allow-http", action="store_true", help="allow plain http:// (for localhost verification)")
 
+    def _add_serve_args(p: argparse.ArgumentParser, default_bench: bool) -> None:
+        p.add_argument("--model", help="built standalone specialist GGUF")
+        p.add_argument("--source", help="frozen stock BF16 GGUF (paired with --mask for auto-build cache)")
+        p.add_argument("--mask", help="chantless.mask/v3 JSON (paired with --source)")
+        p.add_argument("--imatrix", help="importance-matrix GGUF (required for IQ-tier masks)")
+        p.add_argument("--hf-dir", help="optional HF config dir for Gemma 4 shared-KV metadata")
+        p.add_argument("--cache-dir", help="auto-build cache dir (default ~/.cache/chantless/builds)")
+        p.add_argument("--llama-bin", required=True, help="directory containing llama-server and llama-quantize")
+        p.add_argument("--gpu", default="", help="CUDA_VISIBLE_DEVICES id (empty for Metal/CPU)")
+        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--port", type=int, default=8080)
+        p.add_argument("--slots", type=int, default=1 if default_bench else 4)
+        p.add_argument("--ctx-per-slot", type=int, default=4096 if default_bench else 8192)
+        p.add_argument("--kv-type", default="f16")
+        p.add_argument("--alias", help="OpenAI API model alias")
+        p.add_argument("--webui", action="store_true", help="enable llama-server WebUI (off by default)")
+        p.add_argument("--no-metrics", action="store_true", help="disable /metrics endpoint")
+        p.add_argument("--log", help="optional llama-server log path")
+        p.add_argument("--threads", type=int, default=8, help="quantize threads on auto-build cache miss")
+        p.add_argument("--shards", type=int, default=0, help="parallel quantize shards on cache miss")
+        p.add_argument("--bench", action="store_true", default=default_bench, help="run benchmark sweep and emit JSON telemetry receipt")
+        p.add_argument("--prompt-tokens", type=int, default=256)
+        p.add_argument("--gen-tokens", type=int, default=128)
+        p.add_argument("--runs", type=int, default=3)
+        p.add_argument("--compare", help="optional baseline GGUF for sequential side-by-side benchmark diff")
+        p.add_argument("--out", help="optional JSON receipt output path for --bench")
+
+    sv = sub.add_parser("serve", help="serve a built GGUF or thin mask (auto-build cached) with telemetry or --bench")
+    _add_serve_args(sv, default_bench=False)
+
+    bn = sub.add_parser("bench", help="benchmark a built GGUF or thin mask and emit JSON telemetry receipt")
+    _add_serve_args(bn, default_bench=True)
+
     a = ap.parse_args()
+    if a.cmd in ("serve", "bench"):
+        from . import serve as svmod
+        try:
+            minfo = svmod.resolve_model(
+                a.llama_bin,
+                model=a.model,
+                source=a.source,
+                mask=a.mask,
+                imatrix=a.imatrix,
+                hf_dir=a.hf_dir,
+                cache_dir=a.cache_dir,
+                threads=a.threads,
+                shards=a.shards,
+            )
+            if a.bench:
+                out = svmod.run_bench(
+                    a.llama_bin,
+                    minfo,
+                    compare_path=a.compare,
+                    out_path=a.out,
+                    gpu=a.gpu,
+                    slots=a.slots,
+                    ctx_per_slot=a.ctx_per_slot,
+                    kv_type=a.kv_type,
+                    prompt_tokens=a.prompt_tokens,
+                    gen_tokens=a.gen_tokens,
+                    runs=a.runs,
+                )
+            else:
+                out = svmod.serve_live(
+                    a.llama_bin,
+                    minfo,
+                    host=a.host,
+                    port=a.port,
+                    gpu=a.gpu,
+                    slots=a.slots,
+                    ctx_per_slot=a.ctx_per_slot,
+                    kv_type=a.kv_type,
+                    alias=a.alias,
+                    metrics=not a.no_metrics,
+                    webui=a.webui,
+                    log_path=a.log,
+                )
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            raise SystemExit(f"{a.cmd} failed: {e}")
+        print(json.dumps(out, indent=2))
+        return
     if a.cmd == "mask":
         from . import mask as mk
         try:

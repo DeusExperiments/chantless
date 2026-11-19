@@ -55,24 +55,43 @@ class LlamaServer:
     """One llama-server process. Used as a context manager."""
 
     def __init__(self, tc: Toolchain, model: str | os.PathLike, gpu: str = "", slots: int = 4, ctx_per_slot: int = 8192,
-                 kv_type: str = "f16", log: str | os.PathLike | None = None, extra: list[str] | None = None):
+                 kv_type: str = "f16", log: str | os.PathLike | None = None, extra: list[str] | None = None,
+                 host: str = "127.0.0.1", port: int | None = None, metrics: bool = False,
+                 alias: str | None = None, cache_prompt: bool = True, webui: bool = False):
         self.tc, self.model, self.gpu, self.slots = tc, str(model), gpu, slots
         self.ctx = ctx_per_slot * slots
         self.kv_type = kv_type
-        self.port = free_port()
+        self.host = host
+        self.port = int(port) if port is not None else free_port()
+        self.metrics = metrics
+        self.alias = alias
+        self.cache_prompt = cache_prompt
+        self.webui = webui
         self.log = log
         self.extra = extra or []
         self.proc: subprocess.Popen | None = None
+        self._log_fh = None
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        connect_host = "127.0.0.1" if self.host in ("0.0.0.0", "::") else self.host
+        return f"http://{connect_host}:{self.port}"
 
     def __enter__(self):
-        cmd = [str(self.tc.llama_bin / "llama-server"), "-m", self.model, "--host", "127.0.0.1", "--port", str(self.port),
+        cmd = [str(self.tc.llama_bin / "llama-server"), "-m", self.model, "--host", self.host, "--port", str(self.port),
                "-c", str(self.ctx), "-np", str(self.slots), "-fa", "on", "--jinja", "-ngl", "999",
-               "-ctk", self.kv_type, "-ctv", self.kv_type, "--no-webui", *self.extra]
-        out = open(self.log, "a") if self.log else subprocess.DEVNULL
+               "-ctk", self.kv_type, "-ctv", self.kv_type]
+        if not self.webui:
+            cmd.append("--no-webui")
+        if self.metrics:
+            cmd.append("--metrics")
+        if not self.cache_prompt:
+            cmd.append("--no-cache-prompt")
+        if self.alias:
+            cmd += ["--alias", self.alias]
+        cmd += list(self.extra)
+        self._log_fh = open(self.log, "a") if self.log else None
+        out = self._log_fh if self._log_fh is not None else subprocess.DEVNULL
         self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=self.tc.env_for(self.gpu))
         deadline = time.time() + 300
         while time.time() < deadline:
@@ -96,6 +115,12 @@ class LlamaServer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc = None
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
 
     def post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
