@@ -1,4 +1,4 @@
-"""Environment contract (spec §4, decision S12).
+"""Environment contract.
 
 One entry point supplies tasks, a run function and a verifier, and declares the budget,
 deployment conditions and split membership. Infrastructure errors are retried and never
@@ -50,7 +50,7 @@ class Verdict:
 
     @property
     def success(self) -> bool:
-        """Episode success = verifier pass AND no gating detector fired (manual §6.2)."""
+        """Episode success = verifier pass and no gating detector fired."""
         return self.tests_passed and not any(self.detectors.values())
 
     def to_dict(self) -> dict:

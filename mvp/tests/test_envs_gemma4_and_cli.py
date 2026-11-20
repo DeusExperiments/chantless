@@ -1,14 +1,16 @@
-"""Local $0 verification suite for Issue #5 (27/27 matrix readiness):
+"""Local integration tests for environments, Gemma 4 parity, and CLI workflows:
   1. Multi-dialect BFCL tool-call AST environment (`Qwen3` JSON, `Qwen3.5` XML, `Gemma 4` `<|tool_call>call:...`)
-  2. Public DeepMath integer-reasoning environment (`\\boxed{INT}` extraction & SplitGuard conformance)
-  3. Public calibrated classifier environment (`clsbench` + `BatchScorer` + `vocab_keep` retokenization)
+  2. DeepMath integer-reasoning environment (`\\boxed{INT}` extraction & SplitGuard conformance)
+  3. Calibrated classifier environment (`clsbench` + `BatchScorer` + `vocab_keep` retokenization)
   4. Gemma 4 asymmetric tag protection (`<|turn>`, `<turn|>`, `<|tool_call>`, `<tool_call|>`, `<|"|>`)
   5. Unified `learn.build_student` + `learn_gates_seq` on `Gemma 4` (PLE, shared-KV, `Q3_K`, dropped PLE/attn, width cut, softcap, C++ `traj-kl` parity)
-  6. `pyproject.toml` + `chantless {extract, build, learn}` CLI + generative `empty`/`flipped`/`shuffled` controls
+  6. `chantless {extract, build, learn}` CLI + generative `empty`/`flipped`/`shuffled` controls
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -19,7 +21,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "mvp"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from conftest import resolve_model_dir, resolve_toolchain
 from chantless import gguf_ops, vocab
 from chantless.env import bfcl, deepmath, protocol
 
@@ -65,34 +69,33 @@ def test_bfcl_three_dialect_roundtrip_and_env_conformance(tmp_path: Path):
     )
     assert bfcl.calls_match(pred_variant, [call])
 
-    tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
-    if tok_dir.exists():
-        venv_py = ROOT / ".local/mvp/.venv/bin/python"
-        if venv_py.exists():
-            pairs = tmp_path / "bfcl_pairs.jsonl"
-            rows = []
-            for i, sp in enumerate(("search", "select", "exam", "train")):
-                rows.append({
-                    "id": f"simple:{i}",
-                    "category": "simple",
-                    "family": f"simple/{sp}",
-                    "split": sp,
-                    "messages": [{"role": "user", "content": f"Compute f({i})."}],
-                    "tools": [{"type": "function", "function": {"name": "calc", "parameters": {"type": "dict", "properties": {"x": {"type": "int"}}}}}],
-                    "reference_calls": [{"name": "calc", "arguments": {"x": i}}],
-                })
-            pairs.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-            proc = subprocess.run([
-                str(venv_py), "-c",
-                f"import sys; sys.path.insert(0, {str(ROOT / 'mvp')!r}); "
-                f"from chantless.env.protocol import load_environment; "
-                f"env = load_environment('chantless.env.bfcl', hf_dir={str(tok_dir)!r}, pairs_file={str(pairs)!r}); "
-                f"t0 = env.tasks()[0]; "
-                f"from chantless.env.protocol import Episode; "
-                f"ep = Episode(t0.id, 0, t0.prompt['messages'] + [{{'role': 'assistant', 'content': env.format_reference(t0)}}], t0.prompt['tools'], env.format_reference(t0), ['stop'], 1, 12, 0.1); "
-                f"v = env.verify(t0, ep); assert v.success, v; print('BFCL_ENV_OK')"
-            ], capture_output=True, text=True)
-            assert proc.returncode == 0 and "BFCL_ENV_OK" in proc.stdout, proc.stderr
+    tok_dir = resolve_model_dir("qwen3-0.6b")
+    has_ml_deps = importlib.util.find_spec("transformers") is not None
+    if tok_dir.exists() and has_ml_deps:
+        pairs = tmp_path / "bfcl_pairs.jsonl"
+        rows = []
+        for i, sp in enumerate(("search", "select", "exam", "train")):
+            rows.append({
+                "id": f"simple:{i}",
+                "category": "simple",
+                "family": f"simple/{sp}",
+                "split": sp,
+                "messages": [{"role": "user", "content": f"Compute f({i})."}],
+                "tools": [{"type": "function", "function": {"name": "calc", "parameters": {"type": "dict", "properties": {"x": {"type": "int"}}}}}],
+                "reference_calls": [{"name": "calc", "arguments": {"x": i}}],
+            })
+        pairs.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        proc = subprocess.run([
+            sys.executable, "-c",
+            f"import sys; sys.path.insert(0, {str(ROOT / 'mvp')!r}); "
+            f"from chantless.env.protocol import load_environment; "
+            f"env = load_environment('chantless.env.bfcl', hf_dir={str(tok_dir)!r}, pairs_file={str(pairs)!r}); "
+            f"t0 = env.tasks()[0]; "
+            f"from chantless.env.protocol import Episode; "
+            f"ep = Episode(t0.id, 0, t0.prompt['messages'] + [{{'role': 'assistant', 'content': env.format_reference(t0)}}], t0.prompt['tools'], env.format_reference(t0), ['stop'], 1, 12, 0.1); "
+            f"v = env.verify(t0, ep); assert v.success, v; print('BFCL_ENV_OK')"
+        ], capture_output=True, text=True)
+        assert proc.returncode == 0 and "BFCL_ENV_OK" in proc.stdout, proc.stderr
 
 
 # ------------------------------------------------------------------ 2. DeepMath `\boxed{INT}` extraction + env conformance
@@ -103,9 +106,9 @@ def test_deepmath_boxed_int_and_env_conformance(tmp_path: Path):
     assert deepmath.extract_boxed_int("First \\boxed{10}, corrected \\boxed{2048}") == 2048
     assert deepmath.extract_boxed_int("No boxed answer 42") is None
 
-    tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    if tok_dir.exists() and venv_py.exists():
+    tok_dir = resolve_model_dir("qwen3-0.6b")
+    has_ml_deps = importlib.util.find_spec("transformers") is not None
+    if tok_dir.exists() and has_ml_deps:
         dm_file = tmp_path / "dm.jsonl"
         rows = [
             {"id": f"q{i}", "question": f"What is {i+2} * 3?", "answer": (i + 2) * 3, "difficulty": 5.0, "area": "Algebra", "family": f"alg/{sp}", "split": sp}
@@ -113,7 +116,7 @@ def test_deepmath_boxed_int_and_env_conformance(tmp_path: Path):
         ]
         dm_file.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
         proc = subprocess.run([
-            str(venv_py), "-c",
+            sys.executable, "-c",
             f"import sys; sys.path.insert(0, {str(ROOT / 'mvp')!r}); "
             f"from chantless.env.protocol import load_environment, Episode; "
             f"env = load_environment('chantless.env.deepmath', hf_dir={str(tok_dir)!r}, jsonl_file={str(dm_file)!r}); "
@@ -124,14 +127,13 @@ def test_deepmath_boxed_int_and_env_conformance(tmp_path: Path):
         assert proc.returncode == 0 and "DEEPMATH_ENV_OK" in proc.stdout, proc.stderr
 
 
-# ------------------------------------------------------------------ 3. Public `clsbench` conformance + vocab_keep scoring
+# ------------------------------------------------------------------ 3. `clsbench` conformance + vocab_keep scoring
 def test_clsbench_conformance_and_vocab_trim_scoring(tmp_path: Path):
-    tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    tools_bin = ROOT / ".local/mvp/bin-a01dff9"
-    llama_dir = ROOT / ".local/mvp/llama-a01dff9"
-    if not (tok_dir.exists() and venv_py.exists() and (tools_bin / "logodds").exists()):
-        pytest.skip("local toolchain not present")
+    tok_dir = resolve_model_dir("qwen3-0.6b")
+    llama_dir, tools_bin = resolve_toolchain()
+    has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
+    if not (has_ml_deps and tok_dir.exists() and (tools_bin / "logodds").exists() and (llama_dir / "build/bin/llama-quantize").exists()):
+        pytest.skip("local toolchain, tokenizer model, or ML dependencies not present")
 
     cls_file = tmp_path / "cls.jsonl"
     rows = [
@@ -173,7 +175,7 @@ scorer = runtime.BatchScorer(tc, slots_per_gpu=1)
 sc_full = env.score(env.tasks(), str(gg), scorer)
 assert len(sc_full) == 6
 
-# Trim vocab to 4096 keeping `env.pair` and verify `clsbench.score()` remaps & retokenizes cleanly!
+# Trim vocab to 4096 keeping `env.pair` and verify `clsbench.score()` remaps & retokenizes cleanly
 keep = vocab.rule_p_keep_set(gg, np.zeros(151936, dtype=np.int64), k=4096, must_keep=env.pair)
 gg_trim = TMP / "cls_trim.gguf"
 vocab.trim_gguf(gg, gg_trim, keep)
@@ -181,7 +183,7 @@ sc_trim = env.score(env.tasks(), str(gg_trim), scorer)
 assert len(sc_trim) == 6 and all(np.isfinite(v) for v in sc_trim.values())
 print("CLSBENCH_OK")
 """)
-    proc = subprocess.run([str(venv_py), str(driver)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
     assert proc.returncode == 0 and "CLSBENCH_OK" in proc.stdout, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
 
@@ -213,11 +215,11 @@ def test_vocab_rule_p_protects_gemma4_asymmetric_tags(tmp_path: Path):
 
 # ------------------------------------------------------------------ 5. Unified Gemma 4 Student + `learn_gates_seq` + C++ parity
 def test_gemma4_unified_student_ple_shared_kv_softcap_and_learn_gates_seq_parity(tmp_path: Path):
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    llama_bin = ROOT / ".local/mvp/llama-a01dff9/build/bin"
-    tools_bin = ROOT / ".local/mvp/bin-a01dff9"
-    if not (venv_py.exists() and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists()):
-        pytest.skip("local unified a01dff9 toolchain not present")
+    llama_dir, tools_bin = resolve_toolchain()
+    llama_bin = llama_dir / "build/bin"
+    has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
+    if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists()):
+        pytest.skip("local unified a01dff9 toolchain or ML dependencies not present")
 
     driver = tmp_path / "g4_e2e.py"
     driver.write_text(f"""
@@ -282,7 +284,7 @@ tc = runtime.Toolchain(Path({str(llama_bin)!r}), Path({str(tools_bin / 'traj-kl'
 groups, dead = gguf_ops.adapter_from_gguf(src_gg, hf)
 base_mask = mk.new_mask(groups, "Q4_K", {{"repo": "tiny-g4", "revision": "local", "gguf_sha256": util.sha256_file(src_gg)}})
 base_mask["dead_tensors"] = dead
-base_mask["groups"]["blk.0.ffn"]["tier"] = "Q3_K"   # exercises `dequantize_row_q3_K` + `up_row_zero` on Q3_K!
+base_mask["groups"]["blk.0.ffn"]["tier"] = "Q3_K"   # exercises `dequantize_row_q3_K` + `up_row_zero` on Q3_K
 base_mask["groups"]["blk.2.ple"]["tier"] = "drop"
 base_mask["groups"]["blk.3.attn"]["tier"] = "drop"
 base_mask["widths"] = {{"1": mk.pack_bitmap(list(range(256)), 512)}}
@@ -290,7 +292,7 @@ base_mask["widths"] = {{"1": mk.pack_bitmap(list(range(256)), 512)}}
 spec_gg = TMP / "g4_spec.gguf"
 builder.Builder(tc, str(src_gg), groups, None, TMP / "wk", threads=4).build(base_mask, spec_gg)
 
-# Train `learn_gates_seq` directly on the Gemma 4 specialist!
+# Train `learn_gates_seq` directly on the Gemma 4 specialist
 lessons = [{{"prompt_tokens": [5, 10, 15, 20], "corrected_tokens": [30, 31, 32], "mistaken_tokens": [40, 41, 42]}} for _ in range(4)]
 replay = [([6, 12, 18, 24, 28, 29], [2, 3, 4, 5]), ([7, 14, 21, 25, 26], [1, 2, 3, 4])]
 sw_gg = TMP / "g4_switched.gguf"
@@ -302,7 +304,7 @@ rec = learn.learn_gates_seq(
 )
 assert rec["off"] > 0 and rec["bytes"] == spec_gg.stat().st_size
 
-# Verify `chantless build` from `(src_gg, sw_mask)` is byte-identical!
+# Verify `chantless build` from `(src_gg, sw_mask)` is byte-identical
 reb_gg = TMP / "g4_rebuilt.gguf"
 subprocess.run([
     sys.executable, "-m", "chantless.cli", "build",
@@ -311,8 +313,8 @@ subprocess.run([
 ], cwd={str(ROOT / 'mvp')!r}, check=True, capture_output=True)
 assert util.sha256_file(reb_gg) == util.sha256_file(sw_gg)
 
-# Verify exact architectural parity (< 1e-3 nats) on BF16 before Q8_K activation-dot quantization,
-# plus quantized Q4_K/Q3_K switched Student vs real C++ `traj-kl` parity (< 2e-2 nats) AND lesson margin gain!
+# Verify architectural parity (< 1e-3 nats) on BF16 before Q8_K activation-dot quantization,
+# plus quantized Q4_K/Q3_K switched Student vs C++ `traj-kl` parity (< 2e-2 nats) and lesson margin gain
 eval_recs = [([5, 10, 15, 20, 30, 31, 32], [4, 5, 6]), ([5, 10, 15, 20, 40, 41, 42], [4, 5, 6]), *replay]
 kl.write_trj(TMP / "ev.bin", eval_recs)
 kl.traj_kl(tc, "base", str(src_gg), str(TMP / "ev.bin"), str(TMP / "st0"), str(TMP / "b0.json"), str(TMP / "kl0.log"))
@@ -341,36 +343,27 @@ p_tr, n_tr = cpp["trajs"][0], cpp["trajs"][1]
 assert ((-p_tr["nll_cand"]) - (-n_tr["nll_cand"])) > ((-p_tr["nll_src"]) - (-n_tr["nll_src"]))
 print("GEMMA4_LEARN_SEQ_OK")
 """)
-    proc = subprocess.run([str(venv_py), str(driver)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
     assert proc.returncode == 0 and "GEMMA4_LEARN_SEQ_OK" in proc.stdout, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
 
 # ------------------------------------------------------------------ 6. CLI `{extract, build, learn}` + generative controls (`empty`, `flipped`, `shuffled`)
 def test_cli_extract_build_learn_generative_controls_e2e(tmp_path: Path):
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    llama_dir = ROOT / ".local/mvp/llama-a01dff9"
+    llama_dir, tools_bin = resolve_toolchain()
     llama_bin = llama_dir / "build/bin"
-    tools_bin = ROOT / ".local/mvp/bin-a01dff9"
-    tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
-    if not (venv_py.exists() and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and tok_dir.exists()):
-        pytest.skip("local unified a01dff9 toolchain not present")
+    tok_dir = resolve_model_dir("qwen3-0.6b")
+    has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
+    if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and tok_dir.exists()):
+        pytest.skip("local unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
 
-    # Verify `pyproject.toml` editable install & `chantless {extract, build, learn}` subcommands
-    chantless_bin = venv_py.parent / "chantless"
-    if not chantless_bin.exists():
-        import shutil as _sh
-        if _sh.which("uv"):
-            subprocess.run(["uv", "pip", "install", "--python", str(venv_py), "--no-deps", "-e", str(ROOT)], check=True, capture_output=True)
-        else:
-            subprocess.run([str(venv_py), "-m", "pip", "install", "--no-build-isolation", "--no-deps", "-e", str(ROOT)], check=True, capture_output=True)
-    assert chantless_bin.exists()
+    cli_env = {**os.environ, "PYTHONPATH": str(ROOT / "mvp")}
     for subcmd in ("extract", "build", "learn", "plan"):
-        h = subprocess.run([str(chantless_bin), subcmd, "--help"], capture_output=True, text=True)
+        h = subprocess.run([sys.executable, "-m", "chantless.cli", subcmd, "--help"], env=cli_env, capture_output=True, text=True)
         assert h.returncode == 0, (subcmd, h.stderr)
 
     driver = tmp_path / "cli_learn_ctrl.py"
     driver.write_text(f"""
-import json, shutil, subprocess, sys
+import json, os, shutil, subprocess, sys
 from pathlib import Path
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -430,17 +423,18 @@ cfg_p = TMP / "learn_cfg.json"
 cfg_p.write_text(json.dumps(learn_cfg))
 exp_mask = TMP / "exported.mask.json"
 exp_gguf = TMP / "exported.gguf"
-subprocess.run([{str(chantless_bin)!r}, "learn", "--config", str(cfg_p), "--out-mask", str(exp_mask), "--out", str(exp_gguf)], check=True, capture_output=True, text=True)
+cli_env = {{**os.environ, "PYTHONPATH": {str(ROOT / 'mvp')!r}}}
+subprocess.run([sys.executable, "-m", "chantless.cli", "learn", "--config", str(cfg_p), "--out-mask", str(exp_mask), "--out", str(exp_gguf)], env=cli_env, check=True, capture_output=True, text=True)
 
 res = json.loads((TMP / "learn_out/result-all.json").read_text())
 cpp = res["cpp_traj_kl"]
 assert set(cpp) == {{"base", "learned", "empty", "flipped", "shuffled"}}
-# `learned` must strictly beat `base`, `empty`, and `flipped` on C++ `traj-kl` margin!
+# `learned` must strictly beat `base`, `empty`, and `flipped` on C++ `traj-kl` margin
 assert cpp["learned"]["margin_mean"] > cpp["base"]["margin_mean"]
 assert cpp["learned"]["margin_mean"] > cpp["empty"]["margin_mean"]
 assert cpp["learned"]["margin_mean"] > cpp["flipped"]["margin_mean"]
 assert exp_mask.exists() and exp_gguf.exists() and exp_gguf.stat().st_size == spec_gg.stat().st_size
 print("CLI_CONTROLS_OK", json.dumps(cpp))
 """)
-    proc = subprocess.run([str(venv_py), str(driver)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
     assert proc.returncode == 0 and "CLI_CONTROLS_OK" in proc.stdout, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

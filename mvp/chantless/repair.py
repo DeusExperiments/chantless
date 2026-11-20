@@ -1,10 +1,7 @@
-"""Optional weight adaptation (mask-plus-weights mode, decision S3 / Q31 option B).
+"""Optional LoRA weight repair for mask-plus-weights runs.
 
-LoRA repair on the training split under the candidate's exact removal structure (dropped sub-blocks
-are identity during training, matching the built runtime), merged into full weights, converted to
-GGUF and then materialised by the SAME builder with the same mask and re-measured in the loop.
-Quantisation is not simulated during training; the loop judges the real built artifact. The KL
-reference store stays the frozen source.
+Trains LoRA on the training split with dropped sub-blocks replaced by identity, merges into full weights,
+converts to GGUF, and re-evaluates the rebuilt quantized artifact against the frozen-source reference store.
 """
 from __future__ import annotations
 

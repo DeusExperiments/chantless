@@ -1,7 +1,7 @@
 """Detector environment shared across architectures (Qwen, Gemma 4, etc.): one document -> one forward pass.
 
-Entry point: `make_environment(**kwargs)`. Supports both ChatML (`prompt_style="qwen_chatml"`, byte-identical to
-the original Qwen runs) and Hugging Face chat templates (`prompt_style="chat_template"` or `"auto"`, used for
+Entry point: `make_environment(**kwargs)`. Supports both ChatML (`prompt_style="qwen_chatml"`, raw
+ChatML) and Hugging Face chat templates (`prompt_style="chat_template"` or `"auto"`, used for
 Gemma 4 and any non-ChatML tokenizer). When scoring a vocabulary-trimmed GGUF (`n_vocab < source_vocab`), `score()`
 automatically resolves the remapped `(human, ai)` token IDs in the candidate's GGUF header and re-tokenizes the
 rendered prompts with the candidate's own vocabulary (`tokdocs` when present, or a pruned BPE fallback).
@@ -25,7 +25,7 @@ import numpy as np
 from .. import vocab as vocabmod
 from .protocol import Episode, Task, Verdict
 
-# ProseLens model-card prompt, as in mvp/detect/common.py and mvp/gemma4/mask/gprompts.py
+# ProseLens model-card prompt
 SYSTEM = ("Given a document, answer with one word: human if the document was "
           "human-written, ai if it was AI-generated.")
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -38,14 +38,14 @@ def chat_prompt(text: str) -> str:
 
 
 def _loss_curve_rows(labels) -> set[int]:
-    """The validation rows mvp/detect/prep.py picked (seed 0, 1,000 per label): never used here."""
+    """Validation rows excluded from search/select (seed 0, 1,000 per label)."""
     rng = np.random.default_rng(0)
     values = np.asarray(labels)
     return {int(i) for v in sorted(set(values)) for i in rng.permutation(np.flatnonzero(values == v))[:1000]}
 
 
 def _beemo_rows(path) -> list[dict]:
-    """Every distinct Beemo text, as in mvp/detect/prep.py; split 'search' for 30% of prompts (climb_prep.py)."""
+    """Load distinct Beemo texts; hash 30% of prompt_ids to 'search' and the rest to 'exam'."""
     import pyarrow.parquet as pq
     beemo, seen = [], set()
     for r in pq.read_table(path).to_pylist():
@@ -170,7 +170,7 @@ class DetectEnvironment:
 
     def _classifier_tasks(self, d: Path, rng, cal_ids: set[str], search_per_cell, select_per_cell, exam_test_per_cell,
                           search_beemo_per_kind, select_beemo_per_kind, exam_beemo_per_kind) -> None:
-        """Classifier-mode splits shared identically across Qwen and Gemma."""
+        """Build classifier-mode splits (search, select, exam, calibration)."""
         import pyarrow.parquet as pq
         cols = ["id", "text", "label", "format"]
         wo = d / "WildOutlines/data"
@@ -303,7 +303,7 @@ class DetectEnvironment:
         return self._src_tok_bytes
 
     def _pruned_hf_encode(self, vh: str, meta: dict, prompts: list[str]) -> list[list[int]]:
-        """Pure-Python fallback retokenizer when `toolchain.tokdocs` is unavailable (used in CPU tests)."""
+        """Fallback HF retokenizer when `toolchain.tokdocs` is unavailable."""
         if vh not in self._pruned_tok_cache:
             from tokenizers import Tokenizer
             backend = getattr(self.tok, "backend_tokenizer", None)
@@ -355,8 +355,7 @@ class DetectEnvironment:
         return {t.id: float(x) for t, x in zip(tasks, v)}
 
     def fit_token_counts(self, gguf_path: str | None = None, tc=None) -> np.ndarray:
-        """Token occurrence counts on non-exam fit documents (`calibration` + `search` + WildOutlines `select`),
-        matching Qwen and Gemma Rule-P keep-set fitting without touching `exam` or Beemo `select`."""
+        """Token occurrence counts on `calibration`, `search`, and WildOutlines `select` (excluding `exam` and Beemo `select`)."""
         fit_tasks = [
             t for t in self._tasks
             if t.split in ("calibration", "search") or (t.split == "select" and t.id.startswith("wo-val:"))

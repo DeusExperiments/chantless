@@ -1,10 +1,9 @@
-"""Iterative mask learner with re-probing and failure feedback (spec §2/§6, decision S4).
+"""Iterative mask learner with periodic re-probing and verifier failure feedback.
 
-Moves are ranked by proxy cost per byte saved (Dettmers-style re-probing on the *current*
-allocation). Task-verifier and sanity failures change later allocations: failed trajectories join
-the scoring proxy, moves implicated by those failures are re-measured, then reverted or penalised,
-and reverted (group, tier) settings are blocked. A proxy-only search (feedback disabled) is kept as
-an ablation and does not satisfy the contract.
+Moves are ranked by proxy cost per byte saved (iterative re-probing on the current allocation).
+Task-verifier and sanity failures update later allocations: failed trajectories join the scoring
+proxy, moves implicated by those failures are re-measured, reverted or penalized, and reverted
+(group, tier) settings are blocked. Feedback can be disabled via config for proxy-only ablations.
 """
 from __future__ import annotations
 
@@ -197,7 +196,7 @@ class Learner:
         state.accepted += 1
         return best
 
-    # ---- failure feedback (decision S4)
+    # ---- failure feedback
     def feedback(self, state: LearnerState, fb_store_name: str, base_res, revert: bool) -> dict:
         """Re-measure each move in the current window by reverting it alone, scored on the failure store.
 

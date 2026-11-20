@@ -1,13 +1,9 @@
-"""Learning from labelled examples at the mask stage (mask-plus-weights for a classifier, decision S3).
+"""Few-shot specialist adaptation via fixed-grid level updates and binary MLP neuron switches.
 
-The built model is the starting point and the only input besides its config: `Student` rebuilds it in PyTorch
-from the GGUF, with its removed sub-blocks, cut neurons and trimmed vocabulary, so the student scores what
-the file scores. Training then moves levels on each tensor's fixed grid (lattice.py) with a straight-through
-gradient, and `write_levels` puts them back. Size cannot change, and rounding cannot erase what was learned.
-
-Feedback arrives as labelled documents. A wrong score costs a margin loss, a human and AI document from the
-same origin form a contrastive pair, and a replay set of ordinary documents is held near its starting scores
-so a few corrections cannot move everything else. The real built file is judged afterwards, never the student.
+`Student` reconstructs a built GGUF in PyTorch with its exact removed sub-blocks, cut neurons, and trimmed
+vocabulary. Adaptation optimizes either quantized grid levels (`lattice.py`) or universal `+0 B` binary
+`up_row_zero` MLP neuron switches (`learn_gates`, `learn_gates_seq`) using margin/NLL losses with `replay_h0`
+token-KL retention and A-GEM gradient projection, writes back the GGUF/mask, and evaluates the built file.
 """
 from __future__ import annotations
 
@@ -225,7 +221,7 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
             b.copy_(v.reshape(b.shape))
             continue
         p = params[hfn]
-        # conversion to GGUF adjustments (conversion/qwen.py, Qwen3NextModel & _LinearAttentionVReorderBase)
+        # Match llama.cpp GGUF weight layout conversions (conv1d, A_log, RMSNorm offset, GDN V-head order)
         if "ssm_conv1d" in name:
             v = v.unsqueeze(1)
         elif name.endswith(".ssm_a"):
@@ -489,7 +485,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
             idx.append(rng.choice(pools[names_s[(step + k) % len(names_s)]]))
         fd, hd, ad, rd = [r["tokens"] for r in fb], [h["tokens"] for h, _ in ps], [a["tokens"] for _, a in ps], [replay[i] for i in idx]
         if cap:
-            # one pass, longest first: padding is what a step spends its time on, and four small batches each pad to their own longest
+            # pack all sub-batches into one length-sorted pass to minimize padding
             sizes = [len(fd), len(hd), len(ad), len(rd)]
             out = capped(vec_scores if vec else scores, model, fd + hd + ad + rd, pair, device, amp, cap, prefix_cache=prefix_cache)
             s, sh, sa, sr = (out[0] if vec else out).split(sizes)
@@ -524,7 +520,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         new = loss_fb + pair_weight * loss_pair
         loss = new + hold * loss_hold
         if cfg.get("batch_pairs") and strata:
-            # every human against every AI document in the batch: right scores pull apart, however few pairs the feedback holds
+            # all-pairs human vs AI margin loss within the replay batch
             hs = [k for k, i in enumerate(idx) if strata[i].startswith(cfg.get("sep_humans", "human"))]
             ai = [k for k, i in enumerate(idx) if strata[i].startswith("ai")]
             if hs and ai:
@@ -538,7 +534,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
             raise FloatingPointError(f"loss is not finite at step {step}")
         opt.zero_grad()
         if cfg.get("project"):
-            # A-GEM: where the new lesson would hurt what must be kept, remove that part and move along the plane that does not
+            # A-GEM gradient projection against replay-hold gradients
             old = loss - new
             g_new = torch.autograd.grad(new, flat, retain_graph=True, allow_unused=True)
             g_old = torch.autograd.grad(old, flat, allow_unused=True)
@@ -561,7 +557,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         if on_step:
             on_step(step, opt, hist[-1])
     if cfg.get("project"):
-        log(f"learn: the new lesson conflicted with protected documents on {conflicts} of {steps} steps")
+        log(f"learn: A-GEM projected {conflicts}/{steps} steps")
     return hist
 
 
@@ -1501,13 +1497,12 @@ def sha256(path: str) -> str:
 
 
 def _side(task: str, prompt_id: str | None = None) -> int:
-    """Select documents split in two by task id: side 0 may be replayed in training, side 1 alone judges. With `prompt_id`, by
-    prompt, so one Beemo prompt's human, generated and edited texts cannot land on both sides."""
+    """Deterministic 50/50 split by `prompt_id` (when provided) or `task` id so related items stay on one side."""
     return int(hashlib.sha256((task if prompt_id is None else str(prompt_id)).encode()).hexdigest()[:8], 16) % 2
 
 
 def row_side(r: dict, c: dict) -> int:
-    """`_side` of a select row. With `side_by_prompt` every Beemo row must carry `prompt_id`: Beemo task ids do not hold it."""
+    """Resolve select side (0 = replay pool, 1 = judge), grouping multi-variant rows by `prompt_id` when configured."""
     return _side(r["task"], r["prompt_id"] if c.get("side_by_prompt") and r["task"].startswith("beemo") else None)
 
 
@@ -1520,7 +1515,7 @@ def real_scores(model: str, c: dict, scorer) -> tuple[np.ndarray, np.ndarray]:
         z = np.load(cache)
         return z["pool"], z["held"]
     if quick:
-        # a screen, not a verdict: only documents that can cross the cutoff are scored, the rest keep the base file's scores
+        # quick screen: score boundary-adjacent indices and reuse base scores elsewhere
         pool = real_scores(c["model"], c, scorer)[0].copy()
         pool[np.load(c["quick_idx"])] = scorer.score_trj(model, c["quick_trj"], pair)
     else:
@@ -1553,8 +1548,7 @@ def make_panel(c: dict, rows: list[dict], humans: list[int] | None = None) -> No
 
 
 def real_panel(model: str, c: dict, scorer) -> np.ndarray:
-    """The real file's scores on the fixed panel, in `panel_idx` order, once per file. Beside the quick screen, not a form of it:
-    nothing is imputed from a base file, so it stays honest for a file far from any base and a cutoff may be read from it."""
+    """Score the built GGUF directly on the fixed panel (cached by model and panel hash; no base-score imputation)."""
     cache = Path(c.get("cache_dir", c["out_dir"])) / f"panel-{sha256(model)[:16]}-{sha256(c['panel_trj'])[:8]}.npy"
     if cache.exists():
         return np.load(cache)
@@ -1864,9 +1858,9 @@ def run(cfg: dict, fold: int | None = None, log=print) -> dict:
     cand = judge(out, c, scorer, rows, fb, hold)
     rise = cand["human_flagged_beemo"] - base["human_flagged_beemo"]
     better = hold and cand["held"]["pairs"] and cand["held"]["mean_gap"] > base["held"]["mean_gap"]
-    drop = max(base["caught_wo"] - cand["caught_wo"], base["caught_beemo"] - cand["caught_beemo"])    # the pooled gate hides Beemo
+    drop = max(base["caught_wo"] - cand["caught_wo"], base["caught_beemo"] - cand["caught_beemo"])    # enforce per-subset recall drop cap alongside the pooled gate
     accepted = bool(cand["gate_pass"] and rise <= c.get("max_human_rise", .01) and drop <= c.get("max_ai_drop", .02) and better)
-    res = {"accepted": accepted, "fold": fold, "lineage": rec, "base": base, "candidate": cand, "claim": "preview on one side of select; not a Chantless exam result"}
+    res = {"accepted": accepted, "fold": fold, "lineage": rec, "base": base, "candidate": cand, "split": "select_side1"}
     (out_dir / f"result-{tag}.json").write_text(json.dumps(res, indent=1))
     log(f"learn {tag}: accepted={accepted} gate L {cand['L']:.4f} held pairs right {base['held']['pairs_right']} -> {cand['held']['pairs_right']}, "
         f"flagged AI {base['held']['ai_flagged']} -> {cand['held']['ai_flagged']}, Beemo humans {base['human_flagged_beemo']:.3f} -> {cand['human_flagged_beemo']:.3f}")

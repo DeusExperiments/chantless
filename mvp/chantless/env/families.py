@@ -1,4 +1,4 @@
-"""Procedural Python function task families for the MVP environment.
+"""Procedural Python function task families for the codetasks environment.
 
 Each family is a parameterised generator. A variant fixes the parameters, the function name and
 the hidden tests. Reference solutions run only inside the trusted generator; the model never

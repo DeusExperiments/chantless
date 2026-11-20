@@ -1,10 +1,8 @@
-"""Estimate the work of a run config without running it: moves, probes, episodes, tokens, wall-clock and cost.
+"""Dry-run work estimator for a run config: moves, probes, episodes, tokens, wall-clock, and cost.
 
-Nothing is built, served or scored. Counts follow pipeline.Run's phase logic. Sizes come from the GGUF header,
-the config and, when it loads, the environment; receipts an earlier attempt of the same run left behind
-(sanity mask, proxy store sizes, A/A gate size) are reused. Every other number is an assumption, and each one
-is listed in the result. Time is a throughput model: prefill FLOPs = 2 x parameters x tokens at an effective
-rate per GPU, decode bounded by memory bandwidth, builds at a rate per source GB.
+Computes estimates from the GGUF header, config, environment (if loadable), and any existing run receipts
+(sanity mask, proxy store sizes, A/A gate size). Wall-clock is modeled from prefill FLOPs (2 x parameters x
+tokens), decode memory bandwidth, and build time per source GB.
 """
 from __future__ import annotations
 
@@ -25,16 +23,13 @@ from .learner import LearnerState, legal_moves
 RATES = {
     "laptop": {"label": "laptop M2 Pro", "gpus": 1, "tflops": 3.5, "decode_gbps": 120, "build_s_per_gb": 20,
                "build_parallel": 2, "usd_per_hour": 0.0,
-               "basis": "measured: logodds 166k tokens of the BF16 0.75B detector in 65 s (3.8 TFLOPS); llama-server "
-                        "gates of run detect-400mb-002 at 2.9-3.5 TFLOPS; build rate from its 96 s per 4-probe step; "
-                        "owned hardware, no hourly cost"},
+               "basis": "measured on local M2 Pro (~3.5 TFLOPS prefill, ~20 s/GB build); local hardware ($0/h)"},
     "h100x1": {"label": "1xH100", "gpus": 1, "tflops": 57, "decode_gbps": 2000, "build_s_per_gb": 8,
                "build_parallel": 2, "usd_per_hour": 2.5,
-               "basis": "prefill from the climb exam on 8xH100 (129M tokens in 427 s, 2 logodds processes per GPU); "
-                        "decode and build rates assumed; price a typical on-demand rate, not a quote"},
+               "basis": "measured H100 prefill (~57 TFLOPS); estimated decode/build throughput and reference on-demand rate"},
     "h100x8": {"label": "8xH100", "gpus": 8, "tflops": 57, "decode_gbps": 2000, "build_s_per_gb": 8,
                "build_parallel": 16, "usd_per_hour": 20.0,
-               "basis": "as 1xH100 per GPU, with work spread over all 8 GPUs; price a typical on-demand rate, not a quote"},
+               "basis": "8x 1xH100 rates across 8 GPUs; reference on-demand rate"},
 }
 
 
@@ -149,7 +144,7 @@ def _moves(cfg, sm: SizeModel, start: dict, A: list) -> dict:
 def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) -> dict:
     """Counts, tokens and per-backend wall-clock and cost of running `cfg`; `rates` overrides or extends RATES.
 
-    `source` replaces cfg["source"]["gguf"] for reading the header only (a box config's model path on a laptop).
+    `source` overrides `cfg["source"]["gguf"]` for header inspection (e.g., evaluating a remote config against a local model copy).
     """
     A: list[str] = []
     rt = copy.deepcopy(RATES)

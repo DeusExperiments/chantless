@@ -1,9 +1,9 @@
-"""Acceptance statistics (spec §9, decision S9).
+"""Paired, task-matched non-inferiority acceptance statistics.
 
-Paired, task-matched non-inferiority: delta = mean over tasks of (candidate rate - source rate).
-Uncertainty: cluster bootstrap (resample families, then tasks within them). Sequential: K equally
-spaced looks with Bonferroni alpha spending (alpha/K per look), which is conservative and valid
-for any dependence between looks. Stop for success when L > -margin, for futility when U < -margin.
+`delta` = mean over tasks of (candidate rate - source rate). Uncertainty uses family-clustered CR1
+standard errors with Student-t(F-1) bounds. Sequential stopping uses K equally spaced looks with
+Bonferroni alpha spending (alpha/K per look): stop for success when L > -margin, or for futility when
+U < -margin.
 """
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ Z = NormalDist().inv_cdf
 
 def sample_size(v: float, margin: float, alpha: float, power: float, deff: float = 1.0, looks: int = 1,
                 df: int | None = None) -> int:
-    """Manual §7.1: n = ((q_{1-a} + q_{power}) * sqrt(v) / margin)^2 * deff, alpha split over looks.
-    With df (families - 1) the quantiles are Student-t, matching the cluster-robust gate."""
+    """Required sample size: n = ((q_{1-a} + q_{power}) * sqrt(v) / margin)^2 * deff, with alpha split over
+    looks. With df (families - 1) the quantiles are Student-t, matching the cluster-robust gate."""
     a = alpha / max(1, looks)
     if df:
         from scipy.stats import t as tdist
@@ -42,9 +42,8 @@ def delta_and_bounds(rows: list[dict], alpha: float, n_boot: int = 0, seed: int 
     (family-level) standard error with a t critical value on F-1 degrees of freedom.
 
     Each task's delta already contains its episode noise, and families are the independent units, so the
-    between-family spread of family sums is the right variance (CR1 sandwich). A task-only bootstrap was
-    far too narrow with few families; a three-stage bootstrap double-counted variance (both observed in the
-    local smoke run). n_boot/seed are accepted for API compatibility and ignored.
+    between-family spread of family sums is the right variance (CR1 sandwich). `n_boot` and `seed` are
+    accepted for API compatibility and ignored.
     """
     from scipy.stats import t as tdist
     tr = _task_rates(rows)
@@ -76,11 +75,7 @@ def empty_ok(b: dict, margin: float) -> bool:
 
 
 def discordance(rows: list[dict]) -> dict:
-    """v = variance of a single paired difference; deff = (CR1 variance of the task-mean delta) / (iid variance of it).
-
-    The earlier unweighted family-mean estimator inflated deff when some families had very few tasks
-    (observed 29 on the first full A/A; the task-level CR1 ratio on the same data is ~0.7).
-    """
+    """v = variance of a single paired difference; deff = (CR1 variance of the task-mean delta) / (iid variance)."""
     tr = _task_rates(rows)
     diffs = []
     for a in tr.values():
@@ -116,7 +111,7 @@ def sequential_decision(rows: list[dict], look: int, looks: int, margin: float, 
 
 
 def detector_bounds(rows: list[dict], alpha: float, bound: float) -> dict:
-    """Upper (1-alpha) bound on (cand - src) rate per detector must be <= bound (manual §7.2, +3 pt default)."""
+    """Check that the upper (1-alpha) bound on (cand - src) rate per detector is <= `bound`."""
     out = {}
     names = sorted({k for r in rows for k in r.get("detectors", {})})
     for k in names:

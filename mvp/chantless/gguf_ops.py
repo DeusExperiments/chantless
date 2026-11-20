@@ -249,7 +249,7 @@ def file_bytes(path: str | os.PathLike) -> int:
 
 
 def copy_with_zeroed(src: str | os.PathLike, dst: str | os.PathLike, zero: set[str]) -> None:
-    """Test helper: same file with the named tensors' data set to zero (same size; earns no byte credit)."""
+    """Copy `src` to `dst` with the named tensors zeroed (preserves file size)."""
     import gguf
     shutil_copy = __import__("shutil").copyfile
     shutil_copy(src, dst)

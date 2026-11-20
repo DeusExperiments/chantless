@@ -1,4 +1,4 @@
-"""External comparison of classifiers, each at its own 1% operating point (the rule of mvp/detect/measure.py).
+"""External comparison of classifiers, each calibrated at its own 1% false-positive operating point.
 
 A model's cutoff is the score at index int(0.01 * n) of its sorted negative-class calibration scores, and a
 document is flagged when its score is strictly below it. Only documents every model scored are counted.
@@ -35,8 +35,8 @@ def compare(models: dict, labels: dict, kinds: dict, groups_of=None, boot: int =
     models = {name: {"cal": negative-class calibration scores, "scores": {doc_id: score}}}; a lower score
     means more toward the flagged ("pos") class. labels = {doc_id: "pos" | "neg"}, kinds = {doc_id: str}.
     groups_of: the kinds reported separately (each restricted to positives); None reports every positive
-    kind when there are at least two. `seed` may be a numpy Generator, which is then advanced in place: one
-    shared Generator over successive calls (test, then Beemo) reproduces measure.py's resamples exactly.
+    kind when there are at least two. `seed` may be a numpy Generator, advanced in place so successive calls
+    share a deterministic RNG stream.
     A label other than "pos"/"neg", or a non-finite score, is an error. A selection with no documents reports
     NaN with a NaN interval.
     """

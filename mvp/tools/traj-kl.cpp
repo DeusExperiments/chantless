@@ -1,4 +1,4 @@
-// traj-kl: whole-trajectory KL tool (manual §5.4 / patch L5).
+// traj-kl: whole-trajectory KL tool.
 //
 // Each trajectory is evaluated in ONE forward pass at its full length, so no chunking.
 // Only the listed target positions are scored: assistant-generated tokens, optionally subsampled.
@@ -72,19 +72,6 @@ static void log_softmax_serial(const float * logits, float * out, int n) {
     for (int i = 0; i < n; ++i) out[i] = logits[i] - lse;
 }
 
-// log-softmax of logits[0..n) into out (float), returns nothing
-static void log_softmax(const float * logits, float * out, int n) {
-    float mx = -INFINITY;
-    #pragma omp parallel for reduction(max:mx)
-    for (int i = 0; i < n; ++i) mx = std::max(mx, logits[i]);
-    double s = 0.0;
-    #pragma omp parallel for reduction(+:s)
-    for (int i = 0; i < n; ++i) s += std::exp((double) logits[i] - mx);
-    const float lse = mx + (float) std::log(s);
-    #pragma omp parallel for
-    for (int i = 0; i < n; ++i) out[i] = logits[i] - lse;
-}
-
 int main(int argc, char ** argv) {
     std::string mode, model_path, traj_path, store, out_path, ctk = "f16", ctv = "f16";
     int ubatch = 2048, threads = 16;
@@ -124,8 +111,6 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) die("context init failed");
 
-    std::vector<float> lsm(n_vocab), base_row(n_vocab);
-    std::vector<ggml_fp16_t> row16(n_vocab);
     double tot_kl = 0, tot_nll_c = 0, tot_nll_s = 0; long tot_n = 0, tot_top1 = 0;
     double t_decode = 0, t_post_total = 0;
     const auto t_start = std::chrono::steady_clock::now();

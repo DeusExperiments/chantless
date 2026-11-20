@@ -1,10 +1,11 @@
-"""Tests for Issue #4: generative `traj-kl` one-shot search (`kind == "kl"`), universal `up_row_zero` switch Apprentice
+"""Generative `traj-kl` one-shot search (`kind == "kl"`), universal `up_row_zero` switch Apprentice
 (`learn_gates_seq` across all ggml quant types including `IQ2_XS`/`IQ1_S` with replay KL + A-GEM), chat/tool token
 protection in `vocab.rule_p_keep_set`, and unified `llama.cpp` `a01dff9` runtime verification.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import shutil
 import struct
@@ -17,7 +18,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "mvp"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from conftest import resolve_model_dir, resolve_toolchain
 from chantless import builder, gguf_ops, lattice, mask as mk, oneshot, sanity, vocab
 
 
@@ -75,8 +78,8 @@ def test_unified_a01dff9_patch_structure_and_clean_apply(tmp_path: Path):
     ):
         assert required in txt, f"unified patch missing {required}"
 
-    lc_repo = ROOT / ".local/mvp/llama-a01dff9"
-    if lc_repo.exists():
+    lc_repo, _ = resolve_toolchain()
+    if (lc_repo / ".git").exists():
         wt = tmp_path / "wt"
         subprocess.run(["git", "worktree", "add", "--detach", str(wt), "a01dff908b9c9311d7af316bba3c918063749bd0"],
                        cwd=lc_repo, check=True, capture_output=True)
@@ -174,7 +177,7 @@ def test_generative_kl_oneshot_solver_and_general_cap_guard():
     # Verify `guard_fn` prevents `oneshot.solve()` from picking a move that blows the general-KL cap when an alternative fits
     options = {"g0": ["Q8_0", "drop"], "g1": ["Q8_0", "drop"]}
     cost = {("g0", "Q8_0"): 1000, ("g0", "drop"): 0, ("g1", "Q8_0"): 1000, ("g1", "drop"): 0}
-    # g0=drop has slightly lower task KL (0.01 vs 0.02), BUT blows general KL (5.0 vs 0.05)!
+    # g0=drop has slightly lower task KL (0.01 vs 0.02) but exceeds the general-KL cap (5.0 vs 0.05)
     task_solo = {("g0", "drop"): np.array([0.01, 0.01]), ("g1", "drop"): np.array([0.02, 0.02])}
     gen_solo = {("g0", "drop"): np.array([5.0, 5.0]), ("g1", "drop"): np.array([0.05, 0.05])}
     tw2 = np.array([1.0, 1.0])
@@ -195,17 +198,15 @@ def test_generative_kl_oneshot_solver_and_general_cap_guard():
 
 # ------------------------------------------------------------------ 5. Live end-to-end generative smoke run on unified `a01dff9`
 def test_live_end_to_end_generative_oneshot_and_learn_gates_seq_smoke(tmp_path: Path):
-    """End-to-end generative smoke proof using real unified `a01dff9` C++ binaries + PyTorch Student (`IQ2_XS` + drop + width + A-GEM)."""
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    llama_dir = ROOT / ".local/mvp/llama-a01dff9"
+    """End-to-end generative smoke proof using unified `a01dff9` C++ binaries and PyTorch Student (`IQ2_XS` + drop + width + A-GEM)."""
+    llama_dir, tools_bin = resolve_toolchain()
     llama_bin = llama_dir / "build/bin"
-    tools_bin = ROOT / ".local/mvp/bin-a01dff9"
-    qwen_tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
+    qwen_tok_dir = resolve_model_dir("qwen3-0.6b")
 
-    if not (venv_py.exists() and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
-        pytest.skip("local unified a01dff9 toolchain / venv not present")
+    has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
+    if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
+        pytest.skip("unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
 
-    # Run inside `.local/mvp/.venv/bin/python` (which has torch, transformers, scipy, gguf)
     driver = tmp_path / "smoke_e2e.py"
     driver.write_text(f"""
 import hashlib, json, shutil, subprocess, sys
@@ -224,9 +225,7 @@ llama_bin = Path({str(llama_bin)!r})
 tools_bin = Path({str(tools_bin)!r})
 tok_src = Path({str(qwen_tok_dir)!r})
 
-# 1. Create a compact 3-layer Qwen3 HF checkpoint (`n_embd=256`, `n_ff=512`, `vocab_size=2048` synthetic or full Qwen3 vocab)
-# Use `vocab_size=2048` with a clean subset or full vocab? Using `vocab_size=1024`? Wait: `convert_hf_to_gguf.py` reads tokenizer!
-# With `n_embd=256`, even full Qwen3 `vocab_size=151936` is only `256 * 151936 * 2 = 77 MB` in BF16 (converts in 1.5s, quantizes in 0.4s)!
+# 1. Build a 3-layer Qwen3 HF checkpoint with full tokenizer vocab (77 MB BF16 at n_embd=256).
 hf_dir = TMP / "hf_tiny"
 hf_dir.mkdir()
 for fn in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "special_tokens_map.json"):
@@ -295,7 +294,7 @@ for g, info in groups.items():
 assert groups["blk.0.ffn"]["imatrix_ok"] is True
 assert groups["token_embd"]["imatrix_ok"] is False
 
-# 3. Run sanity uniform + solo probes (`Q4_K`, `IQ2_XS`, `drop`) + Wanda width probes (`512 -> 256`) and solve via `_search_oneshot`!
+# 3. Run sanity uniform + solo probes (`Q4_K`, `IQ2_XS`, `drop`) + Wanda width probes (`512 -> 256`) and solve via `_search_oneshot`
 B_san = builder.Builder(tc, str(src_gguf), groups, str(pdir / "imatrix.gguf"), TMP / "work_san", threads=4)
 P_san = prober.Prober(tc, B_san, TMP / "run/probe/sanity", str(TMP / "run/probe.log"), workers=1, scratch=TMP / "cand_san")
 P_san.add_store(prober.Store("task", str(pdir / "task.bin"), str(pdir / "store_task"), meta_t["n_targets"], kind="kl"))
@@ -314,7 +313,7 @@ for t in ladder[1:]:
 util.write_json(TMP / "run/sanity/uniform.json", uniform)
 util.write_json(TMP / "run/sanity/sanity_mask.json", base_m)
 util.write_json(pdir / "proxy.json", {{"task": meta_t, "general": meta_g, "self_kl": {{"task": 0.0, "general": 0.0}}}})
-util.write_json(TMP / "run/feedback_stores.jsonl", []) if False else (TMP / "run/feedback_stores.jsonl").write_text("")
+(TMP / "run/feedback_stores.jsonl").write_text("")
 
 solo_masks = []
 for g in base_m["groups"]:
@@ -322,7 +321,7 @@ for g in base_m["groups"]:
         solo_masks.append(mk.apply(base_m, g, t))
 P_san.probe_many(solo_masks, ["general", "task"])
 
-# Exercise `Run._search_oneshot` directly (`kind == "kl"`, Wanda `widths=True`, `IQ2_XS` + `drop` + `Q4_K` under a tight budget!)
+# Exercise `Run._search_oneshot` directly (`kind == "kl"`, Wanda `widths=True`, `IQ2_XS` + `drop` + `Q4_K` under a tight budget)
 from chantless.pipeline import Run
 dummy_run = object.__new__(Run)
 dummy_run.dir = TMP / "run"
@@ -348,7 +347,7 @@ dummy_run.mark = lambda phase, extra=None: dummy_run.records.append(("mark", pha
 dummy_run._source_pin = lambda: base_m["source"]
 
 P_search = dummy_run.make_prober(str(src_gguf), "search")
-# Set `vocab_k = 8192` + `target_b` strictly below trimmed uniform Q4_K so solver exercises Rule-P vocab trim + IQ2_XS / width cuts / drop!
+# Set `vocab_k = 8192` + `target_b` strictly below trimmed uniform Q4_K so solver exercises Rule-P vocab trim + IQ2_XS / width cuts / drop
 from chantless import vocab as vocabmod
 bm = oneshot.ByteModel(str(src_gguf), groups)
 bm.calibrate(dummy_run.uniform_mask(base_m, "Q4_K"), uniform["Q4_K"]["bytes"])
@@ -372,7 +371,7 @@ v3_mask = dummy_run._search_oneshot(P_search, base_m, lc, cap=cap)
 assert v3_mask["schema"] == "chantless.mask/v3"
 assert v3_mask["vocab_keep"] is not None
 
-# Ensure at least one surviving MLP is IQ2_XS so we also prove IQ2_XS Student + `up_row_zero` switch parity!
+# Ensure at least one surviving MLP is IQ2_XS so we exercise IQ2_XS Student + `up_row_zero` switch parity
 kept_ffns = [int(g.split(".")[1]) for g, e in v3_mask["groups"].items() if g.endswith(".ffn") and e["tier"] != "drop"]
 if not kept_ffns:
     v3_mask["groups"]["blk.0.ffn"]["tier"] = "IQ2_XS"
@@ -385,11 +384,11 @@ spec_base = TMP / "specialist_oneshot.gguf"
 br_base = builder.Builder(tc, str(src_gguf), groups, str(pdir / "imatrix.gguf"), TMP / "work_build", threads=4).build(v3_mask, spec_base)
 assert abs(bm(v3_mask) - br_base.file_bytes) <= 32
 
-# Verify `<tool_call>` and `</tool_call>` survived Rule-P vocabulary trimming as single special tokens in `spec_base`!
+# Verify `<tool_call>` and `</tool_call>` survived Rule-P vocabulary trimming as single special tokens in `spec_base`
 tag_toks = runtime.tokenize_docs(tc, spec_base, ["<tool_call>", "</tool_call>", "<|im_end|>"], threads=2)
 assert all(len(x) == 1 for x in tag_toks), f"chat/tool control tags split in trimmed GGUF: {{tag_toks}}"
 
-# 4. Tokenize lessons & replay trajectories against `spec_base`'s trimmed GGUF vocab, then run `learn_gates_seq` (`up_row_zero` + A-GEM)!
+# 4. Tokenize lessons & replay trajectories against `spec_base`'s trimmed GGUF vocab, then run `learn_gates_seq` (`up_row_zero` + A-GEM)
 prompt_str = R._render([{{"role": "user", "content": "Output magic token sequence."}}], None, True)
 prompt_ids, good_ids, bad_ids = [x.tolist() for x in runtime.tokenize_docs(tc, spec_base, [prompt_str, "ALPHA_OK", "BETA_BAD"], threads=2)]
 lessons = [{{"prompt_tokens": prompt_ids, "corrected_tokens": good_ids, "mistaken_tokens": bad_ids}} for _ in range(4)]
@@ -431,9 +430,9 @@ rec_learn = learn.learn_gates_seq(
 )
 assert rec_learn["off"] > 0, f"expected >0 switched-off neurons, got {{rec_learn}}"
 assert rec_learn["bytes"] == br_base.file_bytes
-assert rec_learn["loss_last"][0] < rec_learn["loss_first"][0]  # NLL on corrected output strictly improved!
+assert rec_learn["loss_last"][0] < rec_learn["loss_first"][0]  # NLL on corrected output strictly improved
 
-# 5. Rebuild from `(frozen BF16 source + thin v3 mask)` via `python -m chantless.cli build` and verify bit-identical SHA256!
+# 5. Rebuild from `(frozen BF16 source + thin v3 mask)` via `python -m chantless.cli build` and verify bit-identical SHA256
 cli_rebuilt = TMP / "cli_rebuilt.gguf"
 subprocess.run([
     sys.executable, "-m", "chantless.cli", "build",
@@ -448,9 +447,9 @@ subprocess.run([
 ], cwd=str(ROOT / "mvp"), check=True, capture_output=True, text=True)
 
 assert cli_rebuilt.stat().st_size == switched_gguf.stat().st_size
-assert util.sha256_file(cli_rebuilt) == util.sha256_file(switched_gguf), "cli build from thin v3 mask must match learn_gates_seq GGUF byte-for-byte!"
+assert util.sha256_file(cli_rebuilt) == util.sha256_file(switched_gguf), "cli build from thin v3 mask must match learn_gates_seq GGUF byte-for-byte"
 
-# 6. Verify PyTorch Student vs REAL C++ `traj-kl` trajectory log-prob / NLL parity on the rebuilt GGUF!
+# 6. Verify PyTorch Student vs C++ `traj-kl` trajectory log-prob / NLL parity on the rebuilt GGUF
 eval_trj = TMP / "eval_lesson.bin"
 pos_seq = prompt_ids + good_ids
 neg_seq = prompt_ids + bad_ids
@@ -474,14 +473,14 @@ diffs = [abs(s["nll_cand"] - c["nll_cand"]) for s, c in zip(stu_eval, cpp_eval["
 print("Student vs C++ traj-kl max |NLL diff|:", max(diffs), "per-traj:", list(zip([round(s["nll_cand"], 5) for s in stu_eval], [round(c["nll_cand"], 5) for c in cpp_eval["trajs"]])))
 assert max(diffs) < 5e-3, f"Student vs C++ GGUF NLL diverged: {{diffs}}"
 
-# Verify lesson improvement on REAL C++ GGUF (`nll_cand` vs `nll_src` on `pos_seq` vs `neg_seq`)
+# Verify lesson improvement on C++ GGUF (`nll_cand` vs `nll_src` on `pos_seq` vs `neg_seq`)
 pos_tr, neg_tr = cpp_eval["trajs"][0], cpp_eval["trajs"][1]
 gap_before = (-pos_tr["nll_src"]) - (-neg_tr["nll_src"])
 gap_after = (-pos_tr["nll_cand"]) - (-neg_tr["nll_cand"])
-print(f"Real C++ GGUF lesson log-prob margin: {{gap_before:.6f}} -> {{gap_after:.6f}} (delta={{gap_after - gap_before:+.6f}}), thin mask={{switched_mask_path.stat().st_size}} B, off={{rec_learn['off']}}")
-assert gap_after > gap_before, f"Real C++ GGUF margin did not improve: {{gap_before}} -> {{gap_after}}"
+print(f"C++ GGUF lesson log-prob margin: {{gap_before:.6f}} -> {{gap_after:.6f}} (delta={{gap_after - gap_before:+.6f}}), thin mask={{switched_mask_path.stat().st_size}} B, off={{rec_learn['off']}}")
+assert gap_after > gap_before, f"C++ GGUF margin did not improve: {{gap_before}} -> {{gap_after}}"
 
-# 7. Run `Run.phase_freeze()` on the switched `chantless.mask/v3` mask (double-build SHA256, header audit, `llama-server` chat + memory)!
+# 7. Run `Run.phase_freeze()` on the switched `chantless.mask/v3` mask (double-build SHA256, header audit, `llama-server` chat + memory)
 util.write_json(TMP / "run/search_result.json", {{"mask": mk.load(switched_mask_path), "weights": str(src_gguf)}})
 dummy_run.phase_freeze()
 freeze_rec = util.read_json(TMP / "run/final/freeze.json")
@@ -494,26 +493,25 @@ assert freeze_rec["build"]["file_bytes"] == switched_gguf.stat().st_size
 assert util.read_json(TMP / "run/final/mask.json")["measured"]["memory"]["decode_tokens"] >= 1
 print("Freeze audit & LlamaServer memory receipt:", json.dumps(freeze_rec))
 
-print("E2E_GENERATIVE_ISSUE4_OK")
+print("E2E_GENERATIVE_OK")
 """)
-    proc = subprocess.run([str(venv_py), str(driver)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
     if proc.returncode != 0:
         raise AssertionError(f"E2E smoke failed (rc={proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     print(proc.stdout)
-    assert "E2E_GENERATIVE_ISSUE4_OK" in proc.stdout
+    assert "E2E_GENERATIVE_OK" in proc.stdout
 
 
 # ------------------------------------------------------------------ 6. Qwen3.5 VLM config + GatedDeltaNet (num_k != num_v) parity on unified `a01dff9`
 def test_qwen35_vlm_config_and_gdn_v_head_unreorder_parity(tmp_path: Path):
     """Verify stock VLM `Qwen3_5Config` (`text_config`), `num_k_heads != num_v_heads` V-head un-reordering, variable width, vocab trim, and `up_row_zero`."""
-    venv_py = ROOT / ".local/mvp/.venv/bin/python"
-    llama_dir = ROOT / ".local/mvp/llama-a01dff9"
+    llama_dir, tools_bin = resolve_toolchain()
     llama_bin = llama_dir / "build/bin"
-    tools_bin = ROOT / ".local/mvp/bin-a01dff9"
-    qwen_tok_dir = ROOT / ".local/mvp/models/qwen3-0.6b"
+    qwen_tok_dir = resolve_model_dir("qwen3-0.6b")
 
-    if not (venv_py.exists() and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
-        pytest.skip("local unified a01dff9 toolchain / venv not present")
+    has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
+    if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
+        pytest.skip("unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
 
     driver = tmp_path / "q35_parity.py"
     driver.write_text(f"""
@@ -583,7 +581,7 @@ print("Qwen3.5 VLM+GDN(k=2,v=4)+cut+vocab+up_row_zero max |NLL diff|:", max(diff
 assert max(diffs) < 5e-3, f"Qwen3.5 Student vs C++ NLL diverged: {{diffs}}"
 print("QWEN35_PARITY_OK")
 """)
-    proc = subprocess.run([str(venv_py), str(driver)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
     if proc.returncode != 0:
         raise AssertionError(f"Qwen3.5 parity failed (rc={proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     print(proc.stdout)

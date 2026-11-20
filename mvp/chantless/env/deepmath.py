@@ -1,8 +1,8 @@
-"""Public DeepMath-103K integer reasoning environment across Qwen3, Qwen3.5, and Gemma 4.
+"""DeepMath-103K integer reasoning environment across Qwen3, Qwen3.5, and Gemma 4.
 
-Uses pinned MIT-licensed `zwhe99/DeepMath-103K@5cf055d1fe3d7a2eb19719ac020211469736ae44` filtered to
-non-trivial integer answers (`abs(ans) >= 2`, difficulty >= 3.0), clustered into disjoint topic-hash
-families across `search`, `select`, `exam`, and `train`, and verified deterministically via `\\boxed{INT}`.
+Uses pinned `zwhe99/DeepMath-103K@5cf055d1fe3d7a2eb19719ac020211469736ae44` filtered to integer answers
+outside `{0, 1}` (`difficulty >= 3.0`), clustered into disjoint topic-hash families across `search`,
+`select`, `exam`, and `train`, and verified deterministically via `\\boxed{INT}`.
 """
 from __future__ import annotations
 

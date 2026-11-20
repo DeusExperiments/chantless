@@ -1,8 +1,8 @@
-"""MVP environment: procedurally generated Python function tasks with hidden unit tests.
+"""Procedurally generated Python function tasks with hidden unit tests.
 
 Entry point: make_environment(**kwargs). Each episode is a short tool-using interaction: the model
 may call `run_tests` on the visible examples, then must answer with one ```python block. Success
-is decided by hidden tests (never shown) and the complaint-derived detectors.
+is decided by hidden tests (never shown) and the gating detectors.
 """
 from __future__ import annotations
 

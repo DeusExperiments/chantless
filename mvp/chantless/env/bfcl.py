@@ -1,10 +1,10 @@
-"""Public single-turn BFCL AST tool-calling environment across Qwen3, Qwen3.5, and Gemma 4.
+"""Single-turn BFCL AST tool-calling environment across Qwen3, Qwen3.5, and Gemma 4.
 
 Downloads and caches pinned Berkeley Function Calling Leaderboard v3 single-call tasks from
-`ShishirPatil/gorilla@70b6a4a2144597b1f99d1f4d3185d35d7ee532a4` (Apache-2.0; zero private data),
-renders each model family's native tool template (`Qwen3` JSON, `Qwen3.5` XML `<function=...>`,
-`Gemma 4` `<|tool_call>call:...<tool_call|>`), executes unconstrained `/v1/completions` (no GBNF
-grammar rescue), and verifies canonicalized AST tool invocations.
+`ShishirPatil/gorilla@70b6a4a2144597b1f99d1f4d3185d35d7ee532a4` (Apache-2.0), renders each model
+family's native tool template (`Qwen3` JSON, `Qwen3.5` XML `<function=...>`, `Gemma 4`
+`<|tool_call>call:...<tool_call|>`), executes unconstrained `/v1/completions`, and verifies
+canonicalized AST tool invocations.
 """
 from __future__ import annotations
 
@@ -356,7 +356,7 @@ def calls_match(pred_calls: list[dict[str, Any]], ref_calls: list[dict[str, Any]
         r = canonical(ref)
         if p == r:
             return True
-        # Also allow optional fields omitted in prediction when reference marks them "" or default
+        # Retry after normalizing scalar/list types against the reference
         np_ = canonical(_norm_against_target(p, r))
         nr_ = canonical(_norm_against_target(r, r))
         if np_ == nr_:

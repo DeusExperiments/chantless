@@ -1,4 +1,4 @@
-"""Precision & structural mask schema `chantless.mask/v3`, backward-compatible with `v2` and `onlyskills.mask/v1`.
+"""Precision & structural mask schema `chantless.mask/v3` (reads `v2` and legacy v1 masks).
 
 A `v3` mask is the complete, deterministic record turning the frozen reference base into the Chantless model:
   - `groups` / `tensors`: per-group and per-tensor precision tiers or `drop` (physical sub-block removal)
@@ -301,7 +301,7 @@ def load(path: str | Path) -> dict:
 
 
 def from_v1(d: dict) -> dict:
-    """Read a legacy v1 mask (manual §11.1) into v2 form without touching the original file."""
+    """Convert a legacy v1 mask dict into `chantless.mask/v2` format without mutating the input."""
     out = {
         "schema": SCHEMA_V2, "source": d.get("source", {}), "objective_mode": "preserve", "groups": {},
         "tensors": {}, "floors": {}, "weights": {"lineage": []}, "deployment": {"kv_type": d.get("kv_type")},

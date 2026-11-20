@@ -1,4 +1,4 @@
-"""The grid a quantised tensor lives on (mask-plus-weights, decision S3).
+"""Fixed quantization grids (`Q4_K`, `Q8_0`) and in-place level updates on built GGUF files.
 
 A Q4_K or Q8_0 tensor is a fixed grid: value = lo + step * level, with lo and step fixed per sub-block and
 only the integer levels free. Learning moves levels and leaves lo and step alone, so training simulates the

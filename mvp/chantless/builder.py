@@ -1,4 +1,4 @@
-"""Materialize a mask (`v2` or `v3`) into a standalone GGUF and account its actual bytes (spec §9, decision S1).
+"""Materialize a mask (`v2` or `v3`) into a standalone GGUF and verify its header and byte count.
 
 Order for a full `chantless.mask/v3` mask:
   1. Remove dropped groups + `dead_tensors`, and physically slice per-layer MLP `widths` (and `imatrix` columns).

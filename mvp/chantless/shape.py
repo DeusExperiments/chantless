@@ -1,11 +1,8 @@
-"""A learned structure as a real file (One-Budget Anneal).
+"""Materialize variable-width, mixed-precision, vocab-trimmed GGUFs and price candidate structures.
 
-Kept neurons, a tier per group and, when training has moved them, float weights go in; a built GGUF and its size come out.
-The chain is the push's: a variable-width GGUF at full vocabulary, `Builder` quantising in a directory of its own, the
-vocabulary trim last. Neurons are named by their index in the source, so a cut is cumulative however many rungs came before
-it. What is cut is absent from the file, never zeroed. The bytes that count are the built file's; `Ledger` only prices moves.
-
-Tiers are {group: tier} for every group, with "drop" for a removed sub-block, so `tiers` alone says what is dropped.
+Pipeline: write variable-width GGUF (omitting dropped sub-blocks) -> quantize via `Builder` -> trim
+vocabulary. Kept neurons use source indices so cuts compose cumulatively; `tiers` maps every group to a
+ggml tier or `'drop'`.
 """
 from __future__ import annotations
 
@@ -247,9 +244,8 @@ def tensor_bytes(dims: list[int], tier: str) -> int:
 
 
 class Shaper:
-    """One source and its fixed inputs. Each `build` is one attempt in a directory emptied first and removed afterwards, so
-    nothing of an earlier or killed attempt can reach a later file. The directory is named by `out` because its path lands in
-    the header (quantize.imatrix.file): the same inputs and `out` give the same bytes. Put `work` on a RAM disk when one is free."""
+    """Builds GGUFs from a fixed source, imatrix, and vocab keep-set in a fresh per-output work directory
+    (deterministic path keeps `quantize.imatrix.file` reproducible; prefer tmpfs/RAM disk for `work`)."""
 
     def __init__(self, tc, src: str, groups: dict, imatrix: str, vocab: np.ndarray | str, work: str | os.PathLike, threads: int = 16, log: str | None = None):
         self.tc, self.src, self.groups, self.imatrix, self.threads, self.log = tc, str(src), groups, str(imatrix), threads, log

@@ -1,6 +1,3 @@
-# Large binary artifacts: kept on disk, not in git (checksums are committed alongside).
-runs/search-pilot/artifacts/base_swe/*.f16
-runs/pilot/pod_artifacts/*.tgz
 # Local Claude Code session state
 .claude/
 
@@ -19,8 +16,7 @@ runs/pilot/pod_artifacts/*.tgz
 *.key
 .env
 .env.*
-# Private writing data and test caches.
-/krishna-writing-data/
+# Python and test caches.
 .pytest_cache/
 __pycache__/
 *.egg-info/

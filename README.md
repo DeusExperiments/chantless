@@ -37,7 +37,7 @@ chantless bench \
 
 ## Verified Winners
 
-All **`12` trophy masks** (`6.4–52.8 KB`, `weights.lineage = []`) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
+All **`12` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
 
 ### 1. Stock-Checkpoint Double Winners (`extract` + `<=25`-Mistake `+0 B` `learn`)
 
@@ -60,35 +60,34 @@ All **`12` trophy masks** (`6.4–52.8 KB`, `weights.lineage = []`) and SHA256 r
 
 | Measurement | Hardware | Baseline | Chantless | Delta |
 | :--- | :--- | :---: | :---: | :--- |
-| **Apprentice Training (`stream_prefix=True`)** | NVIDIA RTX 4090 (`sm_89`) | `3,072.8 MB` alloc · `18.84s` | **`493.3 MB`** alloc · `15.76s` *(cached `13.10s`)* | **`-83.95%`** CUDA VRAM (`stream_hdiff = 0.0`) |
+| **Apprentice Training (Streaming Prefix)** | NVIDIA RTX 4090 (`sm_89`) | `3,072.8 MB` alloc · `18.84s` | **`493.3 MB`** alloc · `15.76s` *(cached `13.10s`)* | **`-83.95%`** CUDA VRAM (bit-exact, `0.0` diff) |
 | **Inference (`chantless bench`, `Q4_K` vs `BF16`)** | NVIDIA RTX 4090 (`CUDA0`) | `440.95 tok/s` · `1,844 MiB` VRAM | **`630.0 tok/s`** · **`1,016 MiB`** VRAM (`571 MiB` `CUDA0`) | **`1.429×`** decode · **`0.551×`** `nvidia-smi` VRAM |
 | **Inference & Apprentice (`mps` / `MTL0`)** | Apple Silicon | `1,286 MiB` `MTL0` | **`464 MiB`** `MTL0` (`build_s=0.0` cache hit) | **`2.498×`** decode · **`0.361×`** memory · `3.9×–13.5×` learn |
 
 ### 4. Production-Scale Classifier Proof & OOD Counter-Baselines
-- **`Gemma 4 E2B` `10.00%` (`931 MB`) Detector & `i1` Apprentice:** **`99.76%`** agreement on a **`51,066`-document** held-out exam (`99.82%` AI caught @ `0.08%` human FPR); on `4,549` unseen Beemo docs, real labels fixed **`241`** mistakes vs **`36`** for flipped labels.
-- **`Qwen3.5-0.8B` `200 MB` `combo` Apprentice vs Small-Model SFT/KD:** Improved **`8/25 → 25/25`** on unseen AI passages (`0/25` human FPR) at **`6.6 × 10¹⁶` FLOPs** replay (`3.2×` cheaper than Hinton KD on `ModernBERT-base`). On the exact same `14,991`-doc splits, labels-only SFT on `ModernBERT-base` (`159 MB`) and `LFM2.5-230M` (`244 MB`) collapsed OOD (**`75.21%`** and **`78.44%`** human false-positive rate on Beemo).
+- **`Gemma 4 E2B` `10.00%` (`931 MB`) Detector & Switch Apprentice:** **`99.76%`** agreement on a **`51,066`-document** held-out exam (`99.82%` AI caught @ `0.08%` human FPR); on `4,549` unseen Beemo docs, real labels fixed **`241`** mistakes vs **`36`** for flipped labels.
+- **`Qwen3.5-0.8B` `200 MB` multi-pass Apprentice vs Small-Model SFT/KD:** Improved **`8/25 → 25/25`** on unseen AI passages (`0/25` human FPR) at **`6.6 × 10¹⁶` FLOPs** replay (`3.2×` cheaper than Hinton KD on `ModernBERT-base`). On the exact same `14,991`-doc splits, labels-only SFT on `ModernBERT-base` (`159 MB`) and `LFM2.5-230M` (`244 MB`) collapsed OOD (**`75.21%`** and **`78.44%`** human false-positive rate on Beemo).
 
 ---
 
-## Features & Ease-of-Life Options
+## CLI & Capabilities
 
-| Area | Command | Capabilities | Ease-of-Life Options |
+| Area | Command | Capabilities | Key Options |
 | :--- | :--- | :--- | :--- |
-| **Toolchain Bootstrap** | [`scripts/build_toolchain.sh`](scripts/build_toolchain.sh) | Builds pinned `llama.cpp @ a01dff9` (single unified patch for `Qwen3` / `Qwen3.5` / `Gemma 4`) + `traj-kl`, `logodds`, `tokdocs` | `--backend auto\|cuda\|metal\|cpu`, auto single-arch `compute_cap` via `nvidia-smi`, auto `g++-12` host compiler, `--with-fla`, `--dry-run` |
+| **Toolchain Bootstrap** | [`scripts/build_toolchain.sh`](scripts/build_toolchain.sh) | Builds pinned `llama.cpp @ a01dff9` (single unified patch for `Qwen3` / `Qwen3.5` / `Gemma 4`) + `traj-kl`, `logodds`, `tokdocs` | `--backend auto\|cuda\|metal\|cpu`, auto single-arch CUDA detection, `--with-fla`, `--dry-run` |
 | **Environment Preflight** | `chantless doctor` | JSON health check for `a01dff9` binaries, C++ scorers, CUDA/Metal + `fla`, Python deps, and `/dev/shm` + disk | `--config`, `--model-gb 54` (`27B` scratch/tier-cache layout preview), `--require-cuda`, `--require-classifier` |
-| **Declarative Configs** | `chantless validate` / `schema` | Strict Pydantic v2 validation (`extra="forbid"`) + JSON Schema export | JSON or YAML, file-relative `extends:`, repeatable `--set key.path=val` overrides, `22` opt-in ggml tiers |
+| **Declarative Configs** | `chantless validate` / `schema` | Strict Pydantic v2 validation + JSON Schema export | JSON or YAML, file-relative `extends:`, repeatable `--set key.path=val`, `22` opt-in ggml tiers |
 | **Dry-Run Planner** | `chantless plan` | Estimates moves, probes, episodes, wall-clock, and spend before compute | `--rates custom.json`, `--source local.gguf`, `--set` overrides |
-| **Specialist Extraction** | `chantless extract` | Frozen-base extraction (`prepare → proxy → sanity → search → freeze → exam → report`) with one-shot solver, Wanda widths, Rule-P vocab trim, lossless dead shared-KV drop, and `SplitGuard` | Phase resume (`--upto`, `--reset`), `--out-mask`, `--out`, decoupled `/dev/shm` vs NVMe (`1.5×`/`3.5×`), auto worker clamp, single-pass minimal `SpliceProbeBuilder` tier cache |
-| **Zero-Byte Apprentice** | `chantless learn` | Adapts built specialists from `<=25` mistakes at `+0 B` via `up_row_zero` switches + `replay_h0` token-KL & A-GEM + `4` strict controls | `PrefixCache` + `frozen_bf16` + `stream_prefix="auto"` + `free_prefix` + CUDA `pin_memory`, deterministic `judge_slots=1` + `--no-cache-prompt` |
-| **Multi-Cell Sweeps** | `chantless sweep` | Declarative matrix runner across models, tasks, and budgets | `--launcher local\|ssh\|modal\|colab`, `--dry-run`, durable `done.json` auto-resume, `--stop-on-failure` |
+| **Specialist Extraction** | `chantless extract` | Frozen-base extraction (`prepare → proxy → sanity → search → freeze → exam → report`) with one-shot solver, Wanda widths, Rule-P vocab trim, lossless dead shared-KV drop, and `SplitGuard` | `--upto`, `--reset`, `--out-mask`, `--out`, decoupled `/dev/shm` vs NVMe (`1.5×`/`3.5×`), auto worker clamp, tier cache |
+| **Zero-Byte Apprentice** | `chantless learn` | Adapts built specialists from `<=25` mistakes at `+0 B` via `up_row_zero` switches + full-vocab token-KL & A-GEM + `4` strict controls | Prefix activation cache, `stream_prefix="auto"`, CUDA pinned memory, deterministic `judge_slots=1` |
+| **Multi-Cell Sweeps** | `chantless sweep` | Declarative matrix runner across models, tasks, and budgets | `--launcher local\|ssh\|modal\|colab`, `--dry-run`, auto-resume, `--stop-on-failure` |
 | **Mask Algebra & Import** | `chantless mask <cmd>` | Git-like operations on `chantless.mask/v3` across all `22` native `llama-quantize` ggml types (`F32..IQ1_S`) | `inspect`, `diff`, `fork`, `merge` (`apprentice` / `specialist`), `pull` (`hf://`/`https://` SHA256-pinned), `import` (`--from-gguf`, `--from-tensor-types`, `--from-spec`) |
 | **Deterministic Build** | `chantless build` | SHA256-exact standalone GGUF compilation from stock BF16 + mask | Auto sharded `llama-quantize` (`--shards`, `--threads`), `--hf-dir` shared-KV resolution, `--imatrix` isolation |
-| **Serve & Telemetry** | `chantless serve` / `bench` | OpenAI-compatible serving & benchmarking with structured JSON receipts | Direct `--model` or `--source + --mask` (SHA256 build cache), `--compare`, live `nvidia-smi` per-PID VRAM, `-lv 4` `CUDA0`/`MTL0` buffers, `/metrics`, zero-orphan `SIGTERM` |
+| **Serve & Telemetry** | `chantless serve` / `bench` | OpenAI-compatible serving & benchmarking with structured JSON receipts | Direct `--model` or `--source + --mask` (SHA256 build cache), `--compare`, live per-PID VRAM, `/metrics`, clean `SIGTERM` |
 
 ---
 
-## Documentation & Hygiene
+## Documentation
 
 - [Verified Winner Masks & SHA256 Receipts](masks/README.md) · [Engine Reference](mvp/README.md) · [Architecture & Design Notes](explainer/design-notes.md)
 - Example configs: [extract-example.yaml](mvp/configs/extract-example.yaml) · [learn-example.yaml](mvp/configs/learn-example.yaml) · [local-smoke.json](mvp/configs/local-smoke.json)
-- Only source code, the single unified `a01dff9` patch, tests, docs, and verified `chantless.mask/v3` JSON winners are tracked in Git. Weights, credentials, local scratch, and full historical research archives live outside Git (private archive: `tokenbender/chantless-detect-local-archive:repo-curation-20261120/`).

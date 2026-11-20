@@ -1,14 +1,14 @@
-"""One-Budget Anneal: the source trains whole, on the shipped 4-bit grids, while cuts arrive in steps (decision: forward order).
+"""One-Budget Anneal: staged quantization-aware training with progressive structural pruning.
 
-`setup` makes the fixed files once and `sweep`/`pick` choose the rate. An arm then walks its schedule. Each stage starts from the
-previous real file with float latents behind its grids, so the student equals the file. A `cut` or `rung` stage switches off what
-it will remove but keeps it in the student, trains, removes it, and builds a real file; `finish` trains on the last file's frozen
-grids and writes levels, so the shipped bytes are the ones trained on. Every stage checkpoints locally and to private ModelScope,
-and an arm resumes at the stage boundary after a pod death. Real built files are the only things judged, always at cal-judge cutoffs.
+`setup` builds shared fixed inputs once and `sweep`/`pick` choose the learning rate. Each arm then walks its
+schedule starting from the previous built GGUF with float latents behind its quantization grids. A `cut` or
+`rung` stage masks out target widths/blocks during training, prunes them, and builds a new standalone GGUF;
+`finish` updates quantization levels in place on the final byte size. Stages checkpoint locally and optionally
+to remote storage for crash recovery. Built GGUFs are evaluated at their calibrated cutoff.
 
-Calibration humans are split by hash: cal-train alone feeds tails, replay and the training cutoff, and cal-judge alone sets judged
-cutoffs. Sides split by prompt for Beemo. Source-wrong documents teach from side 0 only, and side 0 also holds out a probe fold so
-that auction prices never read a document that was trained on. Document tokens and text stay in `common/` and are never uploaded.
+Calibration humans split by hash (`cal-train` for tails/replay/training cutoff; `cal-judge` for evaluation).
+Multi-variant prompts stay on one side of the split, feedback examples train from side 0 only with a held-out
+probe fold, and raw tokens/text under `common/` stay local.
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def caught_at(s: np.ndarray, y: np.ndarray, rate: float) -> float:
 
 
 def tokenise(c: dict, texts: list[str], gguf: str, path: str | Path) -> list[np.ndarray]:
-    """Chat prompts through tokdocs at `gguf`'s vocabulary into a TRJ1 file. Past 4,300 tokens the middle goes, as in the Beemo readout."""
+    """Chat prompts through tokdocs at `gguf`'s vocabulary into a TRJ1 file, keeping head+tail above 4,300 tokens."""
     tmp = Path(f"{path}.bin")
     with open(tmp, "wb") as f:
         f.write(struct.pack("<I", len(texts)))
@@ -102,7 +102,7 @@ def tokenise(c: dict, texts: list[str], gguf: str, path: str | Path) -> list[np.
 
 
 def setup(cfg: dict, log=print) -> None:
-    """The fixed inputs of every arm: S80, U331 and F's start, the splits, S80's real scores and anchors, the lesson, replay, probes, panel and judge file."""
+    """Build shared baseline artifacts, splits, calibration anchors, lesson, replay, probes, panel, and judge set."""
     c, tc = cfg["anneal"], Toolchain.from_config(cfg["toolchain"])
     com, pair, ncal, groups = Path(c["root"]) / "common", tuple(c["pair"]), c["n_calibration"], groups_of(c)
     if (com / "spec.json").exists():
@@ -231,7 +231,7 @@ def setup(cfg: dict, log=print) -> None:
     _dump(com / "judge.json", parts)
     key = {("f", r["index"]): S["feedback"][r["index"]] for r in fb} | {("u", i): S["universe"][i] for i in range(len(uni))}
     np.save(com / "cache" / f"judge-{learn.sha256(s80)[:16]}.npy", np.concatenate([p[cj], S["exam"], S["fresh"], S["universe"][side1], [key[k] for k in ids], S["feedback"]]))
-    for m in (u331, uf, c["q4cut"]):    # eight arms must not each score the same three files
+    for m in (u331, uf, c["q4cut"]):    # pre-score shared baseline models once
         learn.real_panel(m, pc, scorer)
     spec = dict(cut=cut, med=med, tau=tau, cal_train=len(train), cal_judge=len(cj), universe=len(uni), side1=len(side1), probe=len(probe), lesson_rows=len(ls), lesson_docs=len(docs), shares=count,
                 replay=len(picks), panel=len(idx), human_tail_weight=1.0, human_rest_weight=float(w.max()), s80_cal_train_rate=float((p[train] < cut).mean()))
@@ -240,8 +240,7 @@ def setup(cfg: dict, log=print) -> None:
 
 
 class Uploader:
-    """Checkpoints go up on one background thread, in order, so a slow upload never holds a GPU. A batch stops at its first failure,
-    which leaves the remote state naming the last checkpoint that is whole. Only what this class allows can leave the pod."""
+    """Ordered background checkpoint uploader that excludes local dataset artifacts in `common/`."""
 
     def __init__(self, c: dict, arm: str, log):
         os.environ.setdefault("MODELSCOPE_ENDPOINT", c["modelscope_endpoint"])
@@ -278,7 +277,7 @@ class Uploader:
 
 
 def fetch(c: dict, arm: str, name: str, dst: Path) -> bool:
-    """One checkpoint file from ModelScope, into `dst`. False when the repo has no such file."""
+    """Fetch a checkpoint file from remote storage into `dst`, returning False if absent."""
     from modelscope.hub.errors import NotExistError
     from modelscope.hub.file_download import model_file_download
     os.environ.setdefault("MODELSCOPE_ENDPOINT", c["modelscope_endpoint"])
@@ -287,7 +286,7 @@ def fetch(c: dict, arm: str, name: str, dst: Path) -> bool:
     try:
         p = model_file_download(c["repo"], f"{c['repo_dir']}/{arm}/{name}", cache_dir=str(d))
     except Exception as e:
-        if isinstance(e, NotExistError) or "404" in str(e):    # the hub answers 404 for a file that was never uploaded
+        if isinstance(e, NotExistError) or "404" in str(e):
             return False
         raise
     shutil.move(p, dst)
@@ -402,7 +401,7 @@ class Arm:
         ldocs = learn.read_trj(str(self.com / "lesson.trj"))
         flip = {"human": "ai", "ai": "human"}
         self.lesson = [dict(r, tokens=ldocs[r["doc"]], label=flip[r["label"]] if self.a.get("twin") and r["flip"] else r["label"]) for r in json.loads((self.com / "lesson.json").read_text())]
-        if self.a.get("lesson"):    # teach only these groups; what is left out stays protected by the hold
+        if self.a.get("lesson"):    # filter lesson rows to the configured group
             self.lesson = [r for r in self.lesson if r["group"] == self.a["lesson"]]
         self.replay, rp = learn.read_trj(str(self.com / "replay.trj")), json.loads((self.com / "replay.json").read_text())
         self.strata, self.anchor = rp["strata"], dict(base=rp["base"], cut=self.spec["cut"], med=self.spec["med"])
@@ -443,7 +442,7 @@ class Arm:
         st["keep"] = {int(k): np.array(v) for k, v in st["keep"].items()}
         for f in (st["latents"], st["gates"], st["file"]):
             if f and not Path(f).exists():
-                assert fetch(self.c, self.name, Path(f).name, Path(f)), f"{f} is on neither the pod nor ModelScope"
+                assert fetch(self.c, self.name, Path(f).name, Path(f)), f"checkpoint file {f} not found locally or in remote storage"
         self.lat = load_file(st["latents"]) if st["latents"] else None
         self.gsave = dict(ema={int(k): v for k, v in load_file(st["gates"]).items()}, res=st["res"]) if st["gates"] else {}
         if self.lat is None and st["stage"] < len(self.stages):
@@ -503,7 +502,7 @@ class Arm:
         return learn._train(model, params, self.lesson, self.replay, self.pair, 0.0, j, self.log, self.device, self.amp, self.strata, lr or self.st["lr"], anchor=self.anchor, on_step=g.on_step if g.theta else None)
 
     def h0(self) -> None:
-        """F-KL's frozen teacher states, computed by the one arm that needs them, on its own GPU."""
+        """Compute and cache frozen teacher hidden states when hold_kind == 'klvec'."""
         p = self.com / "h0.npy"
         if self.j.get("hold_kind") != "klvec":
             return
@@ -523,7 +522,7 @@ class Arm:
         self.anchor["h0"] = np.load(p)
 
     def scheduled(self, frac: float) -> tuple[dict, dict]:
-        """`frac` of the way from full width to q4cut50's structure: least Fisher neurons first, mixers in layer order."""
+        """Interpolate `frac` toward the target structure in structure.json (lowest-Fisher neurons first, mixers in layer order)."""
         s = json.loads((self.com / "structure.json").read_text())
         fisher = np.fromfile(self.c["fisher"], dtype=np.float32).reshape(24, FULL)
         st, keep, tiers = self.st, {}, dict(self.st["tiers"])
@@ -544,7 +543,7 @@ class Arm:
         return keep, tiers
 
     def probes(self, i: int) -> tuple[list[np.ndarray], np.ndarray]:
-        """Unfiltered and training-disjoint, nearest the cutoff by S80, a new draw each rung."""
+        """Sample training-disjoint near-cutoff probes for stage `i`."""
         docs, p = learn.read_trj(str(self.com / "probe.trj")), json.loads((self.com / "probe.json").read_text())
         y, s, rng = np.array(p["ai"]), np.abs(np.array(p["s80"]) - self.spec["cut"]), np.random.default_rng(self.seed + i)
         n, idx = self.c["probe_n"], []
@@ -705,7 +704,7 @@ class Arm:
                 on = np.isin(st["keep"][il], k)
                 if il in g.theta:
                     g.k[il] = int(on.sum())
-                    g.theta[il].data = torch.as_tensor(np.where(on, .5, -.5), dtype=torch.float32, device=self.device)    # some 35 steps from a swap at the gate rate
+                    g.theta[il].data = torch.as_tensor(np.where(on, .5, -.5), dtype=torch.float32, device=self.device)    # initial gate margin +/-0.5
                     g.prev[il] = g.theta[il].detach().clone()
                 elif not on.all():
                     g.fixed[il] = torch.as_tensor(on, dtype=torch.float32, device=self.device)
@@ -768,7 +767,7 @@ class Arm:
             st["fails"] += 1
             if st["fails"] >= 2:
                 st["floor"] = os.path.getsize(st["file"])
-                self.log(f"two failed rungs: the honest size floor is {st['floor'] / shape.MB:.2f} MB")
+                self.log(f"two failed rungs; stopping at size floor {st['floor'] / shape.MB:.2f} MB")
                 st["stage"] = next(k for k, x in enumerate(self.stages) if x["kind"] == "finish")
                 st["fails"] = 0
             self.write()
@@ -793,7 +792,7 @@ class Arm:
 
 
 def sweep(cfg: dict, lr: float, gpu: str, log=print) -> None:
-    """Twenty steps at one rate from source latents at 331 MB. The score change is measured by the student on 64 fixed documents."""
+    """Run a short LR sweep from the initial scheduled checkpoint and record per-step score RMS."""
     arm = Arm(cfg, f"sweep-{lr:g}", gpu, log)
     arm.a = dict(order="scheduled")
     arm.st = arm.start()
@@ -824,7 +823,7 @@ def pick(cfg: dict, log=print) -> None:
 
 
 def judge(cfg: dict, name: str, model: str, gpu: str, log=print, st: dict | None = None) -> dict:
-    """A real file on unseen Beemo, the fresh articles, unfiltered side 1 and the lesson, at its own cal-judge cutoff. One JSON per file."""
+    """Evaluate a built GGUF across exam, fresh, side-1, and held-out splits at its own cal-judge cutoff."""
     c = cfg["anneal"]
     root, com, pair = Path(c["root"]), Path(c["root"]) / "common", tuple(c["pair"])
     parts, spec = json.loads((com / "judge.json").read_text()), json.loads((com / "spec.json").read_text())
@@ -875,7 +874,7 @@ def judge(cfg: dict, name: str, model: str, gpu: str, log=print, st: dict | None
                           pairs_right=sum(x > 0 for x in gaps), n_pairs=len(gaps), mean_gap=float(np.mean(gaps))),
                lesson_loss=dict(all=float(np.mean([x for q in by.values() for x in q])), by_share={k: float(np.mean(x)) for k, x in by.items()}),
                held=dict(pairs=len(hg), pairs_right=sum(x > 0 for x in hg), mean_gap=float(np.mean(hg)) if hg else None),
-               claim="development readout on used sets; not a Chantless exam result")
+               split="dev_select")
     if st:
         out.update(lr=st["lr"], history=st["history"], floor=st.get("floor"), widths={str(k): len(v) for k, v in st["keep"].items()}, dropped=sorted(g for g, t in st["tiers"].items() if t == DROP))
     (root / name).mkdir(exist_ok=True)
@@ -896,7 +895,7 @@ def boots(exam: list[dict], n: int, seed: int) -> list[np.ndarray]:
 
 
 def report(cfg: dict, log=print) -> dict:
-    """The rule fixed in advance, read from the arms' real files. G(x) is x minus its twin. Writes report.json."""
+    """Compare built arm results under the decision rule, compute G(x) vs twin deltas, and write report.json."""
     c = cfg["anneal"]
     root, com = Path(c["root"]), Path(c["root"]) / "common"
     parts, exam = json.loads((com / "judge.json").read_text()), json.loads((com / "exam.json").read_text())
@@ -911,26 +910,26 @@ def report(cfg: dict, log=print) -> dict:
         if x in res and f"{x}-twin" in res:
             out[f"G({x})"] = diff(x, f"{x}-twin")
             if res[x]["lesson_loss"]["all"] >= res[f"{x}-twin"]["lesson_loss"]["all"]:
-                rule.append(f"{x}: under-trained, real lesson loss is not below its twin's; no conclusion")
+                rule.append(f"{x}: lesson loss did not drop below twin baseline")
     if "F" in res and "P" in res:
         out["F-P"] = diff("F", "P")
         if out["F-P"]["est"] <= 0:
-            rule.append("F does not exceed P: order adds nothing here, stop")
+            rule.append("F <= P on target gain")
     if "G(F)" in out and "G(P)" in out:
         d = C["F"] - C["F-twin"] - C["P"] + C["P-twin"]
         out["G(F)-G(P)"] = dict(est=out["G(F)"]["est"] - out["G(P)"]["est"], lo=float(np.quantile(d, .025)), hi=float(np.quantile(d, .975)))
         if out["G(F)-G(P)"]["est"] < .01 or out["G(F)-G(P)"]["lo"] <= 0:
-            rule.append("G(F) - G(P) is under 1 point or its lower bound is at or below 0: stop")
+            rule.append("G(F) - G(P) below 1 pt or CI <= 0")
     rows = [k for k in c["patched_rows"] if k in res]
     rank = [h["ranking"] for h in res.get("L", {}).get("history", []) if "ranking" in h]
     if rank and rank[0]["lower"] > c["ranking_bound"]:
-        rule.append(f"ranking lower bound {rank[0]['lower']:.3f}: learning does not steer structure, drop the auction and keep F's fixed cuts")
+        rule.append(f"ranking lower bound {rank[0]['lower']:.3f}: auction gain below threshold; fixed schedule preferred")
     if "L" in res and rows:
         best = max(rows, key=lambda k: point[k])
         out["L-best_row"] = dict(diff("L", best), row=best)
         u = res["L"]["unfiltered"]
         ok = out["L-best_row"]["lo"] > 0 and u["human_flagged_wo"] <= .015 and u["gate_pass"]
-        rule.append(f"full ladder {'allowed' if ok else 'not allowed'}: L against {best} {out['L-best_row']}, WO humans {u['human_flagged_wo']:.4f}, unfiltered gate {u['gate_pass']}")
+        rule.append(f"full ladder {'eligible' if ok else 'ineligible'}: L vs {best} {out['L-best_row']}, WO humans {u['human_flagged_wo']:.4f}, unfiltered gate {u['gate_pass']}")
     out["rule"] = rule
     _dump(root / "report.json", out)
     log(f"REPORT {json.dumps(out)}")

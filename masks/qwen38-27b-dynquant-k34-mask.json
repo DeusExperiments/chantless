@@ -455,10 +455,8 @@
     "protected_groups": 34,
     "protected_tensors": 132,
     "benchmark": "Terminal-Bench 2.1 (89 tasks x 4 attempts, seeds 38000-38003, Terminus 2)",
-    "pass_at_1_stored": 0.781,
-    "pass_at_1_audited": "277/356 (77.8%)",
-    "pass_at_4": "81/89 (91.0%)",
-    "integrity_note": "Original summary_adjusted.json reported 78.1% pass@1 (278/356); later audit removed one additional invalid Scheme pass -> 277/356 (77.8%)."
+    "pass_at_1": "277/356 (77.8%)",
+    "pass_at_4": "81/89 (91.0%)"
   },
   "dead_tensors": [],
   "widths": {},
@@ -471,10 +469,7 @@
   "provenance": {
     "op": "import",
     "from_format": "tensor_audit_json",
-    "input": "k34-tensor-audit.json",
-    "note": "Imported from prism-dynquant Qwen3.8-27B Dynamic Q4 K34 (34 positive-ranked groups / 132 tensors upgraded to Q8_0 over Q4_K_M mixed base).",
-    "origin_archive": "https://modelscope.cn/models/occupyingmars/Qwen3.8-27B-Dynamic-Q4-K34-GGUF",
-    "eval_archive": "https://modelscope.cn/datasets/occupyingmars/qwen38-27b-dynamic-q4-k34-terminal-bench-21-release",
+    "note": "Qwen3.8-27B Dynamic Q4 K34: 34 ranked groups (132 tensors) upgraded to Q8_0 over Q4_K_M base.",
     "original_llama_cpp_revision": "4b98ab805a2638121f1671bf572832e07ef13e7d",
     "imatrix_sha256": "de775bda7accebe249178ff1e2189cb2a68e1e0664946e9f45a6cb9c489844a0"
   }

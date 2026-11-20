@@ -8,7 +8,7 @@ import urllib.request
 
 
 class InfraError(RuntimeError):
-    """Server/transport failure. Retried; never counted as a task failure (decision S12)."""
+    """Server or transport failure; retried and excluded from task failure counts."""
 
 
 class ChatClient:

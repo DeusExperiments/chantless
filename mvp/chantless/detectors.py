@@ -1,4 +1,4 @@
-"""Complaint-derived behavioral detectors (spec §7, manual §6.2 thresholds as defaults).
+"""Behavioral failure detectors for agent episodes (doom loops, malformed tool calls, premature stops, token corruption).
 
 Every detector is part of episode success; each is also reported separately per side.
 """

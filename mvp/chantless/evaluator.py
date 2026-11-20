@@ -1,7 +1,7 @@
 """Run episodes for one model across all GPUs (independent evaluations in parallel; results identical to serial).
 
 Infra errors are retried on a fresh request and, if they persist, excluded from statistics and
-logged; they never count as task failures (decision S12).
+logged; they never count as task failures.
 
 A classifier environment (env.classifier true) runs no episodes: each distinct task is scored once per
 model by the batch scorer and judged at that model's own rule, computed from its calibration-split scores.

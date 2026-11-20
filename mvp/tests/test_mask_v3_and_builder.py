@@ -1,5 +1,5 @@
-"""Tests for Issue #3: unified `chantless.mask/v3` thin mask, architecture adapter, Wanda width cuts,
-merge-closed Rule-P vocabulary trim, exact byte model, and golden reproduction of Qwen `f200` and Gemma `mask10`.
+"""Tests for `chantless.mask/v3`, architecture adapters, Wanda width cuts, Rule-P vocab trim,
+`oneshot.ByteModel`, `FidelitySurrogate`, sharded quantization, and `logodds.cpp`.
 """
 from __future__ import annotations
 
@@ -93,19 +93,9 @@ def test_gemma4_adapter_matches_golden_groups_and_dead():
     assert all(real_groups[f"blk.{i}.attn"]["kv"] for i in range(15))
     assert all(not real_groups[f"blk.{i}.attn"]["kv"] for i in range(15, 35))
 
-    g_receipt = ROOT / ".local/gemma4/mask10/receipts/groups.json"
-    d_receipt = ROOT / ".local/gemma4/mask10/receipts/dead.json"
-    if g_receipt.exists() and d_receipt.exists():
-        golden_groups = json.loads(g_receipt.read_text())
-        golden_dead = json.loads(d_receipt.read_text())
-        assert dead == golden_dead
-        assert set(real_groups) == set(golden_groups)
-        for g in golden_groups:
-            assert sorted(real_groups[g]["quantizable"]) == sorted(golden_groups[g]["quantizable"])
-            assert sorted(real_groups[g]["fixed"]) == sorted(golden_groups[g]["fixed"])
-            assert real_groups[g]["droppable"] == golden_groups[g]["droppable"]
-            assert real_groups[g]["kv"] == golden_groups[g]["kv"]
-            assert real_groups[g]["imatrix_ok"] == golden_groups[g]["imatrix_ok"]
+    shipped = json.loads((ROOT / "masks/gemma4-e2b-clsbench-mask.json").read_text())
+    assert dead == shipped["dead_tensors"]
+    assert set(real_groups) == set(shipped["groups"])
 
 
 # ------------------------------------------------------------------ 2. Wanda order, variable width, vocab trim & ByteModel
@@ -203,94 +193,94 @@ def test_wanda_variable_width_vocab_trim_and_exact_bytemodel(tmp_path: Path, ff_
     assert bm(m) == final_gguf.stat().st_size
 
 
-# ------------------------------------------------------------------ 3. Thin-mask v3 packing & real receipt sizes
-def test_thin_mask_v3_roundtrip_and_golden_receipt_sizes():
-    g_dir = ROOT / ".local/gemma4/mask10/receipts"
-    q_spec = ROOT / ".local/detect/oneshot-20261104/spec_f200.json"
-    if not g_dir.exists() or not q_spec.exists():
-        pytest.skip("local receipts not present")
+# ------------------------------------------------------------------ 3. Thin-mask v3 round-trip across all shipped masks
+def test_thin_mask_v3_roundtrip_and_shipped_masks():
+    shipped_paths = sorted((ROOT / "masks").glob("*-mask.json"))
+    assert len(shipped_paths) == 12
 
-    # Pack real Gemma 4 E2B 10% + Apprentice switch mask into a single `chantless.mask/v3` JSON
-    groups = json.loads((g_dir / "groups.json").read_text())
-    dead = json.loads((g_dir / "dead.json").read_text())
-    spec = json.loads((g_dir / "spec_g10.json").read_text())
-    order = json.loads((g_dir / "order.json").read_text())
-    keep_80k = np.load(g_dir / "keep-80000.npy")
+    for path in shipped_paths:
+        m = mk.load(path)
+        assert m["schema"] == mk.SCHEMA, path.name
+        assert (m.get("weights") or {}).get("lineage") == [], path.name
+        synthetic_groups = {
+            g: {
+                "droppable": True,
+                "imatrix_ok": True,
+                "quantizable": [f"{g}.weight"],
+                "fixed": [],
+                "kv": g.endswith(".attn"),
+            }
+            for g in m["groups"]
+        }
+        mk.validate(m, synthetic_groups, ladder=mk.ALL_TIERS)
+        summary = mk.inspect_mask(path)
+        assert summary["groups_total"] == len(m["groups"])
+        if m.get("vocab_keep") is not None:
+            assert len(mk.unpack_bitmap(m["vocab_keep"])) > 0
+        for spec in (m.get("widths") or {}).values():
+            assert len(mk.unpack_bitmap(spec)) > 0
 
-    gm = mk.new_mask(groups, "BF16", {"repo": "gemma4-e2b-detector", "revision": "local", "gguf_sha256": "src"})
-    for g, t in spec["tiers"].items():
-        gm["groups"][g]["tier"] = t
-    gm["dead_tensors"] = dead
-    for k, w in spec["widths"].items():
-        full_w = len(order[k])
-        gm["widths"][k] = mk.pack_bitmap(np.sort(np.asarray(order[k][:w], dtype=np.int64)), full_w)
-    gm["vocab_keep"] = mk.pack_bitmap(keep_80k, 262144)
+        encoded = json.dumps(m, separators=(",", ":")).encode("utf-8")
+        assert len(encoded) < 80_000, f"{path.name} exceeded thin-mask target: {len(encoded)} B"
+        reloaded = json.loads(encoded.decode("utf-8"))
+        assert builder.mask_key(m) == builder.mask_key(reloaded)
 
-    sw_path = ROOT / ".local/gemma4/apprentice/receipts/i1.gguf.switches.json"
-    if sw_path.exists():
-        sw = json.loads(sw_path.read_text())
-        for k, dead_idx in sw.items():
-            full_w = int(spec["widths"].get(k, len(order[k])))
-            gm["apprentice"]["switches"][k] = mk.pack_bitmap(dead_idx, full_w)
-
-    mk.validate(gm, groups)
-    encoded = json.dumps(gm, separators=(",", ":")).encode("utf-8")
-    assert len(encoded) < 80_000, f"Gemma thin mask exceeded ~78 KB target: {len(encoded)} B"
-    reloaded = json.loads(encoded.decode("utf-8"))
-    assert np.array_equal(mk.unpack_bitmap(reloaded["vocab_keep"]), keep_80k)
-    for k, w in spec["widths"].items():
-        expected = np.sort(np.asarray(order[k][:w], dtype=np.int64))
-        assert np.array_equal(mk.unpack_bitmap(reloaded["widths"][k]), expected)
-
-    # Also verify v2 mask_key stability for existing cached Qwen sanity probe filenames
-    q_groups = json.loads((ROOT / ".local/detect/cls-run/detect-cls-400mb-001/sanity/sanity_mask.json").read_text())["groups"]
-    v2 = {"schema": "chantless.mask/v2", "groups": {g: {"tier": "BF16"} for g in q_groups}, "tensors": {}, "weights": {"lineage": []}}
+    # Verify v2 -> v3 upgrade preserves `mask_key` when no v3 cuts are active
+    sample_groups = list(mk.load(shipped_paths[0])["groups"])
+    v2 = {"schema": "chantless.mask/v2", "groups": {g: {"tier": "BF16"} for g in sample_groups}, "tensors": {}, "weights": {"lineage": []}}
     v3_plain = mk.upgrade_v2(v2)
     assert builder.mask_key(v2) == builder.mask_key(v3_plain)
 
 
-# ------------------------------------------------------------------ 4. Golden Qwen f200 & Gemma mask10 verification
-def test_reproduce_qwen_f200_and_gemma_mask10_from_saved_receipts():
-    headers_p = ROOT / ".local/detect/neuron/solver/inputs/headers.json"
-    q_groups_p = ROOT / ".local/detect/neuron/solver/inputs/groups.json"
-    cls_run = ROOT / ".local/detect/cls-run/detect-cls-400mb-001"
-    os_dir = ROOT / ".local/detect/oneshot-20261104"
-    g_dir = ROOT / ".local/gemma4/mask10/receipts"
-    if not (headers_p.exists() and cls_run.exists() and os_dir.exists() and g_dir.exists()):
-        pytest.skip("local Qwen/Gemma receipts not present")
+# ------------------------------------------------------------------ 4. FidelitySurrogate + oneshot solver + ByteModel
+def test_oneshot_fidelity_solver_and_bytemodel():
+    n_layer, n_embd, n_ff, v_size = 4, 256, 512, 1024
+    inv = [
+        {"name": "token_embd.weight", "type": "BF16", "shape": [n_embd, v_size], "n_elements": n_embd * v_size, "n_bytes": 2 * n_embd * v_size},
+        {"name": "output_norm.weight", "type": "F32", "shape": [n_embd], "n_elements": n_embd, "n_bytes": 4 * n_embd},
+    ]
+    for il in range(n_layer):
+        p = f"blk.{il}."
+        for suf, sh in (
+            ("attn_norm.weight", [n_embd]), ("attn_q.weight", [n_embd, n_embd]),
+            ("attn_k.weight", [n_embd, n_embd]), ("attn_v.weight", [n_embd, n_embd]),
+            ("attn_output.weight", [n_embd, n_embd]), ("ffn_norm.weight", [n_embd]),
+            ("ffn_gate.weight", [n_embd, n_ff]), ("ffn_up.weight", [n_embd, n_ff]),
+            ("ffn_down.weight", [n_ff, n_embd]),
+        ):
+            nel = int(np.prod(sh))
+            nb = 4 * nel if len(sh) == 1 else 2 * nel
+            inv.append({"name": p + suf, "type": "F32" if len(sh) == 1 else "BF16", "shape": sh, "n_elements": nel, "n_bytes": nb})
 
-    # A. Verify unified ByteModel matches q4cut50 (200,296,000 B) and f200 (200,240,128 B) to 0 bytes
-    type_name = {0: "F32", 1: "F16", 8: "Q8_0", 12: "Q4_K", 19: "IQ1_S", 30: "BF16"}
-    hdr = json.loads(headers_p.read_text())
-    q_groups = json.loads(q_groups_p.read_text())
-    src_tensors = [{"name": n, "shape": d, "type": type_name[t]} for n, d, t, _ in hdr["source"]["tensors"]]
-    bm = oneshot.ByteModel(None, q_groups, tensors=src_tensors, kv_end=hdr["cls400"]["kv_end"], ff_is_array=False, n_layer=24)
-    bm.set_vocab_trim(np.arange(79999, dtype=np.int64), kv_cut=8137472)
+    groups, _ = gguf_ops._build_groups_and_dead(inv, kvs={"general.architecture": "qwen35"})
+    for g, info in groups.items():
+        if not g.startswith("_"):
+            info["imatrix_ok"] = True
+    bm = oneshot.ByteModel(None, groups, tensors=inv, kv_end=4096, ff_is_array=False, n_layer=n_layer)
 
-    fin_groups = json.loads((cls_run / "final/mask.json").read_text())["groups"]
-    q4_tiers = {g: ("Q4_K" if v["tier"] == "Q8_0" else v["tier"]) for g, v in fin_groups.items()}
-    q4_widths = {7: 3072, 10: 1024, 11: 1024, 13: 512, 15: 512, 17: 256, 20: 256, 21: 256, 23: 256}
-    assert abs(bm.spec_bytes(q4_tiers, q4_widths) - 200_296_000) <= 32
-
-    # B. Run unified FidelitySurrogate + solve() on saved Qwen solo + width probes -> must reproduce spec_f200.json!
-    src_scores = np.load(cls_run / "proxy/store_task/source.npy")
-    gs = list(json.loads((cls_run / "sanity/sanity_mask.json").read_text())["groups"])
+    gs = [g for g in groups if not g.startswith("_")]
+    n_docs = 64
+    src_scores = np.linspace(-3.0, 3.0, n_docs)
+    # Alternate distortion magnitudes across layers so mixed allocation beats uniform quantization
+    rng = np.random.default_rng(11)
     solo = {}
     for g in gs:
-        for t in ("Q4_K", "IQ1_S", "drop"):
-            m = {"groups": {x: {"tier": "BF16"} for x in gs}, "tensors": {}, "weights": {"lineage": []}}
-            m["groups"][g]["tier"] = t
-            pf = cls_run / f"probe/sanity/p-{builder.mask_key(m)}-task.npy"
-            if pf.exists():
-                solo[(g, t)] = np.load(pf) - src_scores
+        is_sensitive = g in ("token_embd", "blk.0.attn", "blk.1.ffn")
+        for t, scale in (("Q4_K", 0.25), ("IQ1_S", 1.2), ("drop", 2.0)):
+            if t == "drop" and not groups[g]["droppable"]:
+                continue
+            noise = scale * (4.0 if is_sensitive else 0.05) * rng.standard_normal(n_docs)
+            solo[(g, t)] = noise
 
-    wz = np.load(os_dir / "w.npz")
-    width_cuts = {tuple(map(int, k.split("-"))): wz[k] - wz["src"] for k in wz.files if k != "src"}
-    n_ff0 = {il: 3584 for il in range(24)}
+    width_cuts = {
+        (il, 256): (2.5 if il == 1 else 0.03) * rng.standard_normal(n_docs)
+        for il in range(n_layer)
+    }
+    n_ff0 = {il: n_ff for il in range(n_layer)}
     allowed = {g: ["Q8_0", "Q4_K", "IQ1_S"] for g in gs}
-    options = oneshot.build_joint_options(q_groups, allowed, solo, width_cuts, n_ff0, width_step=256, allow_drop=True)
+    options = oneshot.build_joint_options(groups, allowed, solo, width_cuts, n_ff0, width_step=256, allow_drop=True)
 
-    ref_sol = {g: ("Q8_0", 3584 if g.endswith(".ffn") else 0) for g in gs}
+    ref_sol = {g: ("Q8_0", n_ff if g.endswith(".ffn") else 0) for g in gs}
     ref_t, ref_w = oneshot.unpack_solution(ref_sol)
     ref_b = bm.spec_bytes(ref_t, ref_w)
     cost = {}
@@ -300,31 +290,21 @@ def test_reproduce_qwen_f200_and_gemma_mask10_from_saved_receipts():
             s1[g] = o
             cost[(g, o)] = bm.spec_bytes(*oneshot.unpack_solution(s1)) - ref_b
 
+    uniform_q4 = {g: ("Q4_K", n_ff if g.endswith(".ffn") else 0) for g in gs}
+    u4_bytes = bm.spec_bytes(*oneshot.unpack_solution(uniform_q4))
+
     sur = oneshot.FidelitySurrogate([("task", 1.0, lambda x: 0.0, src_scores)], solo, width_cuts=width_cuts, n_ff0=n_ff0)
-    sol = oneshot.solve(sur, options, cost, budget=200_300_000 - 64, header=ref_b, pair_top=60, max_polish=100, log=lambda *_: None)
+    sol = oneshot.solve(sur, options, cost, budget=u4_bytes, header=ref_b, pair_top=32, max_polish=64, log=lambda *_: None)
     tiers_out, widths_out = oneshot.unpack_solution(sol)
-    widths_cut = {str(k): v for k, v in widths_out.items() if v < 3584}
+    built_bytes = bm.spec_bytes(tiers_out, widths_out)
+    assert built_bytes <= u4_bytes
 
-    golden_f200 = json.loads((os_dir / "spec_f200.json").read_text())
-    assert tiers_out == golden_f200["tiers"]
-    assert widths_cut == {str(k): int(v) for k, v in golden_f200["widths"].items()}
-    assert bm.spec_bytes(tiers_out, widths_out) == 200_240_192
-    assert abs(bm.spec_bytes(tiers_out, widths_out) - 200_240_128) <= 64
+    def eval_damage(choice: dict) -> float:
+        x = src_scores + sum(sur.shift(g, opt) for g, opt in choice.items())
+        return sur.damage(x)
 
-    gates_q = json.loads((os_dir / "gates_20261104.json").read_text())
-    assert gates_q["f200"]["lost"] == 47
-    assert gates_q["f200"]["bytes"] == 200_240_128
-
-    # C. Verify Gemma 4 E2B mask10 gate receipt & score reproduction
-    gate_g = json.loads((g_dir / "gate_select.json").read_text())
-    src_cal = np.load(g_dir / "src_cal.npy")
-    cand_cal = np.load(g_dir / "cal.npy")
-    assert float(np.sort(src_cal)[200]) == pytest.approx(gate_g["src_cutoff"])
-    assert float(np.sort(cand_cal)[200]) == pytest.approx(gate_g["cutoff"])
-    assert gate_g["bytes"] == 930_971_136
-    assert gate_g["lost"] == 42
-    assert gate_g["L"] == pytest.approx(-0.0055489498, abs=1e-7)
-    assert gate_g["pass"] is True
+    assert len(set(tiers_out.values())) > 1
+    assert eval_damage(sol) < eval_damage(uniform_q4)
 
 
 # ------------------------------------------------------------------ 5. End-to-end Builder.build(v3) + pick_vocab_k
@@ -413,7 +393,7 @@ def test_builder_v3_end_to_end_deterministic_rebuild_and_auto_vocab(tmp_path: Pa
     assert sha256_file(cli_out) == sha256_file(r1.path)
 
 
-# ------------------------------------------------------------------ 7. Sharded parallel_quantize bit-identity
+# ------------------------------------------------------------------ 6. Sharded parallel_quantize bit-identity
 def test_parallel_quantize_bit_identical_to_single(tmp_path: Path):
     """Verify multi-process `parallel_quantize` produces bit-identical SHA256 to single-process `quantize`."""
     import hashlib
@@ -556,7 +536,7 @@ finally:
     assert hashlib.sha256(out_single.read_bytes()).hexdigest() == hashlib.sha256(out_shard := out_sharded.read_bytes()).hexdigest()
 
 
-# ------------------------------------------------------------------ 8. Packed multi-seq logodds.cpp + BatchScorer
+# ------------------------------------------------------------------ 7. Packed multi-seq logodds.cpp + BatchScorer
 def test_logodds_cpp_packed_multiseq_and_batchscorer(tmp_path: Path):
     """Compile real `mvp/tools/logodds.cpp` against a causal sequence-isolated stub runtime and verify exact parity."""
     import shutil

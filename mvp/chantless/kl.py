@@ -1,8 +1,8 @@
 """KL proxy: render episodes to token sequences with assistant-token targets, then score with traj-kl.
 
-traj-kl (tools/traj-kl/traj-kl.cpp) runs one forward pass per sequence and stores or compares
+traj-kl (mvp/tools/traj-kl.cpp) runs one forward pass per sequence and stores or compares
 full-vocabulary log-probs only at target positions. The reference store is computed once from
-the frozen source and reused for every candidate (reference-logit reuse, pilot-measured).
+the frozen source and reused across candidates.
 """
 from __future__ import annotations
 

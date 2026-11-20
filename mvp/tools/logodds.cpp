@@ -1,13 +1,13 @@
-// logodds: the detector's decision quantity for every trajectory, with multi-sequence FlashAttention batch packing.
+// logodds: two-token log-odds scorer for TRJ1 trajectories, with multi-sequence FlashAttention batch packing.
 //
 // For each target t of each trajectory it prints logit[A] - logit[B] read from the logits at t-1, which is
 // log p(A) - log p(B) for the two answer tokens (exact: the softmax normaliser cancels). Input is one or more
 // traj-kl TRJ1 files; --shard i/n scores trajectories i, i+n, i+2n, ... so several processes can split a file.
 // When --n-seq > 1, trajectories fitting within --ubatch are length-sorted and greedily packed into shared
-// microbatches with distinct seq_id slots so FlashAttention isolates causal masks while saturating Tensor Cores.
+// microbatches with distinct seq_id slots so FlashAttention isolates causal masks in one decode call.
 //
 // Usage:
-//   logodds -m model.gguf --traj traj.bin --pair 24509,2075 --out out.tsv
+//   logodds -m model.gguf --traj traj.bin --pair TOK_A,TOK_B --out out.tsv
 //           [--traj traj2.bin --out out2.tsv [--pair ...]]
 //           [--shard 0/1] [--ubatch 4096] [--n-seq 16]
 // Output: one line per target in ascending trajectory order, "<traj index>\t<target index>\t<log-odds>".

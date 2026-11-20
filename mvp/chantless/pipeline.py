@@ -1,4 +1,4 @@
-"""End-to-end Chantless MVP run: prepare -> pool -> aa -> proxy -> sanity -> search -> freeze -> exam -> report.
+"""End-to-end Chantless extraction run: prepare -> pool -> aa -> proxy -> sanity -> search -> freeze -> exam -> report.
 
 Every phase writes receipts under runs/<run_id>/ and a completion marker, so a run can resume.
 The exam split is unreadable before the exam phase (SplitGuard). Nothing from the exam feeds back.
@@ -354,8 +354,7 @@ class Run:
         n_gate = max(st["n_floor"], n_req) if not st.get("n_override") else st["n_override"]
         cap_sel = len(sel) * st["max_eps_per_task"]
         two = stats.delta_and_bounds(rows, 0.025)  # two-sided 95%
-        # Harness bias check: zero inside the two-sided 95% interval; the point tolerance (manual 0.015)
-        # applies only at gate scale, where it is meaningful.
+        # Harness bias check: require 0 inside the two-sided 95% CI, and check |delta| <= aa_tol at gate scale.
         point_ok = abs(bnd["delta"]) <= st["aa_tol"] if d["n_pairs"] >= st["n_floor"] else None
         out = {"v": d["v"], "deff": d["deff"], "v_used": v, "deff_used": deff, "aa_delta": bnd["delta"], "aa_bounds": bnd,
                "aa_two_sided": {"L": two["L"], "U": two["U"]}, "aa_point_ok": point_ok, "n_pairs": d["n_pairs"],
@@ -388,7 +387,7 @@ class Run:
         if not out["aa_ok"]:
             if st.get("aa_enforce", True):
                 raise RuntimeError("A/A check failed: harness, seeding or task isolation is biased; fix before search")
-            self.log("WARNING: A/A check failed but aa_enforce=false (smoke config); recorded, not enforced")
+            self.log("WARNING: A/A check failed (aa_enforce=false; continuing)")
         if not out["pool_rule_ok"] and not st.get("allow_small_pool"):
             raise RuntimeError(f"pool-size rule failed: select capacity {cap_sel} < n_gate {n_gate}")
         self.mark("aa", {"n_gate": n_gate})
@@ -512,7 +511,7 @@ class Run:
         return P
 
     def _staged(self, store_dir) -> str:
-        """Reference stores are read on every probe; keep a verified copy on scratch storage (fast, unencrypted)."""
+        """Keep a verified copy of reference stores on scratch storage."""
         store_dir = Path(store_dir)
         if self.scratch == self.dir:
             return str(store_dir)
@@ -718,9 +717,8 @@ class Run:
     def _source_bank(self, split: str, tasks) -> dict | None:
         """The source's recorded result per task, when stats.reuse_source is set and every task has one.
 
-        Only valid for a deterministic environment (detect: one greedy forward pass), where re-scoring the
-        frozen source returns the same row. Select rows come from the pool and A/A episodes, exam rows from
-        the exam-pool episodes."""
+        Only valid for deterministic environments where re-scoring the frozen source is invariant.
+        Select rows come from the pool and A/A episodes, exam rows from the exam-pool episodes."""
         if not self.cfg["stats"].get("reuse_source"):
             return None
         files = ["pool.jsonl", "aa-A.jsonl", "aa-B.jsonl"] if split != "exam" else ["exam-pool.jsonl"]
@@ -924,9 +922,10 @@ class Run:
                 sel_mask = last_gate or init
                 final_weights, lineage = self.src, []   # the gated incumbent was built from the source weights
                 gated = last_gate is not None
-                self.log("final gate failed: returning last gate-passing mask")
-                if last_gate is None:
-                    self.log("no searched mask passed a gate; the returned mask is the initial sanity mask, which has not passed a gate")
+                if last_gate is not None:
+                    self.log("final gate failed; reverting to last gate-passing mask")
+                else:
+                    self.log("final gate failed with no prior passing gate; falling back to initial sanity mask")
         else:
             gated = True
         sel_mask["weights"] = {"lineage": lineage, "path": final_weights if lineage else None}
@@ -1275,7 +1274,7 @@ class Run:
         out = self.dir / "repair" / "hf"
         rec = repair.repair(self.cfg["source"]["hf_dir"], None, m, recs, self.mode, out, rc, self.log)
         if rec is None:
-            self.log("repair: selected mask has no removed sub-blocks; training cannot improve on the frozen source under an unsimulated quantiser, skipped")
+            self.log("repair: skipped (no dropped sub-blocks in selected mask)")
             write_json(self.dir / "repair" / "lineage.json", {"skipped": "no removal in selected mask"})
             return self.src, [], m
         gg = self.dir / "repair" / "repaired-bf16.gguf"
@@ -1372,15 +1371,15 @@ class Run:
         res["claim"] = ("non-inferior to source" if self.mode == "preserve" else "superior to source")
         res["claim_holds"] = res["pass"] if self.mode == "preserve" else (res["L"] > 0)
         write_json(self.dir / "gates" / "exam.json", res)
-        # descriptive baselines at matched bytes (observed, not claimed)
+        # size-matched baselines
         self.exam_baselines(spec)
         if self.classifier and self.cfg["exam"].get("external"):
             self.exam_compare(spec)
         self.mark("exam", {"claim_holds": res["claim_holds"]})
 
     def exam_compare(self, spec: str):
-        """Classifier exam, descriptive: the specialist, the source and external models (exam.external), each at
-        its own 1%-of-calibration-negatives cutoff, on every exam document, with shared bootstrap resamples."""
+        """Compare specialist, source, and external models (exam.external) on the exam split, each at
+        its own 1%-of-calibration-negatives cutoff, with shared bootstrap resamples."""
         import glob
         import numpy as np
         from . import compare
@@ -1417,8 +1416,8 @@ class Run:
         uniform = read_json(self.dir / "sanity" / "uniform.json")
         tier = min(uniform, key=lambda t: abs(uniform[t]["bytes"] - target))
         cands = {f"uniform-{tier}": self.uniform_mask(base, tier)}
-        # dynquant-style recipes (isolated restore gains on the task proxy, ranked once, no re-ranking):
-        #   K34-style: Q4_K base, top-K groups restored to Q8_0;  K94-style: Q2_K base, Q8_0 ranking, top-K deployed at Q4_K
+        # One-shot sensitivity baselines (rank groups once by isolated task-proxy gain, restore top-K to match bytes):
+        #   k34: Q4_K base + top-K groups at Q8_0; k94: Q2_K base + top-K groups at Q4_K (ranked at Q8_0).
         blk = [g for g in base["groups"] if g.startswith("blk.")]
         recipes = {"k34": ("Q4_K", "Q8_0", "Q8_0"), "k94": ("Q2_K", "Q8_0", "Q4_K")}
         best = None
@@ -1483,10 +1482,9 @@ class Run:
         g = lambda p: read_json(self.dir / p) if (self.dir / p).exists() else None
         run, pool, aa, fr, ex, bl, sr = g("run.json"), g("pool.json"), g("aa.json"), g("final/freeze.json"), g("gates/exam.json"), g("gates/exam_baselines.json"), g("search_result.json")
         src_bytes = gguf_ops.file_bytes(self.src)
-        lines = [f"# Chantless MVP run `{self.cfg['run_id']}`", "",
+        lines = [f"# Chantless run `{self.cfg['run_id']}`", "",
                  f"Source `{self.cfg['source']['repo']}` @ `{self.cfg['source']['revision'][:12]}`; env `{self.env.name}` v{self.env.version}; objective mode {self.mode}; weights: {self._weights_outcome()}.",
-                 f"Returned mask has a passing gate on record: **{sr.get('gate_on_record')}**" + ("" if sr.get("gate_on_record") else " (no searched mask passed a gate; the sanity mask was frozen instead)") + ".",
-                 "Everything below is measured in this run. Claims are limited to the exam test stated; all else is observed, not claimed.", "",
+                 f"Gate on record: **{'yes' if sr.get('gate_on_record') else 'no (fell back to sanity mask)'}**.", "",
                  "## Exam (single use)",
                  f"- Claim tested: **{ex['claim']}** at margin {self.cfg['stats']['margin']}, one-sided alpha {self.cfg['stats']['alpha']}. Result: **{'HOLDS' if ex['claim_holds'] else 'DOES NOT HOLD'}**.",
                  f"- delta (specialist - source) = {ex['delta']:+.4f}, one-sided bounds L={ex['L']:+.4f}, U={ex['U']:+.4f}; {ex.get('n_cand')} specialist / {ex.get('n_src')} source episodes on {ex['n_tasks']} reliable exam tasks.",
@@ -1499,19 +1497,18 @@ class Run:
                  "## Search",
                  f"- Stop: {sr['stop_reason']} after {sr['accepted']} accepted moves; feedback penalties {sr['penalties']}; blocked {sr['blocked']}.",
                  f"- Pool: {pool['sizes']}; A/A delta {aa['aa_delta']:+.4f}, v={aa['v']:.4f}, deff={aa['deff_used']:.2f}, n_gate={aa['n_gate']}.", "",
-                 "## Baselines at matched bytes (descriptive, not claimed)"]
+                 "## Size-matched baselines"]
         for k, v in (bl or {}).get("points", {}).items():
-            match = "" if v.get("matched_within_5pct", True) else f" (NOT byte-matched: {v['bytes_ratio_to_target']:.2f}x target; nearest this recipe reaches)"
+            match = "" if v.get("matched_within_5pct", True) else f" ({v['bytes_ratio_to_target']:.2f}x target)"
             lines.append(f"- {k}: {v['bytes']:,} bytes, delta={v['delta']:+.4f} [{v['L']:+.4f}, {v['U']:+.4f}]{match}")
         cmp_ = g("gates/exam_compare.json")
         if cmp_:
-            lines += ["", "## Classifier comparison (descriptive, not claimed)",
+            lines += ["", "## Classifier comparison",
                       "Each model at its own cutoff (1% of calibration negatives); positives caught, 95% bootstrap intervals over shared resamples."]
             for source, r in cmp_.items():
                 lines.append(f"- {source} ({r['docs']} docs): " + "; ".join(
                     f"{m} {v['pos']['caught']:.3f} [{v['pos']['ci'][0]:.3f}, {v['pos']['ci'][1]:.3f}], negatives flagged {v['neg_flagged']:.3f}"
                     for m, v in r["models"].items()) + "; interval wholly above: " + ", ".join(f"{m} {b}" for m, b in r.get("beats", {}).items()))
-        lines += ["", "## Not established", "No global optimum, no generalisation beyond this environment and model, no latency/throughput claim, no MiMo/qwen35 result."]
         (self.dir / "report.md").write_text("\n".join(lines) + "\n")
         self.log("report written")
         self.mark("report")
@@ -1522,7 +1519,7 @@ def bmod_bpw(nbytes: int, params: int) -> float:
 
 
 def _tools(env):
-    """The tool schema the environment's episodes were rendered with; codetasks predates the attribute."""
+    """Return env.tools, falling back to codetasks.TOOLS."""
     if hasattr(env, "tools"):
         return env.tools
     from .env.codetasks import TOOLS

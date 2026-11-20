@@ -1,9 +1,7 @@
-"""Public calibrated single-token classifier benchmark across Qwen3, Qwen3.5, and Gemma 4.
+"""Calibrated single-token classifier benchmark across Qwen3, Qwen3.5, and Gemma 4.
 
-Implements the full Chantless `ClassifierHooks` contract (`logodds` + `BatchScorer` + automatic
-`tokdocs` retokenization and answer-ID remapping on `vocab_keep`-trimmed GGUFs) over public
-HuggingFace polarity/moderation datasets (defaulting to `fancyzhx/yelp_polarity`, Apache/public,
-zero private files) or a local `jsonl_file` override for offline testing.
+Implements `ClassifierHooks` over HuggingFace polarity datasets (default: `fancyzhx/yelp_polarity`)
+or a local `jsonl_file`, with answer-ID remapping and `tokdocs` retokenization for trimmed vocabularies.
 """
 from __future__ import annotations
 
@@ -228,7 +226,7 @@ class PublicClassifierEnvironment:
         rng = np.random.default_rng(20261118)
         neg_pick = [cal_ids[i] for i in sorted(rng.permutation(len(cal_ids))[: min(n_neg, len(cal_ids))])]
         s_pos = [i for i in src_scores if by_id[i].split == "search" and by_id[i].meta["label"] == self.flagged_word]
-        # Pick boundary/hard positives closest to calibration cutoff plus random positives
+        # Pick positives closest to the calibration cutoff
         cal_cut = float(np.sort([src_scores[i] for i in cal_ids])[max(0, int(self.fpr_target * len(cal_ids)))]) if cal_ids else 0.0
         s_pos.sort(key=lambda i: abs(src_scores[i] - cal_cut))
         pos_pick = s_pos[: min(n_pos, len(s_pos))]
@@ -238,7 +236,7 @@ class PublicClassifierEnvironment:
         ]
 
     def run(self, task: Task, client: Any, seed: int) -> Episode:
-        raise NotImplementedError("classifier environment uses BatchScorer via Evaluator._run_classifier")
+        raise NotImplementedError("classifier environment uses BatchScorer")
 
     def verify(self, task: Task, episode: Episode) -> Verdict:
         raise NotImplementedError("classifier environment uses decide()")

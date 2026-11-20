@@ -1,6 +1,6 @@
 """Pick a representative K-problem set from the integer-answer subset of DeepMath-103K.
 
-Usage: python tools/deepmath_select.py QA_PARQUET MODEL_DIR OUT [K] [N_EXAM]
+Usage: python mvp/tools/deepmath_select.py QA_PARQUET MODEL_DIR OUT [K] [N_EXAM]
   QA_PARQUET: question/final_answer/difficulty/topic columns (shard, row kept for provenance)
   MODEL_DIR:  local EmbeddingGemma snapshot (sentence-transformers format)
 Filter: plain integer answer, difficulty >= 3, exact-duplicate questions dropped (this pool is embedded and
@@ -56,9 +56,9 @@ if emb_path.exists() and np.load(emb_path, mmap_mode="r").shape[0] == len(pool):
 else:
     import torch
     from sentence_transformers import SentenceTransformer
-    m = SentenceTransformer(str(MODEL), device="mps" if torch.backends.mps.is_available() else "cpu",
-                            model_kwargs={"dtype": torch.bfloat16})
-    m.max_seq_length = MAX_TOKENS  # a few very long questions OOM MPS; the stem fits well inside this
+    dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    m = SentenceTransformer(str(MODEL), device=dev, model_kwargs={"dtype": torch.bfloat16})
+    m.max_seq_length = MAX_TOKENS  # cap embedding input length to bound memory
     order = np.argsort([len(r["question"]) for r in pool])  # length-sorted batches pad less
     t0 = time.time()
     e = m.encode([pool[i]["question"] for i in order], prompt_name="Clustering", batch_size=16,

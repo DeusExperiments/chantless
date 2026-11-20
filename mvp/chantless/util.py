@@ -26,7 +26,7 @@ def sha256_text(text: str) -> str:
 
 
 def stable_seed(*parts: Any, bits: int = 31) -> int:
-    """Deterministic seed from arbitrary parts (manual §6.1: hash(run_id, episode_id, turn))."""
+    """Deterministic integer seed hashed from arbitrary parts (e.g., run_id, episode_id, turn)."""
     h = hashlib.sha256("\x1f".join(map(str, parts)).encode()).digest()
     return int.from_bytes(h[:8], "little") % (1 << bits)
 
@@ -60,7 +60,7 @@ def read_jsonl(path: str | os.PathLike) -> list[Any]:
 
 
 class Log:
-    """Human run log (manual §11.2 log.md) plus stderr echo."""
+    """Timestamped run log written to stdout and optionally appended to a file."""
 
     def __init__(self, path: str | os.PathLike | None):
         self.path = Path(path) if path else None

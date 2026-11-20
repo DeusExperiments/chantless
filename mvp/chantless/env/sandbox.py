@@ -1,8 +1,7 @@
-"""Run untrusted model code against tests in an isolated subprocess.
+"""Run model-generated code against tests in an isolated subprocess.
 
 Isolation: fresh temp dir as cwd, `python -I -S`, wall-clock timeout, CPU/memory rlimits where
-the OS supports them, no inherited environment. This is process isolation, not a security
-boundary; the MVP only executes code produced by our own model under test.
+the OS supports them, no inherited environment. Process isolation only (not a security boundary).
 """
 from __future__ import annotations
 

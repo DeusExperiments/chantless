@@ -3,7 +3,7 @@
 Stores (computed once from the frozen source; never moved with candidate weights):
   task     KL on source-successful search-split trajectories (preserve proxy)
   general  KL on general text + code (size-matched sanity cap)
-  fb_k     KL on candidate failure trajectories added by learner feedback (decision S4)
+  fb_k     KL on candidate failure trajectories added by learner feedback
 In improve mode the task proxy is the candidate's NLL on verified-successful trajectories instead of KL.
 A store of kind "logodds" (classifier environments) instead scores the candidate's log-odds at each
 trajectory's answer and records an objectives.OBJECTIVES damage against the source's, as both kl and nll.

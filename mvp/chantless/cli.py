@@ -1,11 +1,4 @@
-"""Chantless CLI:
-  chantless extract --config configs/X.json [--upto PHASE] [--reset PHASE] [--out-mask MASK.json] [--out SPECIALIST.gguf]
-  chantless build   --source BASE.gguf --mask MASK.json --out SPECIALIST.gguf [--imatrix IM.gguf] [--hf-dir DIR] [--llama-bin BIN] [--threads N] [--shards K]
-  chantless learn   --config configs/X.json [--fold N] [--out-mask MASK.json] [--out SPECIALIST.gguf]
-  chantless plan    --config configs/X.json [--rates R.json] [--source MODEL.gguf]
-  chantless run     --config configs/X.json [--upto PHASE] [--reset PHASE]
-  chantless anneal  --config configs/X.json [--stage setup|sweep|pick|arm|judge|report] [--arm NAME] [--gpu ID] [--lr RATE] [--model MODEL.gguf]
-"""
+"""Chantless CLI entrypoint."""
 from __future__ import annotations
 
 import argparse
@@ -61,24 +54,24 @@ def main():
     pl = sub.add_parser("plan", help="estimate moves, episodes, tokens, wall-clock and cost without running")
     pl.add_argument("--config", required=True)
     pl.add_argument("--set", dest="overrides", action="append", default=[])
-    pl.add_argument("--rates", help="JSON {backend: {field: value}} merged over plan.RATES")
+    pl.add_argument("--rates", help="JSON {backend: {field: value}} overriding default backend rate estimates")
     pl.add_argument("--source", help="local copy of the source GGUF, read for its header in place of the config's path")
 
-    ln = sub.add_parser("learn", help="teach a built specialist from <=25 examples via switches/grid moves and judge controls")
+    ln = sub.add_parser("learn", help="adapt a built specialist from few-shot examples via neuron switches or grid updates")
     ln.add_argument("--config", required=True)
     ln.add_argument("--set", dest="overrides", action="append", default=[])
     ln.add_argument("--fold", type=int, help="hold this feedback fold out of training; default trains on all of it")
     ln.add_argument("--out-mask", help="optional path to export the updated chantless.mask/v3 JSON")
     ln.add_argument("--out", help="optional path to export the updated specialist GGUF")
 
-    an = sub.add_parser("anneal", help="train the whole source while cuts arrive in steps, then judge the real files")
+    an = sub.add_parser("anneal", help="run staged quantization-aware training with progressive structural pruning")
     an.add_argument("--config", required=True)
     an.add_argument("--set", dest="overrides", action="append", default=[])
     an.add_argument("--stage", choices=("setup", "sweep", "pick", "arm", "judge", "report"), default="arm")
-    an.add_argument("--arm", help="the arm to run, or the name a judged file goes under")
-    an.add_argument("--gpu", default="0", help="the real GPU id, for the scorer; the caller isolates the process with CUDA_VISIBLE_DEVICES")
-    an.add_argument("--lr", type=float, help="the rate for --stage sweep")
-    an.add_argument("--model", help="the file for --stage judge; default the arm's entry in the config's rows")
+    an.add_argument("--arm", help="arm name")
+    an.add_argument("--gpu", default="0", help="GPU index for scoring (isolate process via CUDA_VISIBLE_DEVICES)")
+    an.add_argument("--lr", type=float, help="learning rate for --stage sweep")
+    an.add_argument("--model", help="GGUF path for --stage judge (defaults to arm's config row)")
 
     sw = sub.add_parser("sweep", help="run a declarative multi-cell sweep across local GPUs or pluggable cloud launchers")
     sw.add_argument("--config", required=True, help="sweep configuration YAML/JSON")
@@ -133,8 +126,8 @@ def main():
     mk_im.add_argument("--from-spec", help="legacy spec JSON ({tiers: {group: tier}})")
     mk_im.add_argument("--source-gguf", help="optional frozen base GGUF for canonical group/drop/regex resolution")
     mk_im.add_argument("--hf-dir", help="optional HF config dir for Gemma 4 shared-KV metadata")
-    mk_im.add_argument("--override-recipe", help="optional dynquant override JSON ({protect_qtype, protected: [...]})")
-    mk_im.add_argument("--repo", default="", help="pinned source Hugging Face / ModelScope repo id")
+    mk_im.add_argument("--override-recipe", help="optional tensor-protection override JSON ({protect_qtype, protected: [...]})")
+    mk_im.add_argument("--repo", default="", help="pinned source model repo id")
     mk_im.add_argument("--revision", default="", help="pinned source checkpoint revision")
     mk_im.add_argument("--source-sha256", default="", help="pinned base GGUF SHA256")
     mk_im.add_argument("--objective-mode", default="preserve", choices=("preserve", "improve"))
@@ -182,7 +175,7 @@ def main():
     dr.add_argument("--logodds", help="path to logodds binary")
     dr.add_argument("--tokdocs", help="path to tokdocs binary")
     dr.add_argument("--run-root", default=".", help="directory to check disk headroom against")
-    dr.add_argument("--model-gb", type=float, help="optional BF16 model size in GiB to preview #12 scratch/tier_cache layout")
+    dr.add_argument("--model-gb", type=float, help="optional BF16 model size in GiB to preview scratch and tier-cache layout")
     dr.add_argument("--require-classifier", action="store_true", help="require logodds and tokdocs binaries")
     dr.add_argument("--require-cuda", action="store_true", help="require NVIDIA CUDA availability")
 

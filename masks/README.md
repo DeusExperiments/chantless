@@ -1,10 +1,8 @@
 # Chantless Thin Masks (`chantless.mask/v3`)
 
-This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure Apache-2.0 JSON, `weights.lineage = []`, zero trained floats):
+This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure Apache-2.0 JSON, zero trained floats):
 - **`10` stock-checkpoint double winners** (`5` architecture/task cells × `{specialist, +0 B Apprentice}`) where extraction cleared its quality gate **and** zero-byte `<=25`-mistake Apprentice learning beat every matched-byte control (`base`, `empty`, `flipped`, `shuffled`).
 - **`2` flagship `27B` imported winners** (`Qwen3.8-27B` `K34` and `K94`), demonstrating `chantless mask import` interoperability at `27B` scale.
-
-*(Full ablation sweeps, non-winning matrix cells, and historical research scripts are preserved with SHA256 manifests in private archive `tokenbender/chantless-detect-local-archive:repo-curation-20261120/`.)*
 
 ## Pinned Stock Source Checkpoints
 
@@ -17,7 +15,7 @@ This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure 
 
 ---
 
-## 1. Stock-Checkpoint Specialist Winners (`5 / 5`, `cli_rebuild_sha256_equal == true`)
+## 1. Stock-Checkpoint Specialist Winners (`5 / 5`, bit-exact CLI rebuilds)
 
 | Mask File | Mask Size | Built GGUF (`%` BF16, `bpw`) | Built GGUF SHA256 | Vocab Kept | Seen `select` | Held-Out `exam` | Gain vs Uniform |
 | :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: |
@@ -29,9 +27,9 @@ This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure 
 
 ---
 
-## 2. Zero-Extra-Byte Switch Apprentice Winners (`5 / 5`, `+0 B`, `empty.sha256 == base.sha256`)
+## 2. Zero-Extra-Byte Switch Apprentice Winners (`5 / 5`, `+0 B`, identity control verified)
 
-Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` specialist mistakes with full-vocabulary `float32` `replay_h0` token-KL protection and adds **`0 bytes`** to the built GGUF (`cli_rebuild_sha256_equal == true`):
+Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` specialist mistakes with full-vocabulary `float32` `replay_h0` token-KL protection and adds **`0 bytes`** to the built GGUF (bit-exact CLI rebuilds):
 
 | Mask File | Mask Size | Built GGUF SHA256 | Switches Off | Unseen Fixed (`learned`) | Controls (`base / empty / flip / shuf`) | `sel1` Retention (`learned` vs `base`) |
 | :--- | :---: | :--- | :---: | :---: | :---: | :---: |
@@ -41,7 +39,7 @@ Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` spe
 | `qwen3-4b-bfcl-apprentice-mask.json` | `9,617 B` | `07dfb251b69c3edc9c9366d78a641f6c35a507fcec4ef1f2ae5888229835d81e` | `2,057 / 77,824` | **`22 / 60`** (`36.7%`) | `3 / 3 / 1 / 12` | `87.29%` vs `95.58%` |
 | `gemma4-e2b-clsbench-apprentice-mask.json` | `49,344 B` | `c599e629739952408f6fc72bbe098a5a70c61ced61a9045a5c78d35aecb2475f` | `1,098 / 63,744` | **`15 / 60`** (`25.0%`) | `3 / 3 / 2 / 8` | **`99.40%`** vs `99.15%` |
 
-*(Control notes: on `qwen35-4b-clsbench`, all 25 training mistakes shared one class label, so `shuffled` uses balanced 50/50 random labels; on `qwen35-4b-bfcl`, `shuffled` permutes `(corrected, mistaken)` pairs across prompts.)*
+*(Control protocol: on `qwen35-4b-clsbench`, all 25 training mistakes shared one class label, so `shuffled` uses balanced 50/50 random labels; on `qwen35-4b-bfcl`, `shuffled` permutes `(corrected, mistaken)` pairs across prompts.)*
 
 ---
 
@@ -49,8 +47,8 @@ Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` spe
 
 | Mask File | Mask Size | Groups / Overrides | Tier Mix | Original Artifact Size / SHA256 | Recorded Terminal-Bench 2.1 Receipt |
 | :--- | :---: | :---: | :--- | :--- | :--- |
-| `qwen38-27b-dynquant-k34-mask.json` | `9,662 B` | `130` / `42` | `95 Q4_K`, `34 Q8_0`, `1 Q6_K` | `19.60 GB` (`35.87%` F16), `62a2d8ae...` | **`77.8%` pass@1** (`277/356` audited; `78.1%` stored) · **`91.0%` pass@4** (`81/89`) |
-| `qwen38-27b-dynquant-k94-mask.json` | `9,553 B` | `130` / `38` | `94 Q4_K`, `35 Q2_K`, `1 Q6_K` | `14.26 GB` (`26.09%` F16), `2184c613...` | **`74.4%` pass@1** (`265/356` audited; `74.7%` stored) · **`85.4%` pass@4** (`76/89`) |
+| `qwen38-27b-dynquant-k34-mask.json` | `9,662 B` | `130` / `42` | `95 Q4_K`, `34 Q8_0`, `1 Q6_K` | `19.60 GB` (`35.87%` F16), `62a2d8ae...` | **`77.8%` pass@1** (`277/356`) · **`91.0%` pass@4** (`81/89`) |
+| `qwen38-27b-dynquant-k94-mask.json` | `9,553 B` | `130` / `38` | `94 Q4_K`, `35 Q2_K`, `1 Q6_K` | `14.26 GB` (`26.09%` F16), `2184c613...` | **`74.4%` pass@1** (`265/356`) · **`85.4%` pass@4** (`76/89`) |
 
 ---
 

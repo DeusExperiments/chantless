@@ -1,8 +1,7 @@
 """General-data sanity: text corpus, executable behavioral checks, size-matched cap, solo-application floors.
 
-Decision S5: initial mask = per-group minimum precisions from solo-application tests; every move
-must keep general KL <= that of a uniform quant at the same bpw; behavioral checks gate every
-screen and gate.
+Computes per-group minimum precisions from solo tests, enforces a size-matched general-KL cap, and runs
+executable behavioral checks on screens and gates.
 """
 from __future__ import annotations
 
@@ -162,7 +161,7 @@ class NoCap:
 
 
 def make_cap(kind: str, points=None):
-    """'general_kl' -> SizeMatchedCap(points), as today; 'off' -> a cap that is always +inf."""
+    """Return `SizeMatchedCap(points)` for `'general_kl'` or `NoCap()` for `'off'`."""
     if kind == "general_kl":
         return SizeMatchedCap(points)
     if kind == "off":

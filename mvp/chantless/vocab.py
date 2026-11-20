@@ -240,8 +240,8 @@ def vocab_trim_byte_savings(
 ) -> int:
     """Exact total file byte reduction (KV + aligned tensor payloads) from trimming to `keep`.
 
-    Note: caller's `ByteModel` handles 32-byte header alignment directly when given `kv_cut`; this helper
-    returns the raw KV + row savings matching `gsolve.py` / `bytes200.py` when alignment mod-32 is preserved.
+    Returns raw KV + row byte reduction without 32-byte header alignment rounding; `oneshot.ByteModel` applies
+    header alignment directly when given `kv_cut`.
     """
     keep = np.asarray(keep, dtype=np.int64)
     h = gguf_ops._Hdr(gguf_path)
