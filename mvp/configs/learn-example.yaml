@@ -1,0 +1,25 @@
+toolchain:
+  llama_bin: .local/toolchain/llama-a01dff9/build/bin
+  traj_kl: .local/toolchain/bin/traj-kl
+  gpus: ["0"]
+
+learn:
+  mode: generative
+  method: gates_seq
+  switch_mode: up_row_zero
+  model: .local/runs/specialist.gguf
+  config_dir: .local/models/qwen3-4b
+  mask_in: masks/qwen3-4b-bfcl-mask.json
+  mask_out: .local/runs/apprentice-mask.json
+  out_dir: .local/runs/apprentice
+  lessons: .local/runs/lessons.jsonl
+  replay: .local/runs/replay.trj
+  max_lessons: 25
+  steps: 80
+  gate_last_blocks: 8
+  prefix_cache: true
+  stream_prefix: auto
+  free_prefix: true
+  judge_slots: 1
+  judge_cache_prompt: false
+  controls: true
