@@ -9,6 +9,7 @@ LLAMA_COMMIT="a01dff908b9c9311d7af316bba3c918063749bd0"
 PREFIX="${CHANTLESS_TOOLCHAIN_PREFIX:-$REPO_ROOT/.local/toolchain}"
 BACKEND="auto"
 CUDA_ARCH="${CHANTLESS_CUDA_ARCH:-native}"
+CUDA_HOST_COMPILER="${CHANTLESS_CUDA_HOST_COMPILER:-}"
 JOBS=""
 WITH_FLA=0
 DRY_RUN=0
@@ -20,13 +21,14 @@ Usage: $(basename "$0") [options]
 Build pinned llama.cpp ($LLAMA_COMMIT) with the Chantless patch and C++ tools (traj-kl, logodds, tokdocs).
 
 Options:
-  --prefix DIR          Install/build root (default: \$REPO_ROOT/.local/toolchain)
-  --backend MODE        auto | cuda | metal | cpu (default: auto)
-  --cuda-arch ARCH      CMAKE_CUDA_ARCHITECTURES value when backend=cuda (default: native)
-  --jobs N              Parallel build jobs (default: auto cpu count, capped at 64)
-  --with-fla            Check/install flash-linear-attention (for Qwen3.5 GDN on CUDA)
-  --dry-run             Print resolved build plan and commands without executing
-  -h, --help            Show this help
+  --prefix DIR                  Install/build root (default: \$REPO_ROOT/.local/toolchain)
+  --backend MODE                auto | cuda | metal | cpu (default: auto)
+  --cuda-arch ARCH              CMAKE_CUDA_ARCHITECTURES when backend=cuda (default: native -> single-arch nvidia-smi)
+  --cuda-host-compiler PATH     CMAKE_CUDA_HOST_COMPILER override (auto-prefers g++-12 over gcc-13 ICE when installed)
+  --jobs N                      Parallel build jobs (default: auto cpu count, capped at 64)
+  --with-fla                    Check/install flash-linear-attention (for Qwen3.5 GDN on CUDA)
+  --dry-run                     Print resolved build plan and commands without executing
+  -h, --help                    Show this help
 EOF
 }
 
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --prefix) PREFIX="$2"; shift 2 ;;
         --backend) BACKEND="$2"; shift 2 ;;
         --cuda-arch) CUDA_ARCH="$2"; shift 2 ;;
+        --cuda-host-compiler) CUDA_HOST_COMPILER="$2"; shift 2 ;;
         --jobs) JOBS="$2"; shift 2 ;;
         --with-fla) WITH_FLA=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -83,7 +86,21 @@ CMAKE_FLAGS=(
 
 case "$BACKEND" in
     cuda)
+        if [[ "$CUDA_ARCH" == "native" || "$CUDA_ARCH" == "auto" ]]; then
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                DETECTED_ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '.[:space:]' || true)"
+                if [[ -n "$DETECTED_ARCH" ]]; then
+                    CUDA_ARCH="$DETECTED_ARCH"
+                fi
+            fi
+        fi
         CMAKE_FLAGS+=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH")
+        if [[ -z "$CUDA_HOST_COMPILER" ]] && command -v g++-12 >/dev/null 2>&1; then
+            CUDA_HOST_COMPILER="$(command -v g++-12)"
+        fi
+        if [[ -n "$CUDA_HOST_COMPILER" ]]; then
+            CMAKE_FLAGS+=("-DCMAKE_CUDA_HOST_COMPILER=$CUDA_HOST_COMPILER")
+        fi
         ;;
     metal)
         CMAKE_FLAGS+=(-DGGML_METAL=ON)

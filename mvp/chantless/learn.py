@@ -690,10 +690,10 @@ def _should_stream_prefix(art: lattice.Artifact, cfg: dict, device: str, frozen_
         return True
     if sp is False or not device.startswith("cuda"):
         return False
-    import torch
+    import math, torch
     if not torch.cuda.is_available():
         return False
-    est_bytes = sum(int(t["n"]) for t in art.tensors.values()) * (2 if frozen_bf16 else 4)
+    est_bytes = sum(math.prod(t["dims"]) for t in art.tensors.values()) * (2 if frozen_bf16 else 4)
     total_vram = torch.cuda.get_device_properties(torch.device(device)).total_memory
     return est_bytes > int(0.65 * total_vram)
 
