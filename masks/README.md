@@ -1,6 +1,8 @@
 # Chantless Thin Masks (`chantless.mask/v3`)
 
-This directory contains all `18` pure Apache-2.0 `chantless.mask/v3` JSON masks (`6.4 KB – 52.8 KB` each, `weights.lineage = []`) across `3` architectures × `3` modalities × `{specialist, Apprentice}`, deterministically materializing standalone GGUFs from unmodified stock Hugging Face checkpoints.
+This directory contains `22` pure Apache-2.0 `chantless.mask/v3` JSON masks (`6.4 KB – 52.8 KB` each, `weights.lineage = []`):
+- **`18` 3×3 matrix masks** across `3` architectures × `3` modalities × `{specialist, Apprentice}`, and
+- **`4` imported dynamic-quantization winners** (`Qwen3.8-27B` `K34`/`K94` and `Qwen3-8B` `IQ2_M K08`/`UD-repro`), converted via `chantless mask import` into native `chantless.mask/v3` format with preserved original provenance and evaluation receipts.
 
 No model weights are stored in these files. Every mask specifies only:
 - Per-group / per-tensor quantization tiers and sub-block drops (`attn_dropped`, FFN drops),
@@ -16,6 +18,8 @@ No model weights are stored in these files. Every mask specifies only:
 | **Qwen3.5-4B** | `Qwen/Qwen3.5-4B` | `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` | `8,424,393,216` | `afc3aaa3f844dda41af4012479d7f9eac87eda553c16bf2795e85ebc1e0e0bf7` | **6 / 6** |
 | **Gemma 4 E2B** | `google/gemma-4-E2B-it` | `4adf15748de9e1a0097b6274cee9c15836c41c37` | `9,311,299,104` | `01ef9dcdba1a648bfb68a4bc2c1b91632f59ad37d48ae81887e51305f9bb0ba6` | **6 / 6** |
 | **Qwen3-4B** | `Qwen/Qwen3-4B` | `1cfa9a7208912126459214e8b04321603b3df60c` | `8,051,284,928` | `99038d3c282d8249b9804a94aea50fd3b30c6b5d56931474042ede9982602337` | **6 / 6** |
+| **Qwen3.8-27B** | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | `54,657,734,080` *(F16)* | `05f18ee2b177c76c34a827a1bcada598a9bfd99f939ddcb8b37a9e47874f6599` | **2** *(imported)* |
+| **Qwen3-8B** | `Qwen/Qwen3-8B` | `main` | — | — | **2** *(imported)* |
 
 *(BF16 GGUFs are produced with `convert_hf_to_gguf.py --outtype bf16` from `llama.cpp` commit `a01dff9` patched with [`../mvp/patches/llama-cpp-a01dff9-chantless.patch`](../mvp/patches/llama-cpp-a01dff9-chantless.patch).)*
 
@@ -61,7 +65,20 @@ Each Apprentice mask starts from its specialist mask above, trains binary `up_ro
 
 ---
 
-## Rebuilding Any Specialist or Apprentice GGUF
+## 3. Imported Dynamic-Quantization Winners (`*-dynquant-*-mask.json`, `4 / 4`)
+
+Historical mixed-precision dynamic-quantization winners imported into native `chantless.mask/v3` via `chantless mask import` (supporting all `22` native `llama-quantize` ggml tensor types). Each mask preserves its original source pin, archive URLs, and recorded evaluation receipts (including integrity caveats) in `provenance` and `measured`, and works natively with `chantless mask {inspect, diff, fork, merge}`, `chantless build`, `chantless serve/bench`, and `chantless learn`.
+
+| Mask File | Mask Size | Groups / Overrides | Tier Mix | Original Artifact Size / SHA256 | Recorded Evaluation Receipt |
+| :--- | :---: | :---: | :--- | :--- | :--- |
+| `qwen38-27b-dynquant-k34-mask.json` | `9,662 B` | `130` / `42` | `95 Q4_K`, `34 Q8_0`, `1 Q6_K` | `19,603,900,096 B` (`35.87%` F16), `62a2d8ae...` | Terminal-Bench 2.1: **`77.8%` pass@1** (`277/356` audited; `78.1%` stored), **`91.0%` pass@4** (`81/89`) |
+| `qwen38-27b-dynquant-k94-mask.json` | `9,553 B` | `130` / `38` | `94 Q4_K`, `35 Q2_K`, `1 Q6_K` | `14,262,798,016 B` (`26.09%` F16), `2184c613...` | Terminal-Bench 2.1: **`74.4%` pass@1** (`265/356` audited; `74.7%` stored), **`85.4%` pass@4** (`76/89`) |
+| `qwen3-8b-dynquant-iq2m-k08-mask.json` | `7,548 B` | `74` / `64` | `64 IQ2_S`, `8 Q4_K`, `1 Q5_K`, `1 IQ3_S` | `day6-lowbit-dyn/A_k08_iq2m_uns` | BFCL (`1,007` ex): **`719/1007` (`71.40%`)**, `+23` vs `k00` (`696/1007`), matches `UD-IQ2_M` (`720/1007`) |
+| `qwen3-8b-dynquant-iq2m-ud-mask.json` | `8,037 B` | `74` / `84` | `57 IQ2_S`, `10 IQ3_XXS`, `5 Q4_K`, `1 Q5_K`, `1 Q3_K` | `day6-lowbit-dyn/udrecipe_ourbuild` | BFCL (`1,007` ex): **`723/1007` (`71.80%`)**, `+27` vs `k00`, `+3` vs upstream `UD-IQ2_M` |
+
+---
+
+## Rebuilding or Importing Any Mask
 
 1. Build `llama.cpp` at commit `a01dff9` with [`../mvp/patches/llama-cpp-a01dff9-chantless.patch`](../mvp/patches/llama-cpp-a01dff9-chantless.patch) and install Chantless (`pip install -e .`).
 2. Convert the stock Hugging Face checkpoint to BF16 GGUF (`convert_hf_to_gguf.py --outtype bf16`).

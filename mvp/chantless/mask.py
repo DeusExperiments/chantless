@@ -24,16 +24,41 @@ LEGACY = "onlyskills.mask/v1"
 
 # Cheapening order. BF16 is the source representation; `drop` is physical removal.
 LADDER = ["BF16", "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K", "IQ2_XS", "IQ1_S"]
+ALL_TIERS = [
+    "F32", "BF16", "F16",
+    "Q8_0", "Q6_K",
+    "Q5_K", "Q5_1", "Q5_0",
+    "Q4_K", "Q4_1", "Q4_0", "IQ4_NL", "IQ4_XS",
+    "Q3_K", "IQ3_S", "IQ3_XXS",
+    "Q2_K", "IQ2_S", "IQ2_XS", "IQ2_XXS",
+    "IQ1_M", "IQ1_S",
+]
+VALID_GGML_TYPES = frozenset(ALL_TIERS)
 DROP = "drop"
-IMATRIX_REQUIRED = {"IQ2_XS", "IQ2_XXS", "IQ1_M", "IQ1_S"}
+IMATRIX_REQUIRED = {"IQ2_S", "IQ2_XS", "IQ2_XXS", "IQ1_M", "IQ1_S"}
 BLOCK_SIZES = {
-    "F32": 1, "BF16": 1, "F16": 1, "Q8_0": 32, "Q6_K": 256, "Q5_K": 256,
-    "Q4_K": 256, "Q3_K": 256, "Q2_K": 256, "IQ2_XS": 256, "IQ1_S": 256,
+    "F32": 1, "BF16": 1, "F16": 1,
+    "Q8_0": 32, "Q6_K": 256,
+    "Q5_K": 256, "Q5_1": 32, "Q5_0": 32,
+    "Q4_K": 256, "Q4_1": 32, "Q4_0": 32, "IQ4_NL": 32, "IQ4_XS": 256,
+    "Q3_K": 256, "IQ3_S": 256, "IQ3_XXS": 256,
+    "Q2_K": 256, "IQ2_S": 256, "IQ2_XS": 256, "IQ2_XXS": 256,
+    "IQ1_M": 256, "IQ1_S": 256,
 }
 
 
 class MaskError(ValueError):
     pass
+
+
+def normalize_tier(tier: str) -> str:
+    s = str(tier).strip()
+    if s.lower() == DROP:
+        return DROP
+    u = s.upper()
+    if u not in VALID_GGML_TYPES:
+        raise MaskError(f"unknown ggml tier {tier!r}")
+    return u
 
 
 def tier_allowed(group_info: dict, tier: str) -> bool:
@@ -52,7 +77,12 @@ def clip(group_info: dict, tier: str, ladder: list[str] | None = None) -> str:
 
 def rank(tier: str) -> int:
     """Higher rank = cheaper. drop is cheapest."""
-    return len(LADDER) if tier == DROP else ladder_index(tier)
+    if tier == DROP:
+        return len(ALL_TIERS)
+    u = tier.upper()
+    if u in ALL_TIERS:
+        return ALL_TIERS.index(u)
+    raise MaskError(f"unknown tier {tier!r}")
 
 
 def ladder_index(tier: str, ladder: list[str] | None = None) -> int:
@@ -179,7 +209,7 @@ def has_v3_cuts(mask: dict) -> bool:
 
 
 def validate(mask: dict, groups: dict[str, dict], ladder: list[str] | None = None) -> None:
-    ladder = ladder or LADDER
+    allowed = VALID_GGML_TYPES if ladder is None else (set(ladder) | VALID_GGML_TYPES)
     sc = mask.get("schema")
     if sc not in (SCHEMA, SCHEMA_V2):
         raise MaskError(f"schema must be {SCHEMA} or {SCHEMA_V2}, got {sc!r}")
@@ -196,17 +226,17 @@ def validate(mask: dict, groups: dict[str, dict], ladder: list[str] | None = Non
             if not groups[g]["droppable"]:
                 raise MaskError(f"{g} cannot be dropped")
             dropped_attn += g.endswith(".attn")
-        elif t not in ladder:
+        elif t not in allowed:
             raise MaskError(f"{g}: unknown tier {t}")
         elif not tier_allowed(groups[g], t):
             raise MaskError(f"{g}: tier {t} needs importance data this group lacks")
         fl = mask.get("floors", {}).get(g)
-        if fl and (len(ladder) if t == DROP else ladder.index(t)) > ladder.index(fl["min_tier"]) and not (t == DROP and fl.get("drop_ok")):
+        if fl and rank(t) > rank(fl["min_tier"]) and not (t == DROP and fl.get("drop_ok")):
             raise MaskError(f"{g}: tier {t} below sanity floor {fl['min_tier']}")
     if n_attn > 0 and dropped_attn >= n_attn:
         raise MaskError("at least one attention block must remain")
     for name, t in mask.get("tensors", {}).items():
-        if t not in ladder:
+        if t not in allowed:
             raise MaskError(f"tensor {name}: unknown tier {t}")
 
     for k, spec in (mask.get("widths") or {}).items():
@@ -688,3 +718,235 @@ def pull_mask(
     tmp.write_bytes(data)
     tmp.replace(op_p)
     return {"uri": uri, "resolved_url": url, "out": str(op_p), "bytes": len(data), "sha256": got_sha, "schema": parsed.get("schema")}
+
+
+def _parse_tensor_types_input(path: Path, source_names: list[str] | None = None) -> tuple[dict[str, str], list[dict], str]:
+    import re
+    raw_txt = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        obj = json.loads(raw_txt)
+        if isinstance(obj, dict) and isinstance(obj.get("tensors"), list):
+            tmap: dict[str, str] = {}
+            inv: list[dict] = []
+            for entry in obj["tensors"]:
+                nm = entry["name"]
+                ty = normalize_tier(entry.get("output_type") or entry.get("type"))
+                tmap[nm] = ty
+                inv.append({"name": nm, "type": ty, "shape": entry.get("shape") or []})
+            return tmap, inv, "tensor_audit_json"
+        if isinstance(obj, dict) and isinstance(obj.get("types"), dict):
+            tmap = {nm: normalize_tier(ty) for nm, ty in obj["types"].items()}
+            inv = [{"name": nm, "type": ty, "shape": []} for nm, ty in tmap.items()]
+            return tmap, inv, "types_json"
+        if isinstance(obj, dict) and all(isinstance(v, str) for v in obj.values()):
+            tmap = {nm: normalize_tier(ty) for nm, ty in obj.items()}
+            inv = [{"name": nm, "type": ty, "shape": []} for nm, ty in tmap.items()]
+            return tmap, inv, "flat_types_json"
+        raise MaskError(f"unrecognized JSON tensor-types layout in {path}")
+
+    entries: list[tuple[str, str]] = []
+    for line in raw_txt.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        for tok in s.split():
+            if "=" not in tok:
+                continue
+            pat, ty = tok.rsplit("=", 1)
+            entries.append((pat.strip(), normalize_tier(ty)))
+    if not entries:
+        raise MaskError(f"no tensor=type entries found in {path}")
+
+    tmap = {}
+    if source_names:
+        for pat, ty in entries:
+            exact = pat.lstrip("^").rstrip("$").replace("\\.", ".")
+            if exact in source_names:
+                tmap[exact] = ty
+            else:
+                rx = re.compile(pat)
+                for nm in source_names:
+                    if rx.search(nm):
+                        tmap[nm] = ty
+    else:
+        for pat, ty in entries:
+            nm = pat.lstrip("^").rstrip("$").replace("\\.", ".")
+            tmap[nm] = ty
+    inv = [{"name": nm, "type": ty, "shape": []} for nm, ty in tmap.items()]
+    return tmap, inv, "tensor_types_txt"
+
+
+def _apply_dynquant_override(tmap: dict[str, str], groups: dict[str, dict], recipe: dict) -> dict:
+    import re
+    protect_raw = recipe.get("protect_qtype") or recipe.get("protect_type")
+    if not protect_raw:
+        raise MaskError("override recipe missing protect_qtype / protect_type")
+    protect_t = normalize_tier(protect_raw)
+    protected = recipe.get("protected") or []
+    grp_rx = re.compile(r"^L(\d+)_(attn|mixer|ffn)", re.IGNORECASE)
+    upgraded_groups: list[str] = []
+    upgraded_tensors = 0
+    for item in protected:
+        if isinstance(item, dict) and item.get("overrides"):
+            for pair in str(item["overrides"]).split(","):
+                if "=" not in pair:
+                    continue
+                pat, ty = pair.rsplit("=", 1)
+                nt = normalize_tier(ty)
+                rx = re.compile(pat)
+                for nm in list(tmap):
+                    if rx.search(nm):
+                        tmap[nm] = nt
+                        upgraded_tensors += 1
+            if item.get("label"):
+                upgraded_groups.append(str(item["label"]))
+            continue
+        lbl = item.get("label") if isinstance(item, dict) else str(item)
+        m = grp_rx.match(lbl)
+        if not m:
+            raise MaskError(f"unrecognized protected group label {lbl!r}")
+        il, kind = int(m.group(1)), m.group(2).lower()
+        gname = f"blk.{il}.{'attn' if kind in ('attn', 'mixer') else 'ffn'}"
+        if gname not in groups:
+            raise MaskError(f"protected group {gname!r} (from {lbl!r}) not found in model groups")
+        for nm in groups[gname]["quantizable"]:
+            tmap[nm] = protect_t
+            upgraded_tensors += 1
+        upgraded_groups.append(gname)
+    return {"protect_type": protect_t, "protected_groups": upgraded_groups, "upgraded_tensors": upgraded_tensors}
+
+
+def import_mask(
+    out_path: str | Path,
+    from_gguf: str | Path | None = None,
+    from_tensor_types: str | Path | None = None,
+    from_spec: str | Path | None = None,
+    source_gguf: str | Path | None = None,
+    hf_dir: str | Path | None = None,
+    override_recipe: str | Path | None = None,
+    repo: str = "",
+    revision: str = "",
+    source_sha256: str = "",
+    objective_mode: str = "preserve",
+    note: str | None = None,
+    measured: dict | None = None,
+    extra_provenance: dict | None = None,
+) -> dict:
+    from collections import Counter
+    from . import gguf_ops
+
+    modes = [bool(from_gguf), bool(from_tensor_types), bool(from_spec)]
+    if sum(modes) != 1:
+        raise MaskError("specify exactly one of from_gguf, from_tensor_types, or from_spec")
+
+    source_info = {"repo": repo, "revision": revision, "gguf_sha256": source_sha256}
+    groups: dict[str, dict]
+    dead: list[str] = []
+    override_info = None
+
+    if from_spec:
+        sp = Path(from_spec)
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+        tiers = raw.get("tiers")
+        if not isinstance(tiers, dict) or not tiers:
+            raise MaskError(f"{sp}: expected non-empty 'tiers' dict")
+        if source_gguf:
+            groups, dead = gguf_ops.adapter_from_gguf(source_gguf, hf_dir)
+            m = new_mask(groups, "BF16", source_info, objective_mode=objective_mode, schema=SCHEMA)
+            m["dead_tensors"] = list(dead)
+            for g, t in tiers.items():
+                if g in m["groups"]:
+                    m["groups"][g] = {"tier": normalize_tier(t)}
+            validate(m, groups)
+        else:
+            m = {
+                "schema": SCHEMA,
+                "source": source_info,
+                "objective_mode": objective_mode,
+                "groups": {g: {"tier": normalize_tier(t)} for g, t in sorted(tiers.items())},
+                "tensors": {},
+                "floors": {},
+                "weights": {"lineage": []},
+                "deployment": {},
+                "measured": dict(measured or {}),
+                "dead_tensors": [],
+                "widths": {},
+                "vocab_keep": None,
+                "apprentice": {"switches": {}, "levels": {}, "decision": {}},
+            }
+        src_format = "legacy_spec_json"
+        in_name = sp.name
+    else:
+        if from_gguf:
+            gp = Path(from_gguf)
+            inv_built = gguf_ops.inventory(gp)
+            tmap = {t["name"]: normalize_tier(t["type"]) for t in inv_built}
+            src_format = "gguf"
+            in_name = gp.name
+            if source_gguf:
+                groups, dead = gguf_ops.adapter_from_gguf(source_gguf, hf_dir)
+            else:
+                groups, dead = gguf_ops.adapter_from_gguf(gp, hf_dir)
+        else:
+            tp = Path(from_tensor_types)
+            src_names = [t["name"] for t in gguf_ops.inventory(source_gguf)] if source_gguf else None
+            tmap, inv_tt, src_format = _parse_tensor_types_input(tp, source_names=src_names)
+            in_name = tp.name
+            if source_gguf:
+                groups, dead = gguf_ops.adapter_from_gguf(source_gguf, hf_dir)
+            else:
+                groups, dead = gguf_ops._build_groups_and_dead(inv_tt, strip_dead=False)
+
+        if override_recipe:
+            rec = json.loads(Path(override_recipe).read_text(encoding="utf-8"))
+            override_info = _apply_dynquant_override(tmap, groups, rec)
+
+        m = new_mask(groups, "BF16", source_info, objective_mode=objective_mode, schema=SCHEMA)
+        m["dead_tensors"] = list(dead)
+        for g in sorted(k for k in groups if not k.startswith("_")):
+            qnames = groups[g]["quantizable"]
+            present = [tmap[n] for n in qnames if n in tmap]
+            if not present:
+                if source_gguf and groups[g]["droppable"]:
+                    m["groups"][g] = {"tier": DROP}
+                else:
+                    raise MaskError(f"group {g} has no quantizable tensors in imported input")
+                continue
+            counts = Counter(present)
+            mode_tier = min(counts, key=lambda t: (-counts[t], rank(t)))
+            m["groups"][g] = {"tier": mode_tier}
+            for n in qnames:
+                if n in tmap and tmap[n] != mode_tier:
+                    m["tensors"][n] = tmap[n]
+
+        validate(m, groups)
+        planned, _ = tensor_plan(m, groups)
+        mismatches = [n for n, t in planned.items() if n in tmap and tmap[n] != t]
+        if mismatches:
+            raise MaskError(f"imported mask tensor_plan mismatch on {len(mismatches)} tensors: {mismatches[:5]}")
+
+    if measured:
+        m["measured"] = dict(measured)
+    prov: dict = {"op": "import", "from_format": src_format, "input": in_name}
+    if override_info:
+        prov["override_recipe"] = override_info
+    if note:
+        prov["note"] = note
+    if extra_provenance:
+        prov.update(extra_provenance)
+    m["provenance"] = prov
+
+    op_p = Path(out_path)
+    op_p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = op_p.with_suffix(op_p.suffix + ".tmp")
+    tmp.write_text(json.dumps(m, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(op_p)
+    return {
+        "out": str(op_p),
+        "out_sha256": _mask_sha256(op_p),
+        "schema": m["schema"],
+        "from_format": src_format,
+        "groups": len(m["groups"]),
+        "tensor_overrides": len(m["tensors"]),
+        "tier_counts": inspect_mask(m)["tier_counts"],
+    }

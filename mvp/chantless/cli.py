@@ -127,6 +127,21 @@ def main():
     mk_p.add_argument("--allow-unpinned", action="store_true", help="allow pull without --sha256")
     mk_p.add_argument("--allow-http", action="store_true", help="allow plain http:// (for localhost verification)")
 
+    mk_im = mk_sub.add_parser("import", help="convert an existing GGUF, tensor-type/audit recipe, or legacy spec into chantless.mask/v3")
+    mk_im.add_argument("--from-gguf", help="existing mixed-precision GGUF whose header tensor types are imported")
+    mk_im.add_argument("--from-tensor-types", help="tensor-audit.json, *_types.json, or llama-quantize tensor_types.txt")
+    mk_im.add_argument("--from-spec", help="legacy spec JSON ({tiers: {group: tier}})")
+    mk_im.add_argument("--source-gguf", help="optional frozen base GGUF for canonical group/drop/regex resolution")
+    mk_im.add_argument("--hf-dir", help="optional HF config dir for Gemma 4 shared-KV metadata")
+    mk_im.add_argument("--override-recipe", help="optional dynquant override JSON ({protect_qtype, protected: [...]})")
+    mk_im.add_argument("--repo", default="", help="pinned source Hugging Face / ModelScope repo id")
+    mk_im.add_argument("--revision", default="", help="pinned source checkpoint revision")
+    mk_im.add_argument("--source-sha256", default="", help="pinned base GGUF SHA256")
+    mk_im.add_argument("--objective-mode", default="preserve", choices=("preserve", "improve"))
+    mk_im.add_argument("--note", help="provenance note attached to the imported mask")
+    mk_im.add_argument("--measured-json", help="optional JSON file of recorded evaluation/size measurements to attach")
+    mk_im.add_argument("--out", required=True, help="output chantless.mask/v3 JSON path")
+
     def _add_serve_args(p: argparse.ArgumentParser, default_bench: bool) -> None:
         p.add_argument("--model", help="built standalone specialist GGUF")
         p.add_argument("--source", help="frozen stock BF16 GGUF (paired with --mask for auto-build cache)")
@@ -258,6 +273,23 @@ def main():
                 out = mk.merge_masks(a.mask_a, a.mask_b, a.out, mode=a.mode, op=a.op)
             elif a.mask_cmd == "pull":
                 out = mk.pull_mask(a.uri, a.out, expected_sha256=a.sha256, allow_unpinned=a.allow_unpinned, allow_http=a.allow_http)
+            elif a.mask_cmd == "import":
+                meas = json.loads(Path(a.measured_json).read_text(encoding="utf-8")) if a.measured_json else None
+                out = mk.import_mask(
+                    a.out,
+                    from_gguf=a.from_gguf,
+                    from_tensor_types=a.from_tensor_types,
+                    from_spec=a.from_spec,
+                    source_gguf=a.source_gguf,
+                    hf_dir=a.hf_dir,
+                    override_recipe=a.override_recipe,
+                    repo=a.repo,
+                    revision=a.revision,
+                    source_sha256=a.source_sha256,
+                    objective_mode=a.objective_mode,
+                    note=a.note,
+                    measured=meas,
+                )
             else:
                 raise SystemExit(f"unknown mask subcommand {a.mask_cmd!r}")
         except (mk.MaskError, FileNotFoundError, ValueError) as e:

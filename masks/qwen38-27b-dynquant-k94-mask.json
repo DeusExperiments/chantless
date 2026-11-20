@@ -1,0 +1,477 @@
+{
+  "schema": "chantless.mask/v3",
+  "source": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "gguf_sha256": "05f18ee2b177c76c34a827a1bcada598a9bfd99f939ddcb8b37a9e47874f6599"
+  },
+  "objective_mode": "preserve",
+  "groups": {
+    "output": {
+      "tier": "Q6_K"
+    },
+    "token_embd": {
+      "tier": "Q2_K"
+    },
+    "blk.0.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.0.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.1.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.1.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.2.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.2.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.3.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.3.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.4.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.4.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.5.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.5.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.6.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.6.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.7.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.7.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.8.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.8.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.9.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.9.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.10.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.10.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.11.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.11.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.12.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.12.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.13.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.13.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.14.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.14.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.15.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.15.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.16.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.16.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.17.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.17.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.18.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.18.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.19.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.19.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.20.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.20.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.21.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.21.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.22.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.22.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.23.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.23.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.24.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.24.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.25.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.25.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.26.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.26.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.27.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.27.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.28.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.28.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.29.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.29.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.30.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.30.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.31.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.31.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.32.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.32.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.33.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.33.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.34.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.34.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.35.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.35.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.36.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.36.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.37.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.37.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.38.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.38.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.39.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.39.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.40.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.40.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.41.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.41.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.42.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.42.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.43.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.43.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.44.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.44.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.45.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.45.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.46.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.46.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.47.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.47.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.48.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.48.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.49.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.49.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.50.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.50.ffn": {
+      "tier": "Q2_K"
+    },
+    "blk.51.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.51.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.52.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.52.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.53.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.53.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.54.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.54.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.55.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.55.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.56.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.56.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.57.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.57.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.58.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.58.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.59.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.59.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.60.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.60.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.61.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.61.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.62.attn": {
+      "tier": "Q2_K"
+    },
+    "blk.62.ffn": {
+      "tier": "Q4_K"
+    },
+    "blk.63.attn": {
+      "tier": "Q4_K"
+    },
+    "blk.63.ffn": {
+      "tier": "Q4_K"
+    }
+  },
+  "tensors": {
+    "blk.1.attn_qkv.weight": "Q4_K",
+    "blk.1.ffn_down.weight": "Q3_K",
+    "blk.11.attn_output.weight": "Q3_K",
+    "blk.11.attn_v.weight": "Q4_K",
+    "blk.12.attn_qkv.weight": "Q4_K",
+    "blk.13.attn_qkv.weight": "Q4_K",
+    "blk.14.ffn_down.weight": "Q3_K",
+    "blk.15.attn_output.weight": "Q3_K",
+    "blk.15.attn_v.weight": "Q4_K",
+    "blk.16.attn_qkv.weight": "Q4_K",
+    "blk.16.ffn_down.weight": "Q3_K",
+    "blk.17.attn_qkv.weight": "Q4_K",
+    "blk.17.ffn_down.weight": "Q3_K",
+    "blk.18.attn_qkv.weight": "Q4_K",
+    "blk.20.attn_qkv.weight": "Q4_K",
+    "blk.22.attn_qkv.weight": "Q4_K",
+    "blk.24.ffn_down.weight": "Q3_K",
+    "blk.25.ffn_down.weight": "Q3_K",
+    "blk.27.ffn_down.weight": "Q3_K",
+    "blk.30.ffn_down.weight": "Q3_K",
+    "blk.33.attn_qkv.weight": "Q4_K",
+    "blk.39.attn_output.weight": "Q3_K",
+    "blk.39.attn_v.weight": "Q4_K",
+    "blk.41.attn_qkv.weight": "Q4_K",
+    "blk.42.attn_qkv.weight": "Q4_K",
+    "blk.46.attn_qkv.weight": "Q4_K",
+    "blk.5.attn_qkv.weight": "Q4_K",
+    "blk.5.ffn_down.weight": "Q3_K",
+    "blk.50.ffn_down.weight": "Q3_K",
+    "blk.56.attn_qkv.weight": "Q4_K",
+    "blk.6.ffn_down.weight": "Q3_K",
+    "blk.61.attn_qkv.weight": "Q4_K",
+    "blk.62.attn_qkv.weight": "Q4_K",
+    "blk.7.attn_output.weight": "Q3_K",
+    "blk.7.attn_v.weight": "Q4_K",
+    "blk.7.ffn_down.weight": "Q3_K",
+    "blk.8.ffn_down.weight": "Q3_K",
+    "blk.9.ffn_down.weight": "Q3_K"
+  },
+  "floors": {},
+  "weights": {
+    "lineage": []
+  },
+  "deployment": {},
+  "measured": {
+    "file_bytes": 14262798016,
+    "built_gguf_sha256": "2184c613b52d584442e11819226ee2f84d16c10454dae1d8f0eb09c74ff9c08d",
+    "source_f16_bytes": 54657734080,
+    "pct_of_f16": 26.09,
+    "protected_groups": 94,
+    "protected_tensors": 358,
+    "benchmark": "Terminal-Bench 2.1 (89 tasks x 4 attempts, seeds 38000-38003, Terminus 2)",
+    "pass_at_1_stored": 0.747,
+    "pass_at_1_audited": "265/356 (74.4%)",
+    "pass_at_4": "76/89 (85.4%)",
+    "integrity_note": "Stored summary reported 74.7% pass@1 (266/356); later audit removed one invalid Scheme pass -> 265/356 (74.4%) with one repeat-3 Scheme attempt noted under review."
+  },
+  "dead_tensors": [],
+  "widths": {},
+  "vocab_keep": null,
+  "apprentice": {
+    "switches": {},
+    "levels": {},
+    "decision": {}
+  },
+  "provenance": {
+    "op": "import",
+    "from_format": "tensor_audit_json",
+    "input": "k94-tensor-audit.json",
+    "note": "Imported from prism-dynquant Qwen3.8-27B Q2->Q4 K94 (94 ranked groups / 358 tensors upgraded to Q4_K over Q2_K mixed base; reused Q2->Q8 ranking).",
+    "origin_archive": "https://modelscope.cn/models/occupyingmars/Qwen3.8-27B-Q2-to-Q4-K94-GGUF",
+    "eval_archive": "https://modelscope.cn/datasets/occupyingmars/qwen38-27b-q2q4-k94-terminal-bench-21-release",
+    "original_llama_cpp_revision": "4b98ab805a2638121f1671bf572832e07ef13e7d",
+    "imatrix_sha256": "de775bda7accebe249178ff1e2189cb2a68e1e0664946e9f45a6cb9c489844a0"
+  }
+}

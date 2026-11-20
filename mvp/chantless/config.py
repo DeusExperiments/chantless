@@ -8,9 +8,9 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .mask import DROP, LADDER
+from .mask import DROP, LADDER, VALID_GGML_TYPES
 
-VALID_TIERS = set(LADDER) | {DROP}
+VALID_TIERS = set(VALID_GGML_TYPES) | {DROP}
 
 
 class StrictModel(BaseModel):
