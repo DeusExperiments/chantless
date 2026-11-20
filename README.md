@@ -12,37 +12,40 @@ Chantless starts from a frozen open-weight reference model and learns a thin `ch
 
 ### 1. Build the Unified Runtime (`llama.cpp` `a01dff9`) & Install `chantless`
 
-All supported architectures (`qwen3`, `qwen35` hybrid Gated DeltaNet + Full Attention, and `gemma4` Per-Layer Embeddings + Shared-KV) build and serve from a single `llama.cpp` patch:
+All supported architectures (`qwen3`, `qwen35` hybrid Gated DeltaNet + Full Attention, and `gemma4` Per-Layer Embeddings + Shared-KV) build and serve from a single `llama.cpp` patch (`a01dff9`), automated by [`scripts/build_toolchain.sh`](scripts/build_toolchain.sh) (auto-detects `CUDA → Metal → CPU`, pins single-arch `compute_cap` via `nvidia-smi`, and prefers `g++-12` when installed):
 
 ```bash
-git clone https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp && git checkout a01dff9
-git apply /path/to/Chantless/mvp/patches/llama-cpp-a01dff9-chantless.patch
-cmake -B build -DGGML_CUDA=ON   # or -DGGML_METAL=ON on macOS
-cmake --build build --config Release -j --target llama-server llama-quantize llama-imatrix
-```
-
-Install the Python package and CLI (`chantless`):
-
-```bash
+./scripts/build_toolchain.sh --backend auto --prefix .local/toolchain
 pip install -e ".[train,dev]"
+chantless doctor --llama-bin .local/toolchain/llama-a01dff9/build/bin --traj-kl .local/toolchain/bin/traj-kl
 ```
 
-### 2. Core CLI (`extract`, `build`, `learn`)
+### 2. Core CLI (`extract`, `learn`, `build`, `serve`/`bench`, `mask`, `sweep`)
 
 ```bash
-# 1. Rebuild a standalone GGUF deterministically from stock HF BF16 + a thin v3 mask:
-chantless build \
-  --source qwen3-4b-bf16.gguf \
-  --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
-  --llama-bin /path/to/llama.cpp/build/bin \
-  --out qwen3-4b-bfcl-apprentice.gguf
+# 1. Validate declarative YAML/JSON configs (Pydantic v2, extends:, --set overrides):
+chantless validate --config mvp/configs/local-smoke.json --kind extract
 
-# 2. Extract a new specialist mask under an exact byte budget and sequential select gate:
+# 2. Extract a specialist mask under an exact byte budget & sequential select gate:
 chantless extract --config mvp/configs/local-smoke.json --out-mask specialist-mask.json
 
-# 3. Teach an already-built quantized GGUF from <=25 mistakes at 0 extra bytes:
+# 3. Teach an already-built quantized GGUF from <=25 mistakes at 0 extra bytes (PrefixCache + frozen_bf16 + stream_prefix):
 chantless learn --config learn-config.json --out-mask apprentice-mask.json
+
+# 4. Materialize a standalone SHA256-exact GGUF (all 22 native llama-quantize ggml types supported):
+chantless build --source qwen3-4b-bf16.gguf --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
+  --llama-bin .local/toolchain/llama-a01dff9/build/bin --out qwen3-4b-bfcl-apprentice.gguf
+
+# 5. Serve or benchmark with SHA256 build cache, live nvidia-smi VRAM, and CUDA0/MTL0 buffer breakdown:
+chantless bench --source qwen3-4b-bf16.gguf --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
+  --compare qwen3-4b-bf16.gguf --llama-bin .local/toolchain/llama-a01dff9/build/bin
+
+# 6. Compose, inspect, diff, fork, merge, pull (SHA256-pinned), or import existing GGUFs/recipes into chantless.mask/v3:
+chantless mask inspect masks/qwen38-27b-dynquant-k34-mask.json
+chantless mask import --from-gguf existing-quant.gguf --source-gguf base-bf16.gguf --out imported-mask.json
+
+# 7. Run declarative multi-cell sweeps across local GPUs, SSH, Modal, or Colab with durable resume:
+chantless sweep --config sweep.yaml --dry-run
 ```
 
 ---
@@ -54,7 +57,7 @@ Every specialist and Apprentice artifact below has `weights.lineage = []` (zero 
 - **Tool Calling (`BFCL`) & Math Reasoning (`DeepMath`):** Pure mask-only non-inferiority (`traj-kl` one-shot solver + Wanda late-layer width cuts + control-tag-safe Rule-P vocabulary trim).
 - **Switch Apprentice (`Learn`):** Trains `up_row_zero` MLP neuron switches on `25` specialist mistakes (`float32` `replay_h0` full-vocabulary token-KL guard) and evaluates unseen held-out mistakes against `4` matched-byte controls (`base`, `empty`, `flipped`, `shuffled`), with `empty.sha256 == base.sha256` on all `9/9` pairs.
 
-All `18` thin masks and exact SHA256 receipts are in [`masks/README.md`](masks/README.md):
+All `22` thin masks (`18` `3×3` matrix masks + `4` imported dynamic-quantization winners: `Qwen3.8-27B K34`/`K94` and `Qwen3-8B IQ2_M K08`/`UD`) and exact SHA256 receipts are in [`masks/README.md`](masks/README.md):
 
 | Model (`Pinned HF Revision`) | Task | Built GGUF (`%` BF16, `bpw`) | Locked Exam vs Uniform Quant | Switch Apprentice (`25` ex → Unseen Fixed vs `base / empty / flip / shuf`) |
 | :--- | :--- | :---: | :--- | :--- |
@@ -71,6 +74,12 @@ All `18` thin masks and exact SHA256 receipts are in [`masks/README.md`](masks/R
 *(See [`masks/README.md`](masks/README.md) for control details on `qwen35-4b-clsbench` balanced-label `shuffled` and `qwen35-4b-bfcl`/`deepmath` pair-shuffled controls.)*
 
 ---
+
+## CUDA & Scale Verification
+
+- **NVIDIA CUDA (`RTX 4090`, `sm_89`, `CUDA 13.2`):** `PrefixCache` + `frozen_bf16` + `stream_prefix` + `pin_memory` reduced peak Apprentice CUDA alloc by **`83.95%`** (`3,072.8 MB → 493.3 MB`, `stream_hdiff = 0.0`, `empty.sha256 == base.sha256`); `chantless bench --compare` measured **`1.429×`** decode speedup (`630.0` vs `441.0 tok/s`), **`0.551×`** live `nvidia-smi` per-PID peak VRAM (`1,016` vs `1,844 MiB`), and **`0.411×`** `CUDA0` buffer footprint with `0` orphans on teardown.
+- **27B Scale & Eval Hardening:** Decoupled `/dev/shm` scratch vs NVMe source staging (`1.5×`/`3.5×`), automatic worker budget clamping, single-pass minimal `SpliceProbeBuilder` tier caching, and deterministic `judge_slots=1` (`--no-cache-prompt`) Apprentice control judging.
+- **Mask Interoperability:** All `22` native `llama-quantize` ggml types (`F32..IQ1_S`) supported in `chantless.mask/v3` and opt-in search ladders; live `chantless mask import --from-gguf` → `chantless build` verified SHA256 bit-identical.
 
 ## Earlier Milestones & Provenance
 
