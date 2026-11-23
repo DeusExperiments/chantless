@@ -2909,6 +2909,7 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
             cache_prompt=(False if c.get("judge_cache_prompt") is None else bool(c["judge_cache_prompt"])),
             special=serving.get("special"),
             flash_attn=("on" if serving.get("flash_attn") is None else serving["flash_attn"]),
+            use_chat_completions=serving.get("use_chat_completions"),
         )
         side_seed = c.get("side_seed")
         if c.get("heldout_ids") is not None:

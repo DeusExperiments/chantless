@@ -1217,3 +1217,580 @@ def test_shipped_inkling2_masks_validate_v3_schema():
             assert m.get("vocab_keep") is None
         else:
             assert m["vocab_keep"]["count"] == spec["vocab_keep"]
+
+
+# ------------------------------------------------------------------ 10. Optional `/v1/chat/completions` BFCL wiring
+def _make_bfcl_loopback_server(handler_fn):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    records: list[dict] = []
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            with lock:
+                idx = len(records)
+                records.append({"path": self.path, "body": body})
+            status, payload = handler_fn(self.path, body, idx)
+            data = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format, *args):
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    return srv, th, f"http://127.0.0.1:{srv.server_port}", records
+
+
+def _build_bfcl_dialect_hf_dir(out_dir: Path, dialect: str) -> Path:
+    from tokenizers import Tokenizer, decoders, models as tok_models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    alphabet = list(pre_tokenizers.ByteLevel.alphabet())
+    vocab_map = {tok: i for i, tok in enumerate(alphabet)}
+    if dialect == "inkling2":
+        specials = [
+            "<|endoftext|>",
+            "<|message_system|>",
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|message_tool|>",
+            "<|content_text|>",
+            "<|content_thinking|>",
+            "<|content_xml|>",
+            "<|content_invoke_tool_json|>",
+            "<|end_message|>",
+            "<|content_model_end_sampling|>",
+        ]
+        ct = (
+            "{%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}"
+            "{%- set effort_num = '0' if eff == 'none' else ('0.2' if eff == 'low' else ('0.9' if eff == 'high' else eff)) -%}"
+            "{%- if tools -%}"
+            "{{- '<|message_system|>tool_declare<|content_xml|>' ~ (tools | tojson) ~ '<|end_message|>' -}}"
+            "{%- endif -%}"
+            "{%- for m in messages -%}"
+            "{%- if m.role == 'system' -%}"
+            "{{- '<|message_system|><|content_text|>' ~ m.content ~ '<|end_message|>' -}}"
+            "{{- '<|message_system|><|content_text|>Thinking effort level: ' ~ effort_num ~ '<|end_message|>' -}}"
+            "{%- elif m.role == 'user' -%}"
+            "{{- '<|message_user|><|content_text|>' ~ m.content ~ '<|end_message|>' -}}"
+            "{%- elif m.role == 'assistant' -%}"
+            "{%- if m.reasoning_content is defined and m.reasoning_content -%}"
+            "{{- '<|message_model|><|content_thinking|>' ~ m.reasoning_content ~ '<|end_message|>' -}}"
+            "{%- endif -%}"
+            "{%- if m.tool_calls -%}"
+            "{%- for tc in m.tool_calls -%}"
+            "{{- '<|message_model|>' ~ tc.function.name ~ '<|content_invoke_tool_json|>' ~ ({'name': tc.function.name, 'args': tc.function.arguments} | tojson) ~ '<|end_message|>' -}}"
+            "{%- endfor -%}"
+            "{{- '<|content_model_end_sampling|>' -}}"
+            "{%- else -%}"
+            "{{- '<|message_model|><|content_text|>' ~ (m.content or '') ~ '<|end_message|><|content_model_end_sampling|>' -}}"
+            "{%- endif -%}"
+            "{%- endif -%}"
+            "{%- endfor -%}"
+        )
+        eos = "<|content_model_end_sampling|>"
+    elif dialect == "gemma4":
+        specials = ["<|endoftext|>", "<|tool_call>", "<tool_call|>", "<turn|>", "<end_of_turn>", "<|tool_response>"]
+        ct = "{%- for m in messages -%}{{- m.role ~ ':' ~ (m.content or '') ~ '<turn|>' -}}{%- endfor -%}"
+        eos = "<turn|>"
+    elif dialect == "qwen35_xml":
+        specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+        ct = "{%- for m in messages -%}{{- '<|im_start|>' ~ m.role ~ '\n' ~ (m.content or '') ~ '<|im_end|>\n' -}}{%- endfor -%}{%- if tools -%}<function=example>{%- endif -%}"
+        eos = "<|im_end|>"
+    else:
+        specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+        ct = "{%- for m in messages -%}{{- '<|im_start|>' ~ m.role ~ '\n' ~ (m.content or '') ~ '<|im_end|>\n' -}}{%- endfor -%}"
+        eos = "<|im_end|>"
+
+    for sp in specials:
+        if sp not in vocab_map:
+            vocab_map[sp] = len(vocab_map)
+    tk = Tokenizer(tok_models.BPE(vocab=vocab_map, merges=[]))
+    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tk.decoder = decoders.ByteLevel()
+    hf_tok = PreTrainedTokenizerFast(tokenizer_object=tk, eos_token=eos, pad_token="<|endoftext|>", chat_template=ct)
+    hf_tok.add_special_tokens({"additional_special_tokens": specials})
+    hf_tok.save_pretrained(out_dir)
+    return out_dir
+
+
+def test_bfcl_chat_completions_inkling2_wire_payload_and_grading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+    import urllib.request
+    from chantless import kl
+    from chantless.evaluator import Evaluator
+
+    ink_dir = _build_bfcl_dialect_hf_dir(tmp_path / "hf_ink", "inkling2")
+    java_raw_tools = [{
+        "type": "function",
+        "function": {
+            "name": "BasePolicyDataProvider.getRegistryPolicyValue",
+            "description": "Reads a registry policy.",
+            "parameters": {
+                "type": "dict",
+                "properties": {
+                    "root": {"type": "String", "description": "Registry root."},
+                    "property": {"type": "String", "description": "Policy property."},
+                },
+                "required": ["root", "property"],
+            },
+        },
+    }]
+    pairs_rows = [
+        {
+            "id": "simple:s0",
+            "category": "simple",
+            "family": "simple/b00",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Area of triangle base 6 height 10?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "geometry.area_triangle",
+                    "description": "Compute triangle area.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "base": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            "unit": {"type": "string"},
+                        },
+                        "required": ["base", "height"],
+                    },
+                },
+            }],
+            "reference_calls": [{"name": "geometry.area_triangle", "arguments": {"base": 6, "height": 10, "unit": ""}}],
+        },
+        {
+            "id": "java:j0",
+            "category": "java",
+            "family": "java/b00",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Read EnableExtensions from HKLM."}],
+            "tools": [bfcl._norm_schema(java_raw_tools[0])],
+            "raw_tools": java_raw_tools,
+            "reference_calls": [{
+                "name": "BasePolicyDataProvider.getRegistryPolicyValue",
+                "arguments": {"property": "EnableExtensions", "root": "WinReg.HKEY_LOCAL_MACHINE"},
+            }],
+        },
+        {
+            "id": "simple:s1_bad_json",
+            "category": "simple",
+            "family": "simple/b01",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Bare JSON text case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s2_len",
+            "category": "simple",
+            "family": "simple/b02",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Truncated length case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s3_garb",
+            "category": "simple",
+            "family": "simple/b03",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Garbage reasoning case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s4_infra",
+            "category": "simple",
+            "family": "simple/b04",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Server 500 case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s5_unknown",
+            "category": "simple",
+            "family": "simple/b05",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Unknown tool case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s6_bad_args",
+            "category": "simple",
+            "family": "simple/b06",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Malformed tool args case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+        {
+            "id": "simple:s7_loop",
+            "category": "simple",
+            "family": "simple/b07",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Doom loop reasoning case."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        },
+    ]
+    pairs_p = tmp_path / "bfcl_pairs.jsonl"
+    pairs_p.write_text("\n".join(json.dumps(r) for r in pairs_rows) + "\n", encoding="utf-8")
+
+    seen_timeouts: list[float] = []
+    orig_urlopen = urllib.request.urlopen
+
+    def spy_urlopen(req, *args, **kwargs):
+        if "timeout" in kwargs:
+            seen_timeouts.append(kwargs["timeout"])
+        return orig_urlopen(req, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", spy_urlopen)
+    monkeypatch.setattr("chantless.client.time.sleep", lambda _s: None)
+
+    def responder(path, body, idx):
+        user_txt = body["messages"][-1]["content"]
+        if "Area of triangle" in user_txt:
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "Triangle area needs base=6 and height=10.",
+                        "tool_calls": [{
+                            "id": "call_tri_1",
+                            "type": "function",
+                            "function": {
+                                "name": "geometry.area_triangle",
+                                "arguments": '{"base": "6", "height": 10}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 27},
+            }
+        if "Read EnableExtensions" in user_txt:
+            # Fallback to Inkling-2 wire tag in `content` when `tool_calls` is empty
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "<|message_model|>BasePolicyDataProvider.getRegistryPolicyValue"
+                            "<|content_invoke_tool_json|>"
+                            '{"name":"BasePolicyDataProvider","args":{"property":"EnableExtensions","root":"WinReg.HKEY_LOCAL_MACHINE"}}'
+                            "<|end_message|>"
+                        ),
+                        "tool_calls": [],
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"completion_tokens": 31},
+            }
+        if "Bare JSON text case" in user_txt:
+            # Plain-text JSON without `<|content_invoke_tool_json|>` must NOT pass on Inkling-2
+            return 200, {
+                "choices": [{
+                    "message": {"role": "assistant", "content": '{"name": "ping", "arguments": {}}'},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"completion_tokens": 9},
+            }
+        if "Truncated length case" in user_txt:
+            return 200, {
+                "choices": [{
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "still thinking..."},
+                    "finish_reason": "length",
+                }],
+                "usage": {"completion_tokens": 1024},
+            }
+        if "Garbage reasoning case" in user_txt:
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "bad utf8 \ufffd token",
+                        "tool_calls": [{"id": "c_g", "type": "function", "function": {"name": "ping", "arguments": "{}"}}],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 14},
+            }
+        if "Unknown tool case" in user_txt:
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{"id": "c_u", "type": "function", "function": {"name": "not_a_tool", "arguments": "{}"}}],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 8},
+            }
+        if "Malformed tool args case" in user_txt:
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{"id": "c_m", "type": "function", "function": {"name": "ping", "arguments": "{broken"}}],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 8},
+            }
+        if "Doom loop reasoning case" in user_txt:
+            span = " ".join(f"tok{k}" for k in range(16))
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": " ".join([span] * 4),
+                        "tool_calls": [{"id": "c_l", "type": "function", "function": {"name": "ping", "arguments": "{}"}}],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 80},
+            }
+        return 500, {"error": "grammar error"}
+
+    srv, th, url, recs = _make_bfcl_loopback_server(responder)
+    tc = runtime.Toolchain(llama_bin=tmp_path, traj_kl=tmp_path / "traj-kl", gpus=[""])
+    try:
+        env = bfcl.BfclEnvironment(hf_dir=str(ink_dir), pairs_file=str(pairs_p), max_tokens=1024, reasoning_effort="none")
+        ev = Evaluator(
+            tc,
+            env,
+            {"temperature": 1.0},
+            slots_per_gpu=1,
+            ctx_per_slot=8192,
+            kv_type="f16",
+            log_dir=tmp_path / "logs_none",
+            infra_retries=0,
+            request_timeout=321.5,
+        )
+        assert ev.use_chat_completions is True
+        tasks = env.tasks()
+        rows = ev.run("mock-inkling2", [(t, 17 + i) for i, t in enumerate(tasks)], "bfcl_oai", save=True, srvs=[SimpleNamespace(url=url, special=True)])
+        by_id = {r["task"]: r for r in rows}
+        eps_by_id = {ep.task_id: ep for ep in ev.last_episodes}
+
+        # Wire HTTP payload checks
+        assert all(r["path"] == "/v1/chat/completions" for r in recs)
+        req0 = recs[0]["body"]
+        assert req0["messages"][0] == {"role": "system", "content": bfcl.DEFAULT_INKLING2_TOOL_SYSTEM_PROMPT}
+        assert req0["messages"][1]["role"] == "user"
+        assert "Python 3 syntax" in req0["tools"][0]["function"]["description"]
+        assert req0["chat_template_kwargs"] == {"reasoning_effort": "none"}
+        assert req0["temperature"] == 1.0
+        assert req0["max_tokens"] == 1024
+        assert req0["seed"] == 17
+        assert req0["stop"] == ["<|content_model_end_sampling|>"]
+        assert req0["cache_prompt"] is False
+        assert 321.5 in seen_timeouts
+
+        # Java raw_tools Gorilla hints sent on the wire
+        req_java = recs[1]["body"]
+        assert "Java 8 SDK syntax" in req_java["tools"][0]["function"]["description"]
+        assert req_java["tools"][0]["function"]["parameters"]["properties"]["root"]["type"] == "string"
+
+        # Grading & Episode population
+        assert by_id["simple:s0"]["success"] is True
+        assert by_id["simple:s0"]["tokens"] == 27
+        assert eps_by_id["simple:s0"].reasoning_content == "Triangle area needs base=6 and height=10."
+        assert eps_by_id["simple:s0"].finish_reasons == ["tool_calls"]
+
+        assert by_id["java:j0"]["success"] is True
+        assert by_id["java:j0"]["tokens"] == 31
+
+        assert by_id["simple:s1_bad_json"]["success"] is False
+        assert by_id["simple:s1_bad_json"]["detectors"]["malformed_tool_call"] is True
+
+        assert by_id["simple:s2_len"]["success"] is False
+        assert by_id["simple:s2_len"]["detectors"]["premature_stop"] is True
+        assert by_id["simple:s2_len"]["detectors"]["malformed_tool_call"] is True
+
+        assert by_id["simple:s3_garb"]["success"] is False
+        assert by_id["simple:s3_garb"]["tests_passed"] is True
+        assert by_id["simple:s3_garb"]["detectors"]["token_garbage"] is True
+
+        assert by_id["simple:s4_infra"]["success"] is None
+        assert by_id["simple:s4_infra"]["infra_error"] is not None
+
+        assert by_id["simple:s5_unknown"]["success"] is False
+        assert by_id["simple:s5_unknown"]["detectors"]["malformed_tool_call"] is True
+
+        assert by_id["simple:s6_bad_args"]["success"] is False
+        assert by_id["simple:s6_bad_args"]["detectors"]["malformed_tool_call"] is True
+
+        assert by_id["simple:s7_loop"]["success"] is False
+        assert by_id["simple:s7_loop"]["tests_passed"] is True
+        assert by_id["simple:s7_loop"]["detectors"]["doom_loop"] is True
+
+        # Saved JSONL preserves `verdict.pred_calls` (Gorilla replay compatible) and `reasoning_content`
+        saved = {
+            json.loads(line)["task"]: json.loads(line)
+            for line in (tmp_path / "logs_none" / "bfcl_oai.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        assert saved["simple:s0"]["verdict"]["pred_calls"] == [
+            {"arguments": {"base": 6, "height": 10}, "name": "geometry.area_triangle"}
+        ]
+        assert saved["simple:s0"]["reasoning_content"] == "Triangle area needs base=6 and height=10."
+        assert saved["java:j0"]["verdict"]["pred_calls"] == [{
+            "arguments": {"property": "EnableExtensions", "root": "WinReg.HKEY_LOCAL_MACHINE"},
+            "name": "BasePolicyDataProvider.getRegistryPolicyValue",
+        }]
+        assert "reasoning_content" not in saved["java:j0"]
+
+        # High reasoning_effort propagates to `chat_template_kwargs` AND `kl.Renderer.episode` renders cleanly
+        recs.clear()
+        env_hi = bfcl.BfclEnvironment(hf_dir=str(ink_dir), pairs_file=str(pairs_p), max_tokens=2048, reasoning_effort="high")
+        ev_hi = Evaluator(tc, env_hi, {"temperature": 1.0}, 1, 8192, "f16", tmp_path / "logs_hi", infra_retries=0)
+        hi_rows = ev_hi.run("mock-inkling2", [(env_hi.tasks()[0], 99)], "bfcl_hi", save=False, srvs=[SimpleNamespace(url=url, special=True)])
+        assert hi_rows[0]["success"] is True
+        assert recs[0]["body"]["chat_template_kwargs"] == {"reasoning_effort": "high"}
+        assert recs[0]["body"]["max_tokens"] == 2048
+        ep_hi = ev_hi.last_episodes[0]
+        R = kl.Renderer(str(ink_dir), reasoning_effort="high")
+        kl_recs = R.episode(ep_hi.messages, ep_hi.tools)
+        assert len(kl_recs) == 1 and len(kl_recs[0][1]) > 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        th.join(timeout=2)
+
+
+def test_bfcl_chat_completions_rule0_and_explicit_overrides(tmp_path: Path):
+    from types import SimpleNamespace
+    from chantless.evaluator import Evaluator
+
+    pairs_p = tmp_path / "bfcl_r0.jsonl"
+    pairs_p.write_text(
+        json.dumps({
+            "id": "simple:s0",
+            "category": "simple",
+            "family": "simple/b00",
+            "split": "select",
+            "messages": [{"role": "user", "content": "Call ping."}],
+            "tools": [{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            "reference_calls": [{"name": "ping", "arguments": {}}],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    dm_p = tmp_path / "dm_r0.jsonl"
+    dm_p.write_text(
+        json.dumps({"id": "q0", "question": "1+1?", "answer": "2", "difficulty": 4.0, "group": 1, "split": "select", "area": "Algebra"}) + "\n",
+        encoding="utf-8",
+    )
+
+    def responder(path, body, idx):
+        if path == "/v1/chat/completions":
+            return 200, {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "ping", "arguments": "{}"}}],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"completion_tokens": 5},
+            }
+        # `/v1/completions`
+        prompt = body["prompt"]
+        if "<|message_user|>" in prompt and "1+1?" in prompt:
+            txt = r"<|message_model|><|content_text|>\boxed{2}<|end_message|>"
+        elif "<|message_user|>" in prompt:
+            txt = '<|message_model|>ping<|content_invoke_tool_json|>{"name":"ping","args":{}}<|end_message|>'
+        elif "<turn|>" in prompt:
+            txt = "<|tool_call>call:ping{}<tool_call|>"
+        elif "<function=" in prompt:
+            txt = "<tool_call>\n<function=ping>\n</function>\n</tool_call>"
+        else:
+            txt = '<tool_call>\n{"name": "ping", "arguments": {}}\n</tool_call>'
+        return 200, {"choices": [{"text": txt, "finish_reason": "stop"}], "usage": {"completion_tokens": 6}}
+
+    srv, th, url, recs = _make_bfcl_loopback_server(responder)
+    tc = runtime.Toolchain(llama_bin=tmp_path, traj_kl=tmp_path / "traj-kl", gpus=[""])
+    try:
+        # Rule 0: non-inkling2 BFCL (`qwen3_json`, `qwen35_xml`, `gemma4`) stays 100% on `/v1/completions`
+        for dial in ("qwen3_json", "qwen35_xml", "gemma4"):
+            d_dir = _build_bfcl_dialect_hf_dir(tmp_path / f"hf_{dial}", dial)
+            env_d = bfcl.BfclEnvironment(hf_dir=str(d_dir), pairs_file=str(pairs_p))
+            assert env_d.dialect == dial
+            ev_d = Evaluator(tc, env_d, {"temperature": 0.0}, 1, 2048, "f16", tmp_path / f"log_{dial}")
+            assert ev_d.use_chat_completions is False
+            recs.clear()
+            rows_d = ev_d.run("m", [(env_d.tasks()[0], 0)], f"r0_{dial}", save=False, srvs=[SimpleNamespace(url=url, special=False)])
+            assert rows_d[0]["success"] is True
+            assert len(recs) == 1 and recs[0]["path"] == "/v1/completions"
+
+        # Rule 0: Inkling-2 DeepMath stays 100% on `/v1/completions`
+        ink_dir = _build_bfcl_dialect_hf_dir(tmp_path / "hf_ink_r0", "inkling2")
+        dm_env = deepmath.DeepMathEnvironment(hf_dir=str(ink_dir), jsonl_file=str(dm_p))
+        ev_dm = Evaluator(tc, dm_env, {"temperature": 1.0}, 1, 4096, "f16", tmp_path / "log_dm")
+        assert ev_dm.use_chat_completions is False
+        recs.clear()
+        dm_rows = ev_dm.run("m", [(dm_env.tasks()[0], 0)], "r0_dm", save=False, srvs=[SimpleNamespace(url=url, special=True)])
+        assert dm_rows[0]["success"] is True
+        assert len(recs) == 1 and recs[0]["path"] == "/v1/completions"
+
+        # Explicit `use_chat_completions=False` on Inkling-2 BFCL forces `/v1/completions`
+        ink_bfcl = bfcl.BfclEnvironment(hf_dir=str(ink_dir), pairs_file=str(pairs_p))
+        ev_force_comp = Evaluator(
+            tc, ink_bfcl, {"temperature": 1.0}, 1, 4096, "f16", tmp_path / "log_ink_comp", use_chat_completions=False
+        )
+        assert ev_force_comp.use_chat_completions is False
+        recs.clear()
+        rows_fc = ev_force_comp.run("m", [(ink_bfcl.tasks()[0], 0)], "ink_comp", save=False, srvs=[SimpleNamespace(url=url, special=True)])
+        assert rows_fc[0]["success"] is True
+        assert len(recs) == 1 and recs[0]["path"] == "/v1/completions"
+
+        # Explicit `use_chat_completions=True` on Qwen3 BFCL enables `/v1/chat/completions` without leaking `reasoning_effort`
+        q3_env = bfcl.BfclEnvironment(hf_dir=str(tmp_path / "hf_qwen3_json"), pairs_file=str(pairs_p))
+        ev_force_chat = Evaluator(
+            tc, q3_env, {"temperature": 0.0}, 1, 4096, "f16", tmp_path / "log_q3_chat", use_chat_completions=True
+        )
+        assert ev_force_chat.use_chat_completions is True
+        recs.clear()
+        rows_q3c = ev_force_chat.run("m", [(q3_env.tasks()[0], 0)], "q3_chat", save=False, srvs=[SimpleNamespace(url=url, special=False)])
+        assert rows_q3c[0]["success"] is True
+        assert len(recs) == 1 and recs[0]["path"] == "/v1/chat/completions"
+        assert recs[0]["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert recs[0]["body"]["cache_prompt"] is False
+
+        # ServingConfig optional `use_chat_completions` flag validates and stays omitted when None
+        sc_default = cfgmod.ServingConfig()
+        assert sc_default.use_chat_completions is None
+        assert "use_chat_completions" not in sc_default.model_dump(exclude_none=True)
+        assert cfgmod.ServingConfig(use_chat_completions=True).use_chat_completions is True
+        assert cfgmod.ServingConfig(use_chat_completions=False).use_chat_completions is False
+        bfcl_cfg = cfgmod.load_config(
+            ROOT / "mvp/configs/inkling2-mini-bfcl.yaml", "extract", overrides=["serving.use_chat_completions=false"]
+        )
+        assert bfcl_cfg.serving.use_chat_completions is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        th.join(timeout=2)

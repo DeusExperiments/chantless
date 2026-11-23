@@ -304,6 +304,7 @@ class Run:
         cache_prompt = bool(serving.get("cache_prompt", False))
         special = serving.get("special")
         flash_attn = serving.get("flash_attn") or "on"
+        use_chat_completions = serving.get("use_chat_completions")
         serv_slots = serving.get("slots_per_gpu") or 4
         ctx_per_slot = serving.get("ctx_per_slot") or 8192
         if self.classifier:
@@ -311,13 +312,15 @@ class Run:
             self.scorer = BatchScorer(self.tc, scoring.get("slots_per_gpu") or 2)
             self.ev = Evaluator(self.tc, self.env, decoding, serv_slots,
                                 ctx_per_slot, self.dep["kv_type"], self.dir / "episodes",
-                                scorer=self.scorer, cache_prompt=cache_prompt, special=special, flash_attn=flash_attn)
+                                scorer=self.scorer, cache_prompt=cache_prompt, special=special, flash_attn=flash_attn,
+                                use_chat_completions=use_chat_completions)
             if scoring.get("seed"):
                 self._seed_source_scores(scoring["seed"])
         else:
             self.ev = Evaluator(self.tc, self.env, decoding, serv_slots,
                                 ctx_per_slot, self.dep["kv_type"], self.dir / "episodes",
-                                cache_prompt=cache_prompt, special=special, flash_attn=flash_attn)
+                                cache_prompt=cache_prompt, special=special, flash_attn=flash_attn,
+                                use_chat_completions=use_chat_completions)
         self.t0 = time.time()
 
     def _seed_source_scores(self, sd: dict):
@@ -952,7 +955,7 @@ class Run:
             p = self.dir / "episodes" / f
             for r in (read_jsonl(p) if p.exists() else []):
                 if r["success"] is not None and r["split"] == split:
-                    bank.setdefault(r["task"], {k: v for k, v in r.items() if k not in ("messages", "final", "verdict")})
+                    bank.setdefault(r["task"], {k: v for k, v in r.items() if k not in ("messages", "final", "verdict", "reasoning_content")})
         return bank if all(t.id in bank for t in tasks) else None
 
     def _exam_pool_from_scores(self, ex_tasks) -> list[dict]:

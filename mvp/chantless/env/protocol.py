@@ -35,6 +35,7 @@ class Episode:
     completion_tokens: int
     wall_s: float
     infra_error: str | None = None
+    reasoning_content: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

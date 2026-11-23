@@ -39,7 +39,8 @@ class Evaluator:
     def __init__(self, tc: Toolchain, env, decoding: dict, slots_per_gpu: int, ctx_per_slot: int, kv_type: str,
                  log_dir: str | Path, infra_retries: int = 2, scorer: BatchScorer | None = None,
                  cache_prompt: bool = False, special: bool | None = None, dialect: str | None = None,
-                 flash_attn: str = "on", extra: list[str] | None = None, request_timeout: float = 600.0):
+                 flash_attn: str = "on", extra: list[str] | None = None, request_timeout: float = 600.0,
+                 use_chat_completions: bool | None = None):
         self.tc, self.env, self.decoding = tc, env, decoding
         self.slots, self.ctx, self.kv = slots_per_gpu, ctx_per_slot, kv_type
         self.cache_prompt = bool(cache_prompt)
@@ -47,6 +48,10 @@ class Evaluator:
         self.extra = list(extra) if extra is not None else []
         self.request_timeout = float(request_timeout)
         self.dialect = dialect if dialect is not None else getattr(env, "dialect", None)
+        self._use_chat_completions_override: bool | None = (
+            None if use_chat_completions is None else bool(use_chat_completions)
+        )
+        self.use_chat_completions: bool = self._resolve_use_chat_completions(self.dialect)
         self._special_override = None if special is None else bool(special)
         env_special = getattr(env, "needs_special_tokens", None)
         self._env_special: bool | None = (
@@ -99,6 +104,11 @@ class Evaluator:
             return "inkling2"
         return None
 
+    def _resolve_use_chat_completions(self, dialect: str | None) -> bool:
+        if self._use_chat_completions_override is not None:
+            return self._use_chat_completions_override
+        return dialect == "inkling2" and getattr(self.env, "name", None) == "bfcl"
+
     @contextlib.contextmanager
     def servers(self, model: str):
         if self.classifier:
@@ -124,6 +134,12 @@ class Evaluator:
         if not srvs:
             raise ValueError("Evaluator.run requires at least one server")
         eff_dialect = self._resolve_dialect(model, srvs)
+        eff_use_chat = self._resolve_use_chat_completions(eff_dialect)
+        use_bfcl_chat = (
+            eff_use_chat
+            and getattr(self.env, "name", None) == "bfcl"
+            and (callable(getattr(self.env, "run_chat", None)) or callable(getattr(self.env, "prepare_request_messages_and_tools", None)))
+        )
         clients = [
             ChatClient(s.url, self.decoding, timeout=self.request_timeout, dialect=eff_dialect, cache_prompt=self.cache_prompt)
             for s in srvs
@@ -135,7 +151,14 @@ class Evaluator:
             cl = clients[i % len(clients)]
             for attempt in range(self.retries + 1):
                 try:
-                    ep = self.env.run(task, cl, seed)
+                    if use_bfcl_chat:
+                        if callable(getattr(self.env, "run_chat", None)):
+                            ep = self.env.run_chat(task, cl, seed)
+                        else:
+                            from .env.bfcl import run_chat_episode
+                            ep = run_chat_episode(self.env, task, cl, seed)
+                    else:
+                        ep = self.env.run(task, cl, seed)
                 except InfraError as e:
                     ep = Episode(task.id, seed, [], None, None, ["error"], 0, 0, 0.0, infra_error=str(e))
                 if not ep.infra_error:
@@ -147,8 +170,11 @@ class Evaluator:
                    "tokens": ep.completion_tokens, "wall_s": round(ep.wall_s, 2)}
             if save:
                 with self._lock:
-                    append_jsonl(out_path, {**row, "messages": ep.messages, "final": ep.final_text,
-                                            "verdict": v.details})
+                    rec = {**row, "messages": ep.messages, "final": ep.final_text, "verdict": v.details}
+                    rc = getattr(ep, "reasoning_content", None)
+                    if rc is not None:
+                        rec["reasoning_content"] = rc
+                    append_jsonl(out_path, rec)
             return row, ep
 
         n = self.slots * len(clients)

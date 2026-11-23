@@ -112,6 +112,7 @@ class ServingConfig(StrictModel):
     cache_prompt: bool = False
     flash_attn: Literal["on", "off", "auto"] = "on"
     special: bool | None = None
+    use_chat_completions: bool | None = None
 
 
 class PoolConfig(StrictModel):

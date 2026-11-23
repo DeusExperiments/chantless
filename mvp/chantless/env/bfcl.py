@@ -349,6 +349,28 @@ def parse_tool_calls(text: str, *, allowed_names: set[str] | None = None) -> lis
     return calls
 
 
+def extract_oai_tool_calls(msg: dict[str, Any], allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
+    """Parse OpenAI `message.tool_calls` via `_parse_maybe` + `canonical`, falling back to Inkling-2 wire tags."""
+    if not isinstance(msg, dict):
+        return []
+    tcs = msg.get("tool_calls")
+    calls: list[dict[str, Any]] = []
+    if isinstance(tcs, list):
+        for tc in tcs:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "").strip()
+            args = _parse_maybe(fn.get("arguments"))
+            if name and isinstance(args, dict):
+                calls.append(canonical({"name": name, "arguments": args}))
+    if not calls:
+        raw = msg.get("content")
+        if isinstance(raw, str) and "<|content_invoke_tool_json|>" in raw:
+            calls = parse_tool_calls(raw, allowed_names=allowed_names)
+    return calls
+
+
 def format_tool_call(call: dict[str, Any], dialect: str) -> str:
     """Serialize a canonical `{"name": ..., "arguments": {...}}` call in the model family's native syntax."""
     name = str(call["name"])
@@ -835,7 +857,12 @@ class BfclEnvironment:
         search_ts = self.sample_tasks("search", int(n), stratified=True)
         return [self.render_prompt(t) + self.format_reference(t) for t in search_ts]
 
-    def run(self, task: Task, client: Any, seed: int) -> Episode:
+    def run_chat(self, task: Task, client: Any, seed: int) -> Episode:
+        return run_chat_episode(self, task, client, seed)
+
+    def run(self, task: Task, client: Any, seed: int, *, use_chat_completions: bool = False) -> Episode:
+        if use_chat_completions:
+            return self.run_chat(task, client, seed)
         t0 = time.time()
         req_msgs, req_tools = self.prepare_request_messages_and_tools(task)
         prompt_str = render_chat_prompt(
@@ -874,8 +901,20 @@ class BfclEnvironment:
             return Verdict(task.id, episode.seed, False, {}, infra_error=episode.infra_error)
         txt = episode.final_text or ""
         allowed_names = {t["function"]["name"] for t in (task.prompt.get("tools") or []) if "function" in t}
-        pred_calls = parse_tool_calls(txt, allowed_names=allowed_names)
-        words = txt.split()
+        last_asst = next(
+            (m for m in reversed(episode.messages or []) if isinstance(m, dict) and m.get("role") == "assistant"),
+            None,
+        )
+        has_oai_tcs = isinstance(last_asst, dict) and bool(last_asst.get("tool_calls"))
+        if has_oai_tcs:
+            pred_calls = extract_oai_tool_calls(last_asst, allowed_names=allowed_names)
+        elif self.dialect == "inkling2":
+            pred_calls = parse_tool_calls(txt, allowed_names=allowed_names) if "<|content_invoke_tool_json|>" in txt else []
+        else:
+            pred_calls = parse_tool_calls(txt, allowed_names=allowed_names)
+        rc = getattr(episode, "reasoning_content", None) or (last_asst.get("reasoning_content") if isinstance(last_asst, dict) else None) or ""
+        det_txt = f"{rc}\n{txt}" if rc else txt
+        words = det_txt.split()
         span_rep = False
         if len(words) >= 64:
             seen: dict[tuple[str, ...], int] = {}
@@ -886,8 +925,10 @@ class BfclEnvironment:
                     span_rep = True
                     break
         malformed = len(pred_calls) == 0 or any(c.get("name") not in allowed_names for c in pred_calls)
-        premature = any(r == "length" for r in episode.finish_reasons) or not txt.strip()
-        garbage = "\ufffd" in txt
+        premature = any(r == "length" for r in episode.finish_reasons) or (not txt.strip() and not has_oai_tcs)
+        garbage = "\ufffd" in det_txt
+        if not garbage and has_oai_tcs:
+            garbage = "\ufffd" in json.dumps(last_asst.get("tool_calls"), ensure_ascii=False)
         ok = (not malformed) and calls_match(pred_calls, task.meta["reference_calls"])
         dets = {
             "doom_loop": span_rep,
@@ -896,6 +937,87 @@ class BfclEnvironment:
             "token_garbage": garbage,
         }
         return Verdict(task.id, episode.seed, ok, dets, details={"pred_calls": pred_calls})
+
+
+def run_chat_episode(env: Any, task: Task, client: Any, seed: int) -> Episode:
+    """Execute one BFCL turn over `/v1/chat/completions` with OpenAI tools and populate an `Episode`."""
+    t0 = time.time()
+    req_msgs, req_tools = env.prepare_request_messages_and_tools(task)
+    eff_dialect = getattr(client, "dialect", None) or getattr(env, "dialect", None)
+    env_re = getattr(env, "reasoning_effort", None)
+    chat_kw: dict[str, Any] = {}
+    if eff_dialect == "inkling2":
+        if env_re is not None:
+            chat_kw["chat_template_kwargs"] = {"reasoning_effort": env_re}
+    elif env_re is not None:
+        chat_kw["chat_template_kwargs"] = {"enable_thinking": _thinking_enabled(eff_dialect, env_re)}
+    stop = getattr(env, "stop", None)
+    if stop:
+        chat_kw["stop"] = list(stop)
+    max_tokens = int(
+        getattr(env, "max_tokens", None)
+        or (getattr(env, "budget", None) or {}).get("max_tokens_per_turn")
+        or 256
+    )
+    try:
+        res = client.chat(
+            req_msgs,
+            seed=seed,
+            max_tokens=max_tokens,
+            tools=req_tools or None,
+            **chat_kw,
+        )
+    except InfraError as e:
+        return Episode(task.id, seed, list(req_msgs), req_tools, None, [], 0, 0, time.time() - t0, str(e))
+
+    msg = res.get("message") if isinstance(res, dict) else {}
+    if not isinstance(msg, dict):
+        msg = {}
+    raw_content = msg.get("content")
+    content_str = raw_content if isinstance(raw_content, str) else ""
+    raw_rc = msg.get("reasoning_content")
+    rc_str = raw_rc if isinstance(raw_rc, str) and raw_rc != "" else None
+    raw_tcs = msg.get("tool_calls")
+    tcs_list = raw_tcs if isinstance(raw_tcs, list) and raw_tcs else None
+
+    am: dict[str, Any] = {"role": "assistant", "content": content_str}
+    if rc_str is not None:
+        am["reasoning_content"] = rc_str
+    if tcs_list is not None:
+        am["tool_calls"] = tcs_list
+
+    allowed_names = {
+        t["function"]["name"]
+        for t in (req_tools or [])
+        if isinstance(t, dict) and isinstance(t.get("function"), dict) and "name" in t["function"]
+    }
+    parsed_calls = extract_oai_tool_calls(msg, allowed_names=allowed_names)
+    fmt_dialect = eff_dialect or "inkling2"
+    if tcs_list is not None:
+        if parsed_calls:
+            formatted = "\n".join(format_tool_call(c, fmt_dialect) for c in parsed_calls)
+            final_text = f"{content_str.strip()}\n{formatted}" if content_str.strip() else formatted
+        else:
+            final_text = content_str.strip() or json.dumps(tcs_list, ensure_ascii=False)
+    else:
+        final_text = content_str.strip()
+
+    msgs = list(req_msgs) + [am]
+    ctok = res.get("completion_tokens", 0) if isinstance(res, dict) else 0
+    ctok_int = int(ctok) if isinstance(ctok, int) and not isinstance(ctok, bool) else 0
+    finish_reason = (res.get("finish_reason") if isinstance(res, dict) else None) or "stop"
+    return Episode(
+        task_id=task.id,
+        seed=seed,
+        messages=msgs,
+        tools=req_tools,
+        final_text=final_text,
+        finish_reasons=[finish_reason],
+        n_turns=1,
+        completion_tokens=ctok_int,
+        wall_s=time.time() - t0,
+        reasoning_content=rc_str,
+    )
 
 
 def make_environment(**kwargs) -> BfclEnvironment:

@@ -81,6 +81,7 @@ class ChatClient:
         tools: list[dict] | None = None,
         chat_template_kwargs: dict | None = None,
         cache_prompt: bool | None = None,
+        stop: list[str] | None = None,
     ) -> dict:
         dec_ctk = self.decoding.get("chat_template_kwargs")
         if isinstance(dec_ctk, dict):
@@ -114,6 +115,8 @@ class ChatClient:
             body["cache_prompt"] = False
         if tools:
             body["tools"] = tools
+        if stop:
+            body["stop"] = list(stop)
         payload = json.dumps(body).encode()
         last = None
         for attempt in range(self.retries):
