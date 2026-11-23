@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,11 +57,61 @@ class DecodingConfig(StrictModel):
     min_p: float | None = None
     max_tokens: int | None = None
     seed: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    enable_thinking: bool | None = None
+    reasoning_effort: str | float | None = None
+
+    @field_validator("temperature", "top_p", "top_k", "min_p", "max_tokens", "seed", "reasoning_effort", mode="before")
+    @classmethod
+    def _reject_numeric_bool(cls, v: Any, info: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError(f"{info.field_name} must be numeric or None (not bool), got {v!r}")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def _check_temperature(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0.0:
+            raise ValueError(f"temperature must be finite and >= 0, got {v!r}")
+        return v
+
+    @field_validator("top_p", "min_p")
+    @classmethod
+    def _check_unit_prob(cls, v: float | None, info: Any) -> float | None:
+        if v is not None and (not math.isfinite(v) or not (0.0 <= v <= 1.0)):
+            raise ValueError(f"{info.field_name} must be finite in [0, 1], got {v!r}")
+        return v
+
+    @field_validator("top_k")
+    @classmethod
+    def _check_top_k(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError(f"top_k must be >= 0, got {v!r}")
+        return v
+
+    @field_validator("max_tokens")
+    @classmethod
+    def _check_max_tokens(cls, v: int | None) -> int | None:
+        if v is not None and v < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {v!r}")
+        return v
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _check_reasoning_effort(cls, v: str | float | None) -> str | float | None:
+        if isinstance(v, float) and (not math.isfinite(v) or v < 0):
+            raise ValueError(f"reasoning_effort must be finite and >= 0, got {v!r}")
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("reasoning_effort string must be non-empty")
+        return v
 
 
 class ServingConfig(StrictModel):
     slots_per_gpu: int = Field(default=4, ge=1)
     ctx_per_slot: int = Field(default=8192, ge=128)
+    cache_prompt: bool = False
+    flash_attn: Literal["on", "off", "auto"] = "on"
+    special: bool | None = None
 
 
 class PoolConfig(StrictModel):
@@ -101,8 +153,8 @@ class ProxyConfig(StrictModel):
     @field_validator("floor_tier")
     @classmethod
     def _check_tier(cls, v: str) -> str:
-        if v not in VALID_TIERS:
-            raise ValueError(f"unknown tier {v!r}")
+        if v not in VALID_GGML_TYPES:
+            raise ValueError(f"floor_tier must be a quantized/ggml tier (not {v!r})")
         return v
 
 
@@ -111,15 +163,29 @@ class SanityConfig(StrictModel):
     behavioral_items: int = Field(default=0, ge=0)
     behavioral_seeds: int = Field(default=1, ge=1)
     behavioral_margin: float = 0.1
-    cap: str | float | bool | None = "off"
-    floor_key: str = "task"
+    cap: Literal["off", "general_kl"] = "off"
+    floor_key: Literal["task", "kl_gen"] = "task"
     solo_tiers: list[str] | None = None
     solo_task_tiers: list[str] | None = None
     splice_cache: bool | None = None
     allow_drop: bool = True
     enforce_general_cap: bool = True
 
-    @field_validator("solo_tiers")
+    @field_validator("floor_factor", "behavioral_margin", mode="before")
+    @classmethod
+    def _reject_sanity_bool(cls, v: Any, info: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError(f"{info.field_name} must be numeric (not bool), got {v!r}")
+        return v
+
+    @field_validator("floor_factor", "behavioral_margin")
+    @classmethod
+    def _check_nonneg_finite(cls, v: float, info: Any) -> float:
+        if not math.isfinite(v) or v < 0.0:
+            raise ValueError(f"{info.field_name} must be finite and >= 0, got {v!r}")
+        return v
+
+    @field_validator("solo_tiers", "solo_task_tiers")
     @classmethod
     def _check_solo_tiers(cls, v: list[str] | None) -> list[str] | None:
         if v is not None:
@@ -156,12 +222,77 @@ class LearnerConfig(StrictModel):
     oneshot_tiers: list[str] | None = None
     group_tiers: dict[str, list[str]] | None = None
     respect_floors: bool = True
+    allow_drop: bool = True
+    enforce_general_cap: bool = True
     widths: bool = False
     width_fractions: list[float] | None = None
-    width_step: int | None = None
-    vocab_k: int | None = None
+    width_step: int | None = Field(default=None, ge=1)
+    vocab_k: int | Literal["auto"] | None = None
     vocab_candidates: list[int] | None = None
     vocab_min_fidelity: float | None = None
+    experts: bool = False
+    expert_counts: list[int] | None = None
+
+    @field_validator("oneshot_tiers")
+    @classmethod
+    def _check_oneshot_tiers(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None:
+            if not v:
+                raise ValueError("oneshot_tiers must be non-empty when set")
+            for t in v:
+                if t not in VALID_GGML_TYPES:
+                    raise ValueError(f"unknown tier in oneshot_tiers: {t!r}")
+        return v
+
+    @field_validator("group_tiers")
+    @classmethod
+    def _check_group_tiers(cls, v: dict[str, list[str]] | None) -> dict[str, list[str]] | None:
+        if v is not None:
+            for g, tiers in v.items():
+                if not g or not g.strip():
+                    raise ValueError("group_tiers keys must be non-empty")
+                if not tiers:
+                    raise ValueError(f"group_tiers[{g!r}] must be non-empty")
+                for t in tiers:
+                    if t not in VALID_GGML_TYPES:
+                        raise ValueError(f"unknown tier in group_tiers[{g!r}]: {t!r}")
+        return v
+
+    @field_validator("vocab_k", mode="before")
+    @classmethod
+    def _reject_vocab_k_bool(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError(f"vocab_k must be a positive integer, 'auto', or None, got {v!r}")
+        return v
+
+    @field_validator("vocab_k")
+    @classmethod
+    def _check_vocab_k(cls, v: int | Literal["auto"] | None) -> int | Literal["auto"] | None:
+        if isinstance(v, int) and v <= 0:
+            raise ValueError(f"vocab_k must be > 0, got {v!r}")
+        return v
+
+    @field_validator("expert_counts", mode="before")
+    @classmethod
+    def _reject_expert_counts_bool(cls, v: Any) -> Any:
+        if isinstance(v, (list, tuple)) and any(isinstance(k, bool) for k in v):
+            raise ValueError(f"expert_counts must contain only positive integers (not bool), got {v!r}")
+        return v
+
+    @field_validator("expert_counts")
+    @classmethod
+    def _check_expert_counts(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("expert_counts must be non-empty when set")
+        if any(isinstance(k, bool) or k <= 0 for k in v):
+            raise ValueError(f"expert_counts must contain only positive integers, got {v!r}")
+        if len(set(v)) != len(v):
+            raise ValueError(f"expert_counts must contain unique integers, got {v!r}")
+        if v != sorted(v):
+            raise ValueError(f"expert_counts must be sorted ascending, got {v!r}")
+        return v
 
 
 class RepairConfig(StrictModel):
@@ -200,8 +331,29 @@ class ProbeConfig(StrictModel):
     clamp_workers: bool = True
     splice_cache: bool = True
     tier_cache_dir: str | None = None
-    want_solo: list[str] | None = None
+    want_solo: list[Literal["general", "task"]] | None = None
     solo_task_tiers: list[str] | None = None
+
+    @field_validator("want_solo")
+    @classmethod
+    def _check_want_solo(
+        cls, v: list[Literal["general", "task"]] | None
+    ) -> list[Literal["general", "task"]] | None:
+        if v is not None:
+            if not v:
+                raise ValueError("want_solo must be non-empty when set")
+            if len(set(v)) != len(v):
+                raise ValueError(f"want_solo must not contain duplicates, got {v!r}")
+        return v
+
+    @field_validator("solo_task_tiers")
+    @classmethod
+    def _check_solo_task_tiers(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None:
+            for t in v:
+                if t not in VALID_TIERS:
+                    raise ValueError(f"unknown solo_task_tiers tier {t!r}")
+        return v
 
 
 class ScoringSeedFileConfig(StrictModel):
@@ -246,11 +398,52 @@ class ExtractConfig(StrictModel):
 
     @model_validator(mode="after")
     def _validate_tiers(self) -> "ExtractConfig":
+        if not self.ladder:
+            raise ValueError("ladder must be non-empty")
         for t in self.ladder:
             if t not in VALID_TIERS:
                 raise ValueError(f"ladder contains unknown tier {t!r}")
         if self.start_tier not in self.ladder:
             raise ValueError(f"start_tier {self.start_tier!r} must be in ladder {self.ladder}")
+        if self.proxy.floor_tier not in self.ladder or (len(self.ladder) > 1 and self.proxy.floor_tier == self.ladder[0]):
+            raise ValueError(
+                f"proxy.floor_tier {self.proxy.floor_tier!r} must be a quantized rung in ladder[1:] {self.ladder[1:]}"
+            )
+        ladder_set = set(self.ladder)
+        for label, tiers in (
+            ("sanity.solo_tiers", self.sanity.solo_tiers),
+            ("sanity.solo_task_tiers", self.sanity.solo_task_tiers),
+            ("probe.solo_task_tiers", self.probe.solo_task_tiers),
+            ("learner.oneshot_tiers", self.learner.oneshot_tiers),
+        ):
+            if tiers is not None:
+                bad = [t for t in tiers if t not in ladder_set]
+                if bad:
+                    raise ValueError(f"{label} contains tiers not in ladder {self.ladder}: {bad}")
+        if self.learner.group_tiers is not None:
+            for g, tiers in self.learner.group_tiers.items():
+                bad = [t for t in tiers if t not in ladder_set]
+                if bad:
+                    raise ValueError(f"learner.group_tiers[{g!r}] contains tiers not in ladder {self.ladder}: {bad}")
+        if self.learner.algo == "oneshot" and self.learner.target_bytes is None:
+            raise ValueError("learner.target_bytes is required when learner.algo == 'oneshot'")
+        for field in ("allow_drop", "enforce_general_cap"):
+            in_s = field in self.sanity.model_fields_set
+            in_l = field in self.learner.model_fields_set
+            s_val = getattr(self.sanity, field)
+            l_val = getattr(self.learner, field)
+            if in_s and in_l:
+                if s_val != l_val:
+                    raise ValueError(f"conflicting sanity.{field}={s_val!r} and learner.{field}={l_val!r}")
+            elif in_s:
+                setattr(self.learner, field, s_val)
+            elif in_l:
+                setattr(self.sanity, field, l_val)
+        if self.probe.want_solo is not None:
+            if (self.learner.algo == "oneshot" or self.sanity.floor_key == "task") and "task" not in self.probe.want_solo:
+                raise ValueError("probe.want_solo must include 'task' when learner.algo == 'oneshot' or sanity.floor_key == 'task'")
+            if (self.sanity.floor_key == "kl_gen" or self.sanity.cap == "general_kl") and "general" not in self.probe.want_solo:
+                raise ValueError("probe.want_solo must include 'general' when sanity.floor_key == 'kl_gen' or sanity.cap == 'general_kl'")
         return self
 
     def to_raw_dict(self) -> dict[str, Any]:
@@ -259,7 +452,7 @@ class ExtractConfig(StrictModel):
 
 class LearnSpecConfig(StrictModel):
     model: str
-    config_dir: str
+    config_dir: str | None = None
     out_dir: str
     mode: Literal["classifier", "generative"] | None = None
     method: Literal["grid", "gates", "gates_seq"] | None = None
@@ -464,9 +657,24 @@ def load_raw_with_extends(path: str | Path, _seen: set[Path] | None = None) -> d
     return deep_merge(merged, raw)
 
 
+class _Yaml12SafeLoader(yaml.SafeLoader):
+    pass
+
+
+_YAML12_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+_Yaml12SafeLoader.yaml_implicit_resolvers = {
+    k: [(tag, pat) for tag, pat in v if tag != "tag:yaml.org,2002:bool"]
+    for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+for _ch in ("t", "T", "f", "F"):
+    _Yaml12SafeLoader.yaml_implicit_resolvers.setdefault(_ch, []).append(
+        ("tag:yaml.org,2002:bool", _YAML12_BOOL_RE)
+    )
+
+
 def _parse_override_value(raw_val: str) -> Any:
     try:
-        return yaml.safe_load(raw_val)
+        return yaml.load(raw_val, Loader=_Yaml12SafeLoader)
     except yaml.YAMLError:
         return raw_val
 
@@ -507,7 +715,7 @@ def load_config(path: str | Path, kind: str, overrides: list[str] | None = None)
 
 def export_json_schema(kind: str = "all") -> dict[str, Any]:
     if kind == "all":
-        return {k: SCHEMA_MODELS[k].model_json_schema() for k in ("extract", "learn", "sweep")}
+        return {k: SCHEMA_MODELS[k].model_json_schema() for k in ("extract", "learn", "sweep", "anneal")}
     if kind not in SCHEMA_MODELS:
         raise ValueError(f"unknown schema kind {kind!r}")
     return SCHEMA_MODELS[kind].model_json_schema()

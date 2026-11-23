@@ -8,13 +8,20 @@ from __future__ import annotations
 import bisect
 import glob
 import json
+import logging
+import math
 import os
 import random
+import re
+import struct
 import sysconfig
 from pathlib import Path
+from typing import Any
 
 from .client import InfraError
 from .util import stable_seed
+
+_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------- general text + code corpus
@@ -87,8 +94,35 @@ def behavioral_items(n: int, seed: int) -> list[dict]:
     return items
 
 
+_INKLING2_WIRE_TAGS = (
+    "<|message_model|>",
+    "<|content_text|>",
+    "<|end_message|>",
+    "<|content_model_end_sampling|>",
+)
+
+
+def _strip_reasoning_and_wire(text: str | None) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    t = text
+    t = re.sub(r"<think>.*?(?:</think>|$)", "", t, flags=re.DOTALL)
+    t = re.sub(r"<\|channel>thought.*?(?:<channel\|>|$)", "", t, flags=re.DOTALL)
+    t = re.sub(
+        r"(?:<\|message_model\|>[^<\n]*)?<\|content_thinking\|>.*?(?:<\|end_message\|>|$)",
+        "",
+        t,
+        flags=re.DOTALL,
+    )
+    for tag in _INKLING2_WIRE_TAGS:
+        t = t.replace(tag, "")
+    return t
+
+
 def _check(item: dict, text: str) -> bool:
-    t = (text or "").strip().strip("`").strip()
+    if not isinstance(text, str):
+        return False
+    t = _strip_reasoning_and_wire(text).strip().strip("`").strip()
     if item["check"] == "exact":
         return t.rstrip(".") == item["answer"]
     if item["check"] == "exact_lower":
@@ -104,13 +138,40 @@ def _check(item: dict, text: str) -> bool:
     raise ValueError(item["check"])
 
 
-def run_behavioral(srvs, decoding: dict, items: list[dict], seeds: list[int], side: str) -> list[dict]:
+def _infer_dialect(srvs, dialect: str | None) -> str | None:
+    if dialect is not None:
+        return dialect
+    if srvs:
+        for s in srvs:
+            m = getattr(s, "model", None)
+            if m and Path(m).is_file():
+                try:
+                    from . import gguf_ops
+                    return "inkling2" if gguf_ops.needs_special_tokens(m) else None
+                except (OSError, ValueError, struct.error) as exc:
+                    _LOG.warning("cannot auto-detect dialect from %s (%s)", m, exc)
+                    return None
+        if any(bool(getattr(s, "special", False)) for s in srvs):
+            return "inkling2"
+    return None
+
+
+def run_behavioral(
+    srvs,
+    decoding: dict,
+    items: list[dict],
+    seeds: list[int],
+    side: str,
+    dialect: str | None = None,
+    cache_prompt: bool = False,
+) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
     jobs = [(it, s) for it in items for s in seeds]
     if not jobs:
         return []
     from .client import ChatClient
-    clients = [ChatClient(s.url, decoding) for s in srvs]
+    eff_dialect = _infer_dialect(srvs, dialect)
+    clients = [ChatClient(s.url, decoding, dialect=eff_dialect, cache_prompt=cache_prompt) for s in srvs]
 
     def one(ij):
         i, (it, s) = ij
@@ -133,18 +194,27 @@ class SizeMatchedCap:
     """cap(bpw) = general KL of a uniform quant at the same average bpw (piecewise linear between ladder points)."""
 
     def __init__(self, points: list[tuple[float, float]]):
-        pts = sorted(points)
+        if not points:
+            raise ValueError("SizeMatchedCap requires at least one point")
+        by_bpw: dict[float, float] = {}
+        for x, y in points:
+            fx, fy = _finite(x, "bpw"), _finite(y, "kl")
+            by_bpw[fx] = fy if fx not in by_bpw else min(by_bpw[fx], fy)
+        pts = sorted(by_bpw.items())
         self.bpw = [p[0] for p in pts]
         self.kl = [p[1] for p in pts]
 
     def __call__(self, bpw: float) -> float:
-        if bpw >= self.bpw[-1]:
+        fbpw = _finite(bpw, "bpw")
+        if fbpw >= self.bpw[-1]:
             return self.kl[-1]
-        if bpw <= self.bpw[0]:
+        if fbpw <= self.bpw[0]:
             return self.kl[0]
-        j = bisect.bisect_left(self.bpw, bpw)
+        j = bisect.bisect_left(self.bpw, fbpw)
         x0, x1, y0, y1 = self.bpw[j - 1], self.bpw[j], self.kl[j - 1], self.kl[j]
-        return y0 + (y1 - y0) * (bpw - x0) / (x1 - x0)
+        if x1 == x0:
+            return float(min(y0, y1))
+        return y0 + (y1 - y0) * (fbpw - x0) / (x1 - x0)
 
     def to_dict(self) -> dict:
         return {"points": list(zip(self.bpw, self.kl))}
@@ -169,6 +239,15 @@ def make_cap(kind: str, points=None):
     raise ValueError(f"unknown cap kind {kind!r}")
 
 
+def _finite(val: Any, name: str) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"invalid boolean for {name}: {val!r}")
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"non-finite value for {name}: {val!r}")
+    return f
+
+
 def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict], ladder: list[str], factor: float,
                      key: str = "kl_gen") -> dict:
     """solo[group][setting] = {key, 'bytes_saved'}; uniform[tier] = {key, 'bytes_saved'}.
@@ -178,8 +257,27 @@ def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict],
     cheapest uniform tier). The floor is the cheapest tier reached before the first forbidden tier; drop
     is allowed only if it passes too.
     """
+    if not ladder:
+        raise ValueError("ladder must be non-empty")
+    ffactor = _finite(factor, "factor")
+    if ffactor < 0.0:
+        raise ValueError(f"factor must be non-negative, got {factor!r}")
     floors = {}
     cheapest = ladder[-1]
+
+    def _eval_one(s: dict, u: dict, label: str) -> tuple[float, bool]:
+        s_cost = _finite(s[key], f"{label}.{key}")
+        s_bytes = _finite(s["bytes_saved"], f"{label}.bytes_saved")
+        u_cost = _finite(u[key], f"{label}.uniform.{key}")
+        u_bytes = _finite(u["bytes_saved"], f"{label}.uniform.bytes_saved")
+        if u_bytes <= 0.0 or s_bytes <= 0.0:
+            return 0.0, False
+        if u_cost <= 0.0:
+            return 0.0, s_cost <= 0.0
+        slope_u = u_cost / u_bytes
+        limit = ffactor * slope_u * s_bytes
+        return limit, s_cost <= limit
+
     for g, settings in solo.items():
         min_tier, evidence = ladder[1] if len(ladder) > 1 else ladder[0], {}
         allowed_chain = True
@@ -187,9 +285,8 @@ def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict],
             if t not in settings:
                 continue
             s, u = settings[t], uniform[t]
-            slope_u = u[key] / max(1, u["bytes_saved"])
-            ok = s["bytes_saved"] > 0 and s[key] <= factor * slope_u * s["bytes_saved"]
-            evidence[t] = {**s, "limit": factor * slope_u * s["bytes_saved"], "ok": ok}
+            limit, ok = _eval_one(s, u, f"{g}.{t}")
+            evidence[t] = {**s, "limit": limit, "ok": ok}
             if allowed_chain and ok:
                 min_tier = t
             else:
@@ -197,8 +294,7 @@ def floors_from_solo(solo: dict[str, dict[str, dict]], uniform: dict[str, dict],
         drop_ok = False
         if "drop" in settings:
             s, u = settings["drop"], uniform[cheapest]
-            slope_u = u[key] / max(1, u["bytes_saved"])
-            drop_ok = s[key] <= factor * slope_u * s["bytes_saved"]
-            evidence["drop"] = {**s, "limit": factor * slope_u * s["bytes_saved"], "ok": drop_ok}
+            limit, drop_ok = _eval_one(s, u, f"{g}.drop")
+            evidence["drop"] = {**s, "limit": limit, "ok": drop_ok}
         floors[g] = {"min_tier": min_tier, "drop_ok": drop_ok, "evidence": evidence}
     return floors

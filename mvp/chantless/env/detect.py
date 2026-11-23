@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import http.client
 import json
 import math
+import numbers
 import os
 import struct
 import threading
@@ -23,6 +25,8 @@ from pathlib import Path
 import numpy as np
 
 from .. import vocab as vocabmod
+from ..client import _DECODING_SKIP
+from .bfcl import detect_dialect, render_chat_prompt
 from .protocol import Episode, Task, Verdict
 
 # ProseLens model-card prompt
@@ -68,9 +72,10 @@ def _read_ids(pattern: str) -> set[str]:
     ids: set[str] = set()
     for f in files:
         if f.endswith(".json"):
-            ids |= set(json.loads(Path(f).read_text()))
+            ids |= set(json.loads(Path(f).read_text(encoding="utf-8")))
         else:
-            ids |= {json.loads(line)["id"] for line in open(f) if line.strip()}
+            with open(f, encoding="utf-8") as fh:
+                ids |= {json.loads(line)["id"] for line in fh if line.strip()}
     return ids
 
 
@@ -89,6 +94,8 @@ class DetectEnvironment:
     name = "detect"
     version = "2"
     tools = None
+    unflagged_word = ANSWERS[0]
+    flagged_word = ANSWERS[1]
 
     def __init__(self, data_dir: str, hf_dir: str, cutoff: float | None = None, seed: int = 20261029,
                  max_doc_tokens: int = 4096, search_per_cell: int | None = 20, select_per_cell: int | None = 50,
@@ -96,29 +103,53 @@ class DetectEnvironment:
                  kv_type: str = "f16", max_total_memory_bytes: int | None = None, classifier: bool = False,
                  calibration_ids_file: str | None = None, cache_dir: str | None = None,
                  search_beemo_per_kind: int | None = None, select_beemo_per_kind: int | None = None,
-                 prompt_style: str = "auto"):
+                 prompt_style: str = "auto", reasoning_effort: str | float | None = "none"):
         """A per-cell or per-kind size of None takes every document of that cell."""
         from transformers import AutoTokenizer
         self.classifier = bool(classifier)
         if cutoff is None and not self.classifier:
             raise ValueError("cutoff is required unless classifier=True")
-        self.cutoff = None if cutoff is None else float(cutoff)
+        if cutoff is not None:
+            if isinstance(cutoff, bool):
+                raise ValueError(f"cutoff must be a finite float or None, got {cutoff!r}")
+            self.cutoff = float(cutoff)
+            if not math.isfinite(self.cutoff):
+                raise ValueError(f"cutoff must be finite, got {cutoff!r}")
+        else:
+            self.cutoff = None
         self.budget = {"max_tokens": 1, "max_doc_tokens": max_doc_tokens}
         self.deployment = {"context": context, "concurrency": 1, "kv_type": kv_type,
                            "max_total_memory_bytes": max_total_memory_bytes}
         self.hf_dir = str(hf_dir)
         self.tok = AutoTokenizer.from_pretrained(hf_dir)
         self.max_doc_tokens = max_doc_tokens
+        self.reasoning_effort = reasoning_effort
+        det_dialect, _ = detect_dialect(self.tok)
+        vocab = self.tok.get_vocab()
         if prompt_style == "auto":
-            vocab = self.tok.get_vocab()
-            self.prompt_style = "qwen_chatml" if "<|im_start|>" in vocab and "<think>" in vocab else "chat_template"
+            if det_dialect == "inkling2":
+                self.prompt_style = "inkling2"
+                self.dialect = "inkling2"
+            elif "<|im_start|>" in vocab and "<think>" in vocab:
+                self.prompt_style = "qwen_chatml"
+                self.dialect = det_dialect
+            else:
+                self.prompt_style = "chat_template"
+                self.dialect = det_dialect
+        elif prompt_style == "inkling2":
+            self.prompt_style = "inkling2"
+            self.dialect = "inkling2"
         elif prompt_style in ("qwen_chatml", "chat_template"):
             self.prompt_style = prompt_style
+            self.dialect = "qwen3_json" if (prompt_style == "qwen_chatml" and det_dialect == "inkling2") else det_dialect
         else:
             raise ValueError(f"unknown prompt_style {prompt_style!r}")
+        self.needs_special_tokens = self.dialect == "inkling2"
 
         d = Path(data_dir)
         rng = np.random.default_rng(seed)
+        self._pruned_tok_cache: dict[str, object] = {}
+        self._prompt_hash: dict[tuple[str, str], bytes] = {}
         if self.classifier:
             if not calibration_ids_file or not cache_dir:
                 raise ValueError("classifier=True needs calibration_ids_file and cache_dir")
@@ -128,7 +159,6 @@ class DetectEnvironment:
             backend = getattr(self.tok, "backend_tokenizer", None)
             ident = backend.to_str() if backend is not None else f"{Path(hf_dir).resolve()}:{len(self.tok)}"
             self._tok_id = hashlib.sha256(ident.encode()).hexdigest()
-            self._pruned_tok_cache: dict[str, object] = {}
             self._classifier_tasks(d, rng, _read_ids(calibration_ids_file), search_per_cell, select_per_cell,
                                    exam_test_per_cell, search_beemo_per_kind, select_beemo_per_kind,
                                    exam_beemo_per_kind)
@@ -163,10 +193,12 @@ class DetectEnvironment:
         if self.prompt_style == "qwen_chatml":
             return chat_prompt(text)
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}]
-        try:
-            return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        except TypeError:
-            return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        if self.prompt_style == "inkling2":
+            pstr = render_chat_prompt(self.tok, msgs, "inkling2", reasoning_effort=self.reasoning_effort)
+            if pstr.endswith("<|end_message|>"):
+                pstr += "<|message_model|><|content_text|>"
+            return pstr
+        return render_chat_prompt(self.tok, msgs, self.dialect, reasoning_effort=self.reasoning_effort)
 
     def _classifier_tasks(self, d: Path, rng, cal_ids: set[str], search_per_cell, select_per_cell, exam_test_per_cell,
                           search_beemo_per_kind, select_beemo_per_kind, exam_beemo_per_kind) -> None:
@@ -188,8 +220,13 @@ class DetectEnvironment:
         test = pq.read_table(wo / "test-00000-of-00001.parquet", columns=cols).to_pylist()
         cal = [r for r in pq.read_table(wo / "calibration-00000-of-00001.parquet", columns=cols).to_pylist()
                if r["id"] in cal_ids]
+        if not cal:
+            raise ValueError("calibration split is empty")
         if len(cal) != len(cal_ids):
             raise ValueError(f"{len(cal_ids) - len(cal)} calibration ids are not in the calibration parquet")
+        non_human = [r["id"] for r in cal if r.get("label") != ANSWERS[0]]
+        if non_human:
+            raise ValueError(f"calibration rows must have label {ANSWERS[0]!r}, got non-human ids: {non_human[:5]}")
         first_half = [r for r in pool if r["prompt_id"] in first]
         second_half = [r for r in pool if r["prompt_id"] not in first]
         picks = [("search", "wo-val", _sample(a, cell, search_per_cell, rng)),
@@ -218,16 +255,29 @@ class DetectEnvironment:
         out, n = [], self.max_doc_tokens
         for i in range(0, len(texts), chunk):
             part = texts[i:i + chunk]
-            enc = self.tok(part, add_special_tokens=False, return_offsets_mapping=True)
-            out += [(t, False) if len(ids) <= n else (t[: off[n - 1][1]], True)
-                    for t, ids, off in zip(part, enc["input_ids"], enc["offset_mapping"])]
+            try:
+                enc = self.tok(part, add_special_tokens=False, return_offsets_mapping=True)
+                offsets = enc["offset_mapping"]
+                for t, ids, off in zip(part, enc["input_ids"], offsets):
+                    if len(ids) <= n:
+                        out.append((t, False))
+                    else:
+                        end = int(off[n - 1][1]) if n - 1 < len(off) else 0
+                        if end > 0:
+                            out.append((t[:end], True))
+                        else:
+                            out.append((self.tok.decode(ids[:n], skip_special_tokens=True), True))
+            except (NotImplementedError, TypeError, ValueError, KeyError):
+                enc = self.tok(part, add_special_tokens=False)
+                for t, ids in zip(part, enc["input_ids"]):
+                    if len(ids) <= n:
+                        out.append((t, False))
+                    else:
+                        out.append((self.tok.decode(ids[:n], skip_special_tokens=True), True))
         return out
 
     def _head(self, text: str) -> tuple[str, bool]:
-        enc = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
-        if len(enc["input_ids"]) <= self.max_doc_tokens:
-            return text, False
-        return text[: enc["offset_mapping"][self.max_doc_tokens - 1][1]], True
+        return self._heads([text])[0]
 
     def tasks(self) -> list[Task]:
         return list(self._tasks)
@@ -240,9 +290,28 @@ class DetectEnvironment:
                                 add_special_tokens=False)["input_ids"]
 
     def _key(self, tasks: list[Task]) -> str:
-        """Cache key: tokenizer, answer pair, prompt template, document cut and the ordered task ids."""
-        head = [self._tok_id, repr(self.pair), self.render_prompt(""), str(self.max_doc_tokens)]
-        return hashlib.sha256("\n".join(head + [t.id for t in tasks]).encode()).hexdigest()[:16]
+        """Cache key: tokenizer, answer pair, prompt template, document cut and ordered (task_id, prompt_hash) pairs."""
+        h = hashlib.sha256()
+        for part in (self._tok_id, repr(self.pair), self.render_prompt(""), str(self.max_doc_tokens)):
+            b = part.encode("utf-8")
+            h.update(struct.pack("<I", len(b)))
+            h.update(b)
+        h.update(struct.pack("<I", len(tasks)))
+        for t in tasks:
+            tid_b = t.id.encode("utf-8")
+            sp_b = t.split.encode("utf-8")
+            txt = str(t.prompt["text"])
+            ck = (t.id, txt)
+            ph = self._prompt_hash.get(ck)
+            if ph is None:
+                ph = hashlib.sha256(self.render_prompt(txt).encode("utf-8")).digest()
+                self._prompt_hash[ck] = ph
+            h.update(struct.pack("<I", len(tid_b)))
+            h.update(tid_b)
+            h.update(struct.pack("<I", len(sp_b)))
+            h.update(sp_b)
+            h.update(ph)
+        return h.hexdigest()[:16]
 
     def _tmp(self, path: Path) -> Path:
         return path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
@@ -269,27 +338,27 @@ class DetectEnvironment:
 
     def _model_vocab_plan(self, model: str) -> tuple[tuple[int, int], str | None, dict | None]:
         """Inspect `model` GGUF vocabulary: returns `((h_id, a_id), vocab_hash_if_trimmed_else_None, meta)`."""
-        if not os.path.exists(model):
-            return self.pair, None, None
-        try:
-            meta = vocabmod.read_tokenizer(model)
-        except Exception:
-            return self.pair, None, None
-        if meta["vocab_size"] == self.source_vocab_size:
-            return self.pair, None, meta
-        # Resolve exact source answer token byte strings inside the trimmed vocabulary
-        idx = {b: i for i, b in enumerate(meta["tokens"])}
+        meta = vocabmod.read_tokenizer(model)
         src_toks = self._source_token_bytes()
+        v = int(meta["vocab_size"])
+        if (
+            v == self.source_vocab_size
+            and self.pair[0] < v
+            and self.pair[1] < v
+            and meta["tokens"][self.pair[0]] == src_toks[self.pair[0]]
+            and meta["tokens"][self.pair[1]] == src_toks[self.pair[1]]
+        ):
+            return self.pair, None, meta
+        # Resolve exact source answer token byte strings inside the trimmed/remapped vocabulary
+        idx = {b: i for i, b in enumerate(meta["tokens"])}
         remapped = []
         for w, pid in zip(ANSWERS, self.pair):
             tb = src_toks[pid]
             if tb in idx:
                 remapped.append(idx[tb])
-            elif w.encode("utf-8") in idx:
-                remapped.append(idx[w.encode("utf-8")])
             else:
                 raise RuntimeError(f"trimmed GGUF {model} dropped answer token {pid} ({w!r} / {tb!r})")
-        vh = hashlib.sha256(b"\x00".join(meta["tokens"])).hexdigest()[:12]
+        vh = _gguf_vocab_hash(meta)
         return (remapped[0], remapped[1]), vh, meta
 
     def _source_token_bytes(self) -> list[bytes]:
@@ -312,9 +381,19 @@ class DetectEnvironment:
             spec = json.loads(backend.to_str())
             kept_strs = [t.decode("utf-8", errors="surrogateescape") for t in meta["tokens"]]
             new_vocab = {s: i for i, s in enumerate(kept_strs)}
-            if spec.get("model", {}).get("type") == "BPE":
+            mtype = spec.get("model", {}).get("type")
+            if mtype == "BPE":
                 spec["model"]["vocab"] = new_vocab
                 spec["model"]["merges"] = [m.decode("utf-8") for m in meta["merges"]]
+            elif mtype in ("WordLevel", "WordPiece"):
+                spec["model"]["vocab"] = new_vocab
+                unk = spec["model"].get("unk_token")
+                if unk is not None and unk not in new_vocab:
+                    raise RuntimeError(f"trimmed GGUF dropped unk_token {unk!r} for {mtype} tokenizer")
+            else:
+                raise RuntimeError(
+                    f"trimmed-GGUF scoring without toolchain.tokdocs does not support tokenizer model type {mtype!r}"
+                )
             if "added_tokens" in spec:
                 kept_added = []
                 for at in spec["added_tokens"]:
@@ -360,42 +439,117 @@ class DetectEnvironment:
             t for t in self._tasks
             if t.split in ("calibration", "search") or (t.split == "select" and t.id.startswith("wo-val:"))
         ]
-        if gguf_path and tc is not None and getattr(tc, "tokdocs", None) is not None:
-            from ..runtime import tokenize_docs
-            v = vocabmod.read_tokenizer(gguf_path)["vocab_size"]
-            seqs = tokenize_docs(tc, gguf_path, [self.render_prompt(t.prompt["text"]) for t in fit_tasks])
-            return np.bincount(np.concatenate(seqs), minlength=v)
-        v = self.source_vocab_size if hasattr(self, "source_vocab_size") else len(self.tok)
-        all_ids = [np.asarray(x, dtype=np.int64) for x in self._encoded(fit_tasks)]
-        return np.bincount(np.concatenate(all_ids), minlength=v) if all_ids else np.zeros(v, dtype=np.int64)
+        if gguf_path is not None:
+            meta = vocabmod.read_tokenizer(gguf_path)
+            v = int(meta["vocab_size"])
+            if tc is not None and getattr(tc, "tokdocs", None) is not None:
+                from ..runtime import tokenize_docs
+                if not fit_tasks:
+                    return np.zeros(v, dtype=np.int64)
+                seqs = [
+                    np.asarray(s, dtype=np.int64)
+                    for s in tokenize_docs(tc, gguf_path, [self.render_prompt(t.prompt["text"]) for t in fit_tasks])
+                    if len(s)
+                ]
+                return np.bincount(np.concatenate(seqs), minlength=v)[:v] if seqs else np.zeros(v, dtype=np.int64)
+
+            if hasattr(self, "source_vocab_size"):
+                src_toks = self._source_token_bytes()
+                untrimmed_or_padded = (
+                    v >= self.source_vocab_size
+                    and self.pair[0] < v
+                    and self.pair[1] < v
+                    and meta["tokens"][self.pair[0]] == src_toks[self.pair[0]]
+                    and meta["tokens"][self.pair[1]] == src_toks[self.pair[1]]
+                )
+            else:
+                untrimmed_or_padded = v >= len(self.tok)
+
+            if untrimmed_or_padded:
+                if not fit_tasks:
+                    return np.zeros(v, dtype=np.int64)
+                all_ids = [np.asarray(x, dtype=np.int64) for x in self._encoded(fit_tasks) if len(x)]
+                return np.bincount(np.concatenate(all_ids), minlength=v)[:v] if all_ids else np.zeros(v, dtype=np.int64)
+
+            if not fit_tasks:
+                return np.zeros(v, dtype=np.int64)
+            vh = _gguf_vocab_hash(meta)
+            prompts = [self.render_prompt(t.prompt["text"]) for t in fit_tasks]
+            encoded = self._pruned_hf_encode(vh, meta, prompts)
+            seqs = [np.asarray(s, dtype=np.int64) for s in encoded if len(s)]
+            return np.bincount(np.concatenate(seqs), minlength=v)[:v] if seqs else np.zeros(v, dtype=np.int64)
+
+        v = int(self.source_vocab_size if hasattr(self, "source_vocab_size") else len(self.tok))
+        if not fit_tasks:
+            return np.zeros(v, dtype=np.int64)
+        all_ids = [np.asarray(x, dtype=np.int64) for x in self._encoded(fit_tasks) if len(x)]
+        return np.bincount(np.concatenate(all_ids), minlength=v)[:v] if all_ids else np.zeros(v, dtype=np.int64)
 
     def calibrate(self, scores: dict[str, float]) -> dict:
         """The cutoff that flags the lowest 1% of this model's calibration humans (flag strictly below)."""
-        cal = sorted(float(v) for k, v in scores.items() if k in self._cal_ids)
-        if not cal:
+        raw: list[float] = []
+        for k, v in scores.items():
+            if k in self._cal_ids:
+                if isinstance(v, bool):
+                    raise ValueError(f"invalid calibration score for {k!r}: {v!r}")
+                try:
+                    f = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid calibration score for {k!r}: {v!r}") from exc
+                if not math.isfinite(f):
+                    raise ValueError(f"non-finite calibration score for {k!r}: {v!r}")
+                raw.append(f)
+        if not raw:
             raise ValueError("no calibration scores to calibrate on")
-        return {"cutoff": cal[int(0.01 * len(cal))], "n": len(cal)}
+        cal = sorted(raw)
+        idx = min(len(cal) - 1, max(0, int(0.01 * len(cal))))
+        return {"cutoff": cal[idx], "n": len(cal)}
 
     def decide(self, task: Task, score: float, rule: dict) -> Verdict:
-        flagged = score < rule["cutoff"]
+        sc = float(score)
+        cut = float(rule["cutoff"])
+        if not (math.isfinite(sc) and math.isfinite(cut)):
+            raise ValueError(f"non-finite decide input: score={score!r}, cutoff={rule.get('cutoff')!r}")
+        flagged = sc < cut
         return Verdict(task.id, 0, flagged == (task.meta["label"] == "ai"), {},
-                       details={"score": score, "p_human": _sigmoid(score), "cutoff": rule["cutoff"],
+                       details={"score": sc, "p_human": _sigmoid(sc), "cutoff": cut,
                                 "pred": "ai" if flagged else "human", "label": task.meta["label"],
                                 "kind": task.meta["kind"]})
 
     def proxy_spec(self, source_scores: dict[str, float], n_neg: int = 1000, n_pos: int = 600,
                    seed: int = 0) -> list[dict]:
         """Parts of the log-odds store, in store order: random calibration humans + near-cutoff search AI docs."""
+        if isinstance(n_neg, bool) or not isinstance(n_neg, numbers.Integral) or int(n_neg) < 0:
+            raise ValueError(f"n_neg must be a non-negative int, got {n_neg!r}")
+        if isinstance(n_pos, bool) or not isinstance(n_pos, numbers.Integral) or int(n_pos) < 0:
+            raise ValueError(f"n_pos must be a non-negative int, got {n_pos!r}")
+        n_neg, n_pos = int(n_neg), int(n_pos)
         cut = self.calibrate(source_scores)["cutoff"]
         cal = [t for t in self._tasks if t.split == "calibration"]
         neg = np.sort(np.random.default_rng(seed).choice(len(cal), min(n_neg, len(cal)), replace=False))
         ai = [(i, t) for i, t in enumerate(self._tasks) if t.split == "search" and t.meta["label"] == "ai"]
-        near = sorted(sorted(ai, key=lambda x: (abs(source_scores[x[1].id] - cut), x[0]))[:n_pos], key=lambda x: x[0])
+        ai_scores: dict[str, float] = {}
+        for _, t in ai:
+            if t.id not in source_scores:
+                raise KeyError(f"missing search score for {t.id!r}")
+            try:
+                val = float(source_scores[t.id])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid search score for {t.id!r}: {source_scores[t.id]!r}") from exc
+            if not math.isfinite(val):
+                raise ValueError(f"non-finite search score for {t.id!r}: {source_scores[t.id]!r}")
+            ai_scores[t.id] = val
+        near = sorted(sorted(ai, key=lambda x: (abs(ai_scores[x[1].id] - cut), x[0]))[:n_pos], key=lambda x: x[0])
         return [{"name": "humans", "role": "neg", "n": len(neg), "ids": [cal[i].id for i in neg]},
                 {"name": "ai", "role": "pos", "n": len(near), "ids": [t.id for _, t in near]}]
 
     def stats_texts(self, n: int, seed: int = 0) -> list[str]:
         """n raw prompt strings from the search split (a fixed random sample) for the importance matrix."""
+        if isinstance(n, bool) or not isinstance(n, numbers.Integral):
+            raise ValueError(f"n must be an int, got {n!r}")
+        if int(n) <= 0:
+            return []
+        n = int(n)
         pool = [t for t in self._tasks if t.split == "search"]
         pick = np.sort(np.random.default_rng(seed).permutation(len(pool))[:n])
         return [self.render_prompt(pool[i].prompt["text"]) for i in pick]
@@ -421,18 +575,64 @@ class DetectEnvironment:
     def run(self, task: Task, client, seed: int) -> Episode:
         """One forward pass through llama-server's raw completion endpoint; the answer is greedy."""
         t0 = time.time()
-        body = {"prompt": self.render_prompt(task.prompt["text"]), "n_predict": 1, "n_probs": 10, "temperature": 1.0,
-                "top_k": 0, "top_p": 1.0, "min_p": 0.0, "grammar": GRAMMAR, "post_sampling_probs": True,
-                "seed": int(seed), "cache_prompt": False}
+        prompt_str = self.render_prompt(task.prompt["text"])
+        bos = getattr(self.tok, "bos_token", None)
+        srv_prompt = prompt_str[len(bos):] if (bos and prompt_str.startswith(bos)) else prompt_str
+        skip = set(_DECODING_SKIP) | {
+            "prompt", "n_predict", "n_probs", "grammar", "post_sampling_probs",
+            "temperature", "top_k", "top_p", "min_p",
+        }
+        extra = {k: v for k, v in getattr(client, "decoding", {}).items() if k not in skip}
+        body = {
+            **extra,
+            "prompt": srv_prompt,
+            "n_predict": 1,
+            "n_probs": 10,
+            "temperature": 1.0,
+            "top_k": 0,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "grammar": GRAMMAR,
+            "post_sampling_probs": True,
+            "seed": int(seed),
+            "cache_prompt": bool(getattr(client, "cache_prompt", False)),
+        }
+        payload = json.dumps(body).encode("utf-8")
         msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.prompt["text"]}]
-        try:
-            req = urllib.request.Request(client.base_url + "/completion", data=json.dumps(body).encode(),
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=client.timeout) as r:
-                out = json.loads(r.read())
-            p = _p_human(out["completion_probabilities"][0])
-        except (urllib.error.URLError, ConnectionError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as e:
-            return Episode(task.id, seed, msgs, None, None, ["error"], 0, 0, time.time() - t0, infra_error=repr(e))
+        retries = max(1, int(getattr(client, "retries", 3)))
+        last_err: Exception | None = None
+        p: float | None = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(client.base_url + "/completion", data=payload,
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=client.timeout) as r:
+                    out = json.loads(r.read())
+                if not isinstance(out, dict):
+                    raise TypeError(f"expected JSON object, got {type(out).__name__}")
+                probs = out["completion_probabilities"]
+                if not isinstance(probs, list) or not probs:
+                    raise KeyError("completion_probabilities")
+                p = _p_human(probs[0])
+                break
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                ConnectionError,
+                TimeoutError,
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError,
+                UnicodeDecodeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as e:
+                last_err = e
+                if attempt + 1 < retries:
+                    time.sleep(1.0 + attempt)
+        if p is None:
+            return Episode(task.id, seed, msgs, None, None, ["error"], 0, 0, time.time() - t0, infra_error=repr(last_err))
         word = "ai" if p < self.cutoff else "human"
         msgs.append({"role": "assistant", "content": word})
         return Episode(task.id, seed, msgs, None, json.dumps({"p_human": p}), ["stop"], 1, 1, time.time() - t0)
@@ -447,8 +647,19 @@ class DetectEnvironment:
 
 
 def _p_human(entry: dict) -> float:
-    pr = {t["token"]: t["prob"] for t in entry["top_probs"]}
+    if not isinstance(entry, dict):
+        raise TypeError(f"expected probability entry object, got {type(entry).__name__}")
+    top = entry.get("top_probs")
+    if not isinstance(top, list):
+        raise ValueError("missing top_probs list")
+    pr = {}
+    for t in top:
+        if not isinstance(t, dict):
+            raise TypeError(f"expected top_probs element object, got {type(t).__name__}")
+        pr[t["token"]] = float(t["prob"])
     h, a = pr.get(ANSWERS[0], 0.0), pr.get(ANSWERS[1], 0.0)
+    if not (math.isfinite(h) and math.isfinite(a)):
+        raise ValueError("non-finite answer token probabilities")
     if h + a <= 0:
         raise KeyError("neither answer token among the returned probabilities")
     return h / (h + a)
@@ -459,6 +670,20 @@ def _sigmoid(x: float) -> float:
         return 1.0 / (1.0 + math.exp(-x))
     z = math.exp(x)
     return z / (1.0 + z)
+
+
+def _gguf_vocab_hash(meta: dict) -> str:
+    h = hashlib.sha256()
+    for section, items in ((b"T", meta["tokens"]), (b"M", meta["merges"])):
+        h.update(section)
+        h.update(struct.pack("<I", len(items)))
+        for item in items:
+            h.update(struct.pack("<I", len(item)))
+            h.update(item)
+    if "token_type" in meta:
+        h.update(b"Y")
+        h.update(np.asarray(meta["token_type"], dtype="<i4").tobytes())
+    return h.hexdigest()[:16]
 
 
 def make_environment(**kwargs) -> DetectEnvironment:

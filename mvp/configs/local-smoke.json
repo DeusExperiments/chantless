@@ -18,8 +18,10 @@
   "env": {
     "module": "chantless.env.codetasks",
     "kwargs": {
+      "hf_dir": ".local/models/qwen3-0.6b",
       "seed": 20261012,
       "variants_per_family": 40,
+      "max_tokens_per_turn": 768,
       "context": 8192,
       "concurrency": 1,
       "kv_type": "f16",
@@ -30,11 +32,15 @@
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 20,
-    "min_p": 0.0
+    "min_p": 0.0,
+    "max_tokens": 768,
+    "enable_thinking": false
   },
   "serving": {
     "slots_per_gpu": 4,
-    "ctx_per_slot": 8192
+    "ctx_per_slot": 8192,
+    "cache_prompt": false,
+    "flash_attn": "on"
   },
   "objective_mode": "preserve",
   "ladder": [

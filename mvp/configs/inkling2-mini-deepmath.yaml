@@ -1,0 +1,76 @@
+run_id: inkling2-mini-deepmath
+run_root: .local/runs
+scratch_root: auto
+objective_mode: preserve
+start_tier: IQ4_NL
+ladder:
+  - BF16
+  - Q8_0
+  - Q6_K
+  - Q5_K
+  - Q4_K
+  - IQ4_NL
+  - Q3_K
+  - Q2_K
+  - IQ2_XS
+  - IQ1_S
+
+source:
+  repo: thinkingmachines/Inkling-2-Mini
+  revision: ed40e7da625f594fc9c4990f5f66be24873c22d7
+  hf_dir: .local/models/inkling2-mini
+  gguf: .local/models/Inkling-2-Mini-BF16.gguf
+  expected_gguf_sha256: 7074c9762e6769a608c7b23960a7fd2444880b1174a3910149749f6d01389aec
+
+toolchain:
+  llama_bin: .local/toolchain-inkling2/llama-inkling2/build/bin
+  traj_kl: .local/toolchain-inkling2/bin/traj-kl
+  logodds: .local/toolchain-inkling2/bin/logodds
+  tokdocs: .local/toolchain-inkling2/bin/tokdocs
+  gpus: ["0"]
+
+env:
+  module: chantless.env.deepmath
+  kwargs:
+    hf_dir: .local/models/inkling2-mini
+    max_tokens: 4096
+    context: 8192
+    reasoning_effort: "low"
+
+serving:
+  slots_per_gpu: 8
+  ctx_per_slot: 8192
+  cache_prompt: false
+  flash_attn: "on"
+
+decoding:
+  temperature: 1.0
+  max_tokens: 4096
+
+pool:
+  tasks_per_split:
+    search: 200
+    select: 200
+    exam: 400
+
+learner:
+  algo: oneshot
+  target_bytes: 12500000000
+  oneshot_tiers:
+    - Q8_0
+    - Q4_K
+    - IQ4_NL
+    - Q3_K
+    - Q2_K
+    - IQ2_XS
+  experts: true
+  expert_counts: [32, 48, 64, 96, 128]
+  widths: true
+  width_fractions: [0.89, 0.75, 0.5, 0.25]
+  width_step: 256
+  vocab_k: "auto"
+  vocab_candidates: [32768, 49152, 65536, 98304, 131072]
+
+probe:
+  clamp_workers: true
+  splice_cache: true

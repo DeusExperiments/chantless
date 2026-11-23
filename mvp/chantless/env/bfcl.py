@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from ..client import InfraError
+from ..client import InfraError, _thinking_enabled
 from .protocol import Episode, Task, Verdict
 
 GORILLA_COMMIT = "70b6a4a2144597b1f99d1f4d3185d35d7ee532a4"
@@ -37,6 +37,42 @@ JSON_TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 XML_FUNC_RE = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.DOTALL)
 XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
 GEMMA4_CALL_RE = re.compile(r"<\|tool_call>call:([A-Za-z0-9_.-]+)\{(.*?)\}<tool_call\|>", re.DOTALL)
+INKLING2_THINK_RE = re.compile(
+    r"(?:<\|message_model\|>[^<\n]*)?<\|content_thinking\|>.*?(?:<\|end_message\|>|$)",
+    re.DOTALL,
+)
+INKLING2_CALL_RE = re.compile(
+    r"(?:<\|message_model\|>([^<\s]*))?<\|content_invoke_tool_json\|>\s*(.*?)\s*(?:<\|end_message\|>|<\|content_model_end_sampling\|>|$)",
+    re.DOTALL,
+)
+
+
+def strip_thinking(text: str) -> str:
+    """Strip Qwen, Gemma 4, and Inkling 2 reasoning blocks (including unclosed trailing blocks) from raw model output."""
+    cleaned = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<\|channel>thought.*?(?:<channel\|>|$)", "", cleaned, flags=re.DOTALL)
+    return INKLING2_THINK_RE.sub("", cleaned)
+
+
+def render_chat_prompt(
+    tok: Any,
+    msgs: list[dict[str, Any]],
+    dialect: str,
+    tools: list[dict[str, Any]] | None = None,
+    reasoning_effort: str | float | None = "none",
+) -> str:
+    """Render an HF chat template with thinking configured for the detected model dialect."""
+    kwargs: dict[str, Any] = {"add_generation_prompt": True, "tokenize": False}
+    if tools is not None:
+        kwargs["tools"] = tools
+    try:
+        if dialect == "inkling2":
+            if reasoning_effort is not None:
+                return tok.apply_chat_template(msgs, reasoning_effort=reasoning_effort, **kwargs)
+            return tok.apply_chat_template(msgs, **kwargs)
+        return tok.apply_chat_template(msgs, enable_thinking=_thinking_enabled(dialect, reasoning_effort), **kwargs)
+    except TypeError:
+        return tok.apply_chat_template(msgs, **kwargs)
 
 
 def _read_records(path: Path) -> list[dict[str, Any]]:
@@ -79,7 +115,7 @@ def _norm_schema(val: Any) -> Any:
         out = {str(k): _norm_schema(v) for k, v in val.items()}
         if out.get("type") in ("dict", "HashMap", "Map"):
             out["type"] = "object"
-        elif out.get("type") in ("tuple", "ArrayList", "array"):
+        elif out.get("type") in ("tuple", "Array", "ArrayList", "array"):
             out["type"] = "array"
         elif out.get("type") in ("float", "double"):
             out["type"] = "number"
@@ -110,7 +146,7 @@ def _norm_messages(row: dict[str, Any]) -> list[dict[str, str]]:
     return [{"role": "user", "content": str(val)}]
 
 
-def _norm_tools(row: dict[str, Any]) -> list[dict[str, Any]]:
+def _raw_tools(row: dict[str, Any]) -> list[dict[str, Any]]:
     val = _parse_maybe(row.get("tools") or row.get("function") or row.get("functions"))
     if val is None:
         return []
@@ -122,10 +158,14 @@ def _norm_tools(row: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(t, dict):
             continue
         if t.get("type") == "function" and isinstance(t.get("function"), dict):
-            out.append(_norm_schema(t))
+            out.append(t)
         else:
-            out.append({"type": "function", "function": _norm_schema(t)})
+            out.append({"type": "function", "function": t})
     return out
+
+
+def _norm_tools(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_norm_schema(t) for t in _raw_tools(row)]
 
 
 def _parse_py_call(expr: str) -> list[dict[str, Any]]:
@@ -244,15 +284,36 @@ def _parse_gemma4_dict(inner: str) -> dict[str, Any]:
     return json.loads("".join(out_chars))
 
 
-def parse_tool_calls(text: str) -> list[dict[str, Any]]:
-    """Parse tool calls across `Qwen3.5` XML, `Gemma 4` `<|tool_call>call:...`, and `Qwen3` JSON."""
+def parse_tool_calls(text: str, *, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
+    """Parse tool calls across `Inkling 2`, `Qwen3.5` XML, `Gemma 4` `<|tool_call>call:...`, and `Qwen3` JSON."""
     if not text:
         return []
-    # Strip any `<think>...</think>` or `<|channel>thought...<channel|>` reasoning prefix
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    cleaned = re.sub(r"<\|channel>thought.*?<channel\|>", "", cleaned, flags=re.DOTALL).strip()
+    cleaned = strip_thinking(text).strip()
 
-    # 1. Gemma 4 `<|tool_call>call:NAME{...}<tool_call|>`
+    # 1. Inkling 2 `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>`
+    ink = INKLING2_CALL_RE.findall(cleaned)
+    if ink:
+        calls = []
+        for prefix_name, body in ink:
+            obj = _parse_maybe(body)
+            if isinstance(obj, dict):
+                jname = str(obj.get("name") or "").strip()
+                pname = prefix_name.strip()
+                if allowed_names and jname in allowed_names:
+                    fn_name = jname
+                elif allowed_names and pname in allowed_names:
+                    fn_name = pname
+                elif pname and (not jname or ("." in pname and pname.startswith(jname + "."))):
+                    fn_name = pname
+                else:
+                    fn_name = jname or pname
+                raw_args = obj["args"] if "args" in obj else obj.get("arguments", {})
+                args = _parse_maybe(raw_args)
+                if fn_name and isinstance(args, dict):
+                    calls.append(canonical({"name": fn_name, "arguments": args}))
+        return calls
+
+    # 2. Gemma 4 `<|tool_call>call:NAME{...}<tool_call|>`
     g4 = GEMMA4_CALL_RE.findall(cleaned)
     if g4:
         calls = []
@@ -299,6 +360,10 @@ def format_tool_call(call: dict[str, Any], dialect: str) -> str:
             lines.append(f"<parameter={k}>\n{v_str}\n</parameter>")
         lines.extend(["</function>", "</tool_call>"])
         return "\n".join(lines)
+    if dialect == "inkling2":
+        args_json = json.dumps({str(k): v for k, v in sorted(args.items())}, ensure_ascii=False, separators=(",", ":"))
+        payload = f'{{"name":{json.dumps(name, ensure_ascii=False)},"args":{args_json}}}'
+        return f"<|message_model|>{name}<|content_invoke_tool_json|>{payload}<|end_message|><|content_model_end_sampling|>"
     if dialect == "gemma4":
         def _g4_val(v: Any) -> str:
             if isinstance(v, str):
@@ -319,8 +384,62 @@ def format_tool_call(call: dict[str, Any], dialect: str) -> str:
     return f"<tool_call>\n{json.dumps({'name': name, 'arguments': args}, ensure_ascii=False)}\n</tool_call>"
 
 
+def _parse_lang_collection_str(s: str, want_dict: bool) -> Any:
+    """Parse common Gorilla Java/JavaScript stringified list/map expressions into Python collections."""
+    s = s.strip()
+    if want_dict:
+        m_hm = re.search(r"new\s+HashMap<[^>]*>\s*\(\)\s*\{\s*\{?\s*(.*?)\s*\}?\s*\}", s, re.DOTALL)
+        if m_hm:
+            out: dict[str, Any] = {}
+            for km, vm in re.findall(r"put\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)", m_hm.group(1)):
+                k = str(_parse_maybe(km.strip())).strip("'\"")
+                out[k] = _parse_maybe(vm.strip())
+            return out
+        if s.startswith("{") and s.endswith("}"):
+            inner = s[1:-1].strip()
+            if not inner:
+                return {}
+            pairs = re.findall(r"([A-Za-z0-9_$\"'\.-]+)\s*:\s*([^,{}]+|\[[^\]]*\]|\{[^}]*\})", inner)
+            if pairs:
+                out = {}
+                for k, v in pairs:
+                    kk = k.strip().strip("'\"")
+                    vv = v.strip()
+                    if vv.startswith("{") and vv.endswith("}"):
+                        out[kk] = _parse_lang_collection_str(vv, want_dict=True)
+                    elif vv.startswith("[") and vv.endswith("]"):
+                        out[kk] = _parse_lang_collection_str(vv, want_dict=False)
+                    else:
+                        out[kk] = _parse_maybe(vv)
+                return out
+        return s
+
+    m_al = re.search(r"new\s+ArrayList<[^>]*>\s*\(\s*Arrays\.asList\((.+?)\)\s*\)", s, re.DOTALL)
+    if m_al:
+        return [_parse_maybe(x.strip().strip("'\"")) for x in m_al.group(1).split(",") if x.strip()]
+    if re.fullmatch(r"new\s+ArrayList<[^>]*>\s*\(\s*\)", s):
+        return []
+    m_arr = re.search(r"new\s+[A-Za-z0-9_]+\[\]\s*\{(.*?)\}", s, re.DOTALL)
+    if m_arr:
+        body = m_arr.group(1).strip()
+        return [] if not body else [_parse_maybe(x.strip().strip("'\"")) for x in body.split(",") if x.strip()]
+    m_js = re.fullmatch(r"(?:new\s+Array\((.*)\)|\[(.*)\])", s, re.DOTALL)
+    if m_js:
+        body = (m_js.group(1) if m_js.group(1) is not None else m_js.group(2)).strip()
+        return [] if not body else [_parse_maybe(x.strip().strip("'\"")) for x in body.split(",") if x.strip()]
+    return s
+
+
 def _norm_against_target(val: Any, tgt: Any) -> Any:
     val, tgt = _parse_maybe(val), _parse_maybe(tgt)
+    if isinstance(val, str) and isinstance(tgt, dict):
+        parsed = _parse_lang_collection_str(val, want_dict=True)
+        if isinstance(parsed, dict):
+            val = parsed
+    elif isinstance(val, str) and isinstance(tgt, list):
+        parsed = _parse_lang_collection_str(val, want_dict=False)
+        if isinstance(parsed, list):
+            val = parsed
     if isinstance(val, dict) and isinstance(tgt, dict):
         return {str(k): _norm_against_target(val[k], tgt.get(k)) for k in sorted(val)}
     if isinstance(val, list) and isinstance(tgt, list) and tgt:
@@ -331,11 +450,12 @@ def _norm_against_target(val: Any, tgt: Any) -> Any:
         s = val.strip()
         if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
             s = s[1:-1]
-        if not isinstance(tgt, bool) and isinstance(tgt, int) and re.fullmatch(r"[-+]?\d+", s):
-            return int(s)
+        if not isinstance(tgt, bool) and isinstance(tgt, int) and re.fullmatch(r"[-+]?\d+[lLn]?", s):
+            return int(s.rstrip("lLn"))
         if not isinstance(tgt, bool) and isinstance(tgt, float):
+            s_num = s[:-1] if re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[fFdD]", s) else s
             try:
-                return float(s)
+                return float(s_num)
             except ValueError:
                 pass
         if isinstance(tgt, str) and "**" in tgt and "^" in s:
@@ -346,6 +466,114 @@ def _norm_against_target(val: Any, tgt: Any) -> Any:
     if not isinstance(val, bool) and isinstance(val, float) and isinstance(tgt, int) and val.is_integer():
         return int(val)
     return val
+
+
+DEFAULT_INKLING2_TOOL_SYSTEM_PROMPT = (
+    "You are an expert in composing functions. You are given a question and a set of possible functions. "
+    "Based on the question, call the appropriate function tool to achieve the purpose."
+)
+
+
+def _gorilla_standardize_str(s: str) -> str:
+    return re.sub(r"[ \,\.\/\-\_\*\^]", "", s).lower().replace("'", '"')
+
+
+def _gorilla_scalar_eq(pv: Any, rv: Any) -> bool:
+    if pv == rv:
+        return True
+    if not isinstance(pv, bool) and not isinstance(rv, bool) and isinstance(pv, (int, float)) and isinstance(rv, (int, float)):
+        return float(pv) == float(rv)
+    if isinstance(pv, str) and isinstance(rv, str):
+        return _gorilla_standardize_str(pv) == _gorilla_standardize_str(rv)
+    return False
+
+
+def _gorilla_val_match(pv: Any, rv: Any, *, allow_option_list: bool = False) -> bool:
+    if _gorilla_scalar_eq(pv, rv):
+        return True
+    if isinstance(pv, dict) and isinstance(rv, dict):
+        return _gorilla_dict_match(pv, rv, nested=True)
+    if isinstance(pv, list) and isinstance(rv, list):
+        if len(pv) == len(rv) and all(_gorilla_val_match(a, b, allow_option_list=False) for a, b in zip(pv, rv)):
+            return True
+    if allow_option_list and isinstance(rv, list):
+        return any(_gorilla_val_match(pv, opt, allow_option_list=False) for opt in rv if opt != "")
+    return False
+
+
+def _gorilla_dict_match(pa: dict[str, Any], ra: dict[str, Any], *, nested: bool = False) -> bool:
+    for k, pv in pa.items():
+        if k not in ra:
+            return False
+        if not _gorilla_val_match(pv, ra[k], allow_option_list=nested):
+            return False
+    for k, rv in ra.items():
+        if k not in pa:
+            if rv == "" or (nested and isinstance(rv, list) and "" in rv):
+                continue
+            return False
+    return True
+
+
+def _apply_gorilla_lang_hints(
+    tools: list[dict[str, Any]],
+    category: str,
+    *,
+    raw_tools: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Mirror Gorilla BFCL's `func_doc_language_specific_pre_processing` on a copy of `tools`."""
+    cat = str(category or "").lower()
+    src = raw_tools if (raw_tools and cat in ("java", "javascript")) else tools
+    if not src:
+        return []
+    if cat == "java":
+        hint = " Note that the provided function is in Java 8 SDK syntax."
+    elif cat == "javascript":
+        hint = " Note that the provided function is in JavaScript syntax."
+    else:
+        hint = " Note that the provided function is in Python 3 syntax."
+    out: list[dict[str, Any]] = []
+    for t in src:
+        tc = json.loads(json.dumps(t))
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        desc = str(fn.get("description") or "")
+        if hint.strip() not in desc:
+            fn["description"] = desc + hint
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            if params.get("type") in (None, "dict"):
+                params["type"] = "object"
+            props = params.get("properties")
+            if isinstance(props, dict) and cat in ("java", "javascript"):
+                lang_label = "Java" if cat == "java" else "JavaScript"
+                for _k, val in props.items():
+                    if not isinstance(val, dict):
+                        continue
+                    orig_type = str(val.get("type") or "any")
+                    pdesc = str(val.get("description") or "")
+                    if "in string representation." not in pdesc:
+                        if orig_type == "any":
+                            pdesc += f" This parameter can be of any type of {lang_label} object in string representation."
+                        else:
+                            pdesc += f" This is {lang_label} {orig_type} type parameter in string representation."
+                        if cat == "java" and orig_type in ("ArrayList", "Array", "array") and isinstance(val.get("items"), dict):
+                            item_t = val["items"].get("type", "any")
+                            pdesc += f" The list elements are of type {item_t}; they are not in string representation."
+                            val.pop("items", None)
+                        elif cat == "javascript" and orig_type == "array" and isinstance(val.get("items"), dict):
+                            item_t = val["items"].get("type", "any")
+                            pdesc += f" The list elements are of type {item_t}; they are not in string representation."
+                            val.pop("items", None)
+                        elif cat == "javascript" and orig_type in ("dict", "object") and isinstance(val.get("properties"), dict):
+                            pdesc += (
+                                " The dictionary entries have the following schema; they are not in string representation. "
+                                + json.dumps(val["properties"])
+                            )
+                            val.pop("properties", None)
+                        val["description"] = pdesc
+                    val["type"] = "string"
+        out.append(tc)
+    return out
 
 
 def calls_match(pred_calls: list[dict[str, Any]], ref_calls: list[dict[str, Any]]) -> bool:
@@ -361,12 +589,30 @@ def calls_match(pred_calls: list[dict[str, Any]], ref_calls: list[dict[str, Any]
         nr_ = canonical(_norm_against_target(r, r))
         if np_ == nr_:
             return True
+        # Retry with Gorilla BFCL AST rules: `""`-optional key omission, nested dict option lists, standardize_string
+        for cand_p, cand_r in ((p, r), (np_, nr_)):
+            if (
+                isinstance(cand_p, dict)
+                and isinstance(cand_r, dict)
+                and cand_p.get("name") == cand_r.get("name")
+                and isinstance(cand_p.get("arguments"), dict)
+                and isinstance(cand_r.get("arguments"), dict)
+                and _gorilla_dict_match(cand_p["arguments"], cand_r["arguments"], nested=False)
+            ):
+                return True
     return False
 
 
 def detect_dialect(tok) -> tuple[str, list[str]]:
     vocab = tok.get_vocab()
     ct = str(getattr(tok, "chat_template", "") or "")
+    if (
+        "<|content_invoke_tool_json|>" in vocab
+        or "<|message_model|>" in vocab
+        or "<|content_invoke_tool_json|>" in ct
+        or "<|message_model|>" in ct
+    ):
+        return "inkling2", ["<|content_model_end_sampling|>"]
     if "<|tool_call>" in vocab or "<turn|>" in vocab:
         return "gemma4", ["<turn|>", "<end_of_turn>", "<|tool_response>"]
     if "<function=" in ct:
@@ -377,7 +623,10 @@ def detect_dialect(tok) -> tuple[str, list[str]]:
 def _download_cached(cache_dir: Path, categories: tuple[str, ...]) -> list[dict[str, Any]]:
     cache_file = cache_dir / f"bfcl_v3_single_{GORILLA_COMMIT[:8]}_{'-'.join(categories)}.jsonl"
     if cache_file.exists():
-        return _read_records(cache_file)
+        cached = _read_records(cache_file)
+        needs_raw = any(r.get("category") in ("java", "javascript") and "raw_tools" not in r for r in cached)
+        if not needs_raw:
+            return cached
     cache_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     for cat in categories:
@@ -410,19 +659,25 @@ def _download_cached(cache_dir: Path, categories: tuple[str, ...]) -> list[dict[
             t_parsed = _parse_maybe(tgt)
             if isinstance(t_parsed, list) and sum(1 for x in t_parsed if isinstance(_parse_maybe(x), (dict, str))) != 1:
                 continue
-            tools = _norm_tools(qr)
+            raw_tools = _raw_tools(qr)
+            tools = [_norm_schema(t) for t in raw_tools]
             if not tools:
                 continue
-            rows.append({
+            row_obj: dict[str, Any] = {
                 "id": f"{cat}:{kid}",
                 "category": cat,
                 "messages": _norm_messages(qr),
                 "tools": tools,
                 "reference_calls": refs[:64],
-            })
-    with cache_file.open("w", encoding="utf-8") as f:
+            }
+            if cat in ("java", "javascript"):
+                row_obj["raw_tools"] = raw_tools
+            rows.append(row_obj)
+    tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+    with tmp_file.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp_file.replace(cache_file)
     return rows
 
 
@@ -443,6 +698,40 @@ def _assign_family_and_split(row: dict[str, Any], n_buckets_per_cat: int = 16) -
     return fam, sp
 
 
+def stratified_sample(
+    tasks: list[Task],
+    n: int,
+    *,
+    split: str | None = None,
+    categories: tuple[str, ...] | list[str] = DEFAULT_CATEGORIES,
+) -> list[Task]:
+    """Deterministically round-robin sample up to `n` tasks across categories, sorted by `t.id` within each category."""
+    if n <= 0:
+        return []
+    pool = [t for t in tasks if t.split == split] if split is not None else list(tasks)
+    buckets: dict[str, list[Task]] = {}
+    for t in pool:
+        cat = str((t.meta or {}).get("category") or (t.id.split(":", 1)[0] if ":" in t.id else "bfcl"))
+        buckets.setdefault(cat, []).append(t)
+    cat_order = [c for c in categories if buckets.get(c)] + sorted(c for c in buckets if c not in categories)
+    for c in cat_order:
+        buckets[c].sort(key=lambda t: t.id)
+    out: list[Task] = []
+    idx = 0
+    while len(out) < n:
+        added = False
+        for c in cat_order:
+            if idx < len(buckets[c]):
+                out.append(buckets[c][idx])
+                added = True
+                if len(out) == n:
+                    break
+        if not added:
+            break
+        idx += 1
+    return out
+
+
 class BfclEnvironment:
     name = "bfcl"
     version = "1"
@@ -459,12 +748,21 @@ class BfclEnvironment:
         kv_type: str = "f16",
         max_total_memory_bytes: int | None = None,
         n_buckets_per_cat: int = 16,
+        reasoning_effort: str | float | None = "none",
+        system_prompt: str | None = None,
+        lang_hints: bool | None = None,
     ):
         from transformers import AutoTokenizer
         self.hf_dir = str(hf_dir)
         self.tok = AutoTokenizer.from_pretrained(self.hf_dir)
         self.dialect, self.stop = detect_dialect(self.tok)
         self.max_tokens = int(max_tokens)
+        self.reasoning_effort = reasoning_effort
+        if system_prompt is None and self.dialect == "inkling2":
+            self.system_prompt: str | None = DEFAULT_INKLING2_TOOL_SYSTEM_PROMPT
+        else:
+            self.system_prompt = system_prompt
+        self.lang_hints = (self.dialect == "inkling2") if lang_hints is None else bool(lang_hints)
         self.budget = {"max_turns": 1, "max_tokens_per_turn": self.max_tokens}
         self.deployment = {
             "context": int(context),
@@ -475,22 +773,51 @@ class BfclEnvironment:
         rows = _read_records(Path(pairs_file)) if pairs_file else _download_cached(Path(cache_dir), tuple(categories))
         self._tasks: list[Task] = []
         for r in rows:
-            fam, sp = (r["family"], r["split"]) if ("family" in r and "split" in r) else _assign_family_and_split(r, n_buckets_per_cat)
+            raw_split = r.get("split")
+            sp_s = str(raw_split).strip() if raw_split is not None else ""
+            has_split = sp_s != ""
+            if has_split and r.get("family") is not None:
+                fam, sp = str(r["family"]), sp_s
+            elif has_split:
+                raw_fam, _ = _assign_family_and_split(r, n_buckets_per_cat)
+                sp = sp_s
+                fam = f"{sp}/{raw_fam}"
+            else:
+                fam, sp = _assign_family_and_split(r, n_buckets_per_cat)
+            meta: dict[str, Any] = {"category": r.get("category", "bfcl"), "reference_calls": r["reference_calls"]}
+            if r.get("raw_tools"):
+                meta["raw_tools"] = r["raw_tools"]
             self._tasks.append(Task(
                 id=str(r["id"]),
                 family=fam,
                 split=sp,
                 prompt={"messages": r["messages"], "tools": r["tools"]},
-                meta={"category": r.get("category", "bfcl"), "reference_calls": r["reference_calls"]},
+                meta=meta,
             ))
 
-    def render_prompt(self, task: Task) -> str:
-        msgs = task.prompt["messages"]
+    def prepare_request_messages_and_tools(self, task: Task) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        msgs = [dict(m) for m in task.prompt["messages"]]
+        if self.system_prompt and (not msgs or msgs[0].get("role") != "system"):
+            msgs = [{"role": "system", "content": self.system_prompt}] + msgs
         tools = task.prompt["tools"]
-        try:
-            return self.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False, enable_thinking=False)
-        except TypeError:
-            return self.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=False)
+        if self.lang_hints:
+            meta = task.meta or {}
+            tools = _apply_gorilla_lang_hints(
+                tools,
+                str(meta.get("category", "")),
+                raw_tools=meta.get("raw_tools"),
+            )
+        return msgs, tools
+
+    def render_prompt(self, task: Task) -> str:
+        msgs, tools = self.prepare_request_messages_and_tools(task)
+        return render_chat_prompt(
+            self.tok,
+            msgs,
+            self.dialect,
+            tools=tools,
+            reasoning_effort=self.reasoning_effort,
+        )
 
     def format_reference(self, task: Task) -> str:
         return format_tool_call(task.meta["reference_calls"][0], self.dialect)
@@ -498,26 +825,43 @@ class BfclEnvironment:
     def tasks(self) -> list[Task]:
         return list(self._tasks)
 
+    def sample_tasks(self, split: str, n: int, *, stratified: bool = True) -> list[Task]:
+        pool = [t for t in self._tasks if t.split == split]
+        if not stratified:
+            return sorted(pool, key=lambda t: t.id)[: max(0, int(n))]
+        return stratified_sample(pool, int(n))
+
     def stats_texts(self, n: int = 200) -> list[str]:
-        search_ts = [t for t in self._tasks if t.split == "search"][:n]
+        search_ts = self.sample_tasks("search", int(n), stratified=True)
         return [self.render_prompt(t) + self.format_reference(t) for t in search_ts]
 
     def run(self, task: Task, client: Any, seed: int) -> Episode:
         t0 = time.time()
-        prompt_str = self.render_prompt(task)
+        req_msgs, req_tools = self.prepare_request_messages_and_tools(task)
+        prompt_str = render_chat_prompt(
+            self.tok,
+            req_msgs,
+            self.dialect,
+            tools=req_tools,
+            reasoning_effort=self.reasoning_effort,
+        )
         srv_prompt = prompt_str[len(self.tok.bos_token):] if (self.tok.bos_token and prompt_str.startswith(self.tok.bos_token)) else prompt_str
         try:
             res = client.complete(srv_prompt, seed=seed, max_tokens=self.max_tokens, stop=self.stop)
         except InfraError as e:
-            return Episode(task.id, seed, list(task.prompt["messages"]), task.prompt["tools"], None, [], 0, 0, time.time() - t0, str(e))
+            return Episode(task.id, seed, list(req_msgs), req_tools, None, [], 0, 0, time.time() - t0, str(e))
         raw_txt = (res["text"] or "").strip()
-        clean_txt = re.sub(r"<\|channel>thought.*?<channel\|>", "", re.sub(r"<think>.*?</think>", "", raw_txt, flags=re.DOTALL), flags=re.DOTALL).strip()
-        msgs = list(task.prompt["messages"]) + [{"role": "assistant", "content": clean_txt or raw_txt}]
+        if _thinking_enabled(self.dialect, self.reasoning_effort):
+            asst_txt = raw_txt
+        else:
+            clean_txt = strip_thinking(raw_txt).strip()
+            asst_txt = clean_txt or raw_txt
+        msgs = list(req_msgs) + [{"role": "assistant", "content": asst_txt}]
         return Episode(
             task_id=task.id,
             seed=seed,
             messages=msgs,
-            tools=task.prompt["tools"],
+            tools=req_tools,
             final_text=raw_txt,
             finish_reasons=[res.get("finish_reason") or "stop"],
             n_turns=1,
@@ -529,8 +873,8 @@ class BfclEnvironment:
         if episode.infra_error:
             return Verdict(task.id, episode.seed, False, {}, infra_error=episode.infra_error)
         txt = episode.final_text or ""
-        pred_calls = parse_tool_calls(txt)
         allowed_names = {t["function"]["name"] for t in (task.prompt.get("tools") or []) if "function" in t}
+        pred_calls = parse_tool_calls(txt, allowed_names=allowed_names)
         words = txt.split()
         span_rep = False
         if len(words) >= 64:

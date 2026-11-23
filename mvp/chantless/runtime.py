@@ -57,7 +57,8 @@ class LlamaServer:
     def __init__(self, tc: Toolchain, model: str | os.PathLike, gpu: str = "", slots: int = 4, ctx_per_slot: int = 8192,
                  kv_type: str = "f16", log: str | os.PathLike | None = None, extra: list[str] | None = None,
                  host: str = "127.0.0.1", port: int | None = None, metrics: bool = False,
-                 alias: str | None = None, cache_prompt: bool = True, webui: bool = False):
+                 alias: str | None = None, cache_prompt: bool = False, webui: bool = False,
+                 special: bool = False, flash_attn: str = "on"):
         self.tc, self.model, self.gpu, self.slots = tc, str(model), gpu, slots
         self.ctx = ctx_per_slot * slots
         self.kv_type = kv_type
@@ -65,10 +66,12 @@ class LlamaServer:
         self.port = int(port) if port is not None else free_port()
         self.metrics = metrics
         self.alias = alias
-        self.cache_prompt = cache_prompt
+        self.cache_prompt = bool(cache_prompt)
         self.webui = webui
+        self.special = bool(special)
+        self.flash_attn = "on" if flash_attn is None else str(flash_attn)
         self.log = log
-        self.extra = extra or []
+        self.extra = list(extra) if extra is not None else []
         self.proc: subprocess.Popen | None = None
         self._log_fh = None
 
@@ -79,7 +82,7 @@ class LlamaServer:
 
     def __enter__(self):
         cmd = [str(self.tc.llama_bin / "llama-server"), "-m", self.model, "--host", self.host, "--port", str(self.port),
-               "-c", str(self.ctx), "-np", str(self.slots), "-fa", "on", "--jinja", "-ngl", "999",
+               "-c", str(self.ctx), "-np", str(self.slots), "-fa", self.flash_attn, "--jinja", "-ngl", "999",
                "-ctk", self.kv_type, "-ctv", self.kv_type]
         if not self.webui:
             cmd.append("--no-webui")
@@ -89,23 +92,31 @@ class LlamaServer:
             cmd.append("--no-cache-prompt")
         if self.alias:
             cmd += ["--alias", self.alias]
+        if self.special:
+            cmd.append("--special")
         cmd += list(self.extra)
+        if self.log:
+            Path(self.log).parent.mkdir(parents=True, exist_ok=True)
         self._log_fh = open(self.log, "a") if self.log else None
         out = self._log_fh if self._log_fh is not None else subprocess.DEVNULL
-        self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=self.tc.env_for(self.gpu))
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"llama-server exited early ({self.proc.returncode}); see {self.log}")
-            try:
-                with urllib.request.urlopen(self.url + "/health", timeout=2) as r:
-                    if json.loads(r.read()).get("status") == "ok":
-                        return self
-            except Exception:
-                pass
-            time.sleep(0.5)
-        self.__exit__(None, None, None)
-        raise RuntimeError("llama-server did not become healthy")
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=self.tc.env_for(self.gpu))
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                if self.proc.poll() is not None:
+                    rc = self.proc.returncode
+                    raise RuntimeError(f"llama-server exited early ({rc}); see {self.log}")
+                try:
+                    with urllib.request.urlopen(self.url + "/health", timeout=2) as r:
+                        if json.loads(r.read()).get("status") == "ok":
+                            return self
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            raise RuntimeError("llama-server did not become healthy")
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
 
     def __exit__(self, *a):
         if self.proc and self.proc.poll() is None:
@@ -387,9 +398,10 @@ class BatchScorer:
                 if not len(out):
                     continue
                 for part in parts[fi]:
-                    for line in open(part):
-                        ti, k, v = line.split("\t")
-                        out[offsets[int(ti)] + int(k)] = float(v)
+                    with open(part) as pf:
+                        for line in pf:
+                            ti, k, v = line.split("\t")
+                            out[offsets[int(ti)] + int(k)] = float(v)
                 miss = np.flatnonzero(~np.isfinite(out))
                 if len(miss):
                     raise RuntimeError(f"logodds left {len(miss)} of {len(out)} targets of {trj} unscored or non-finite "

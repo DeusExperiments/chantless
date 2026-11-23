@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import signal
 import statistics
+import struct
 import subprocess
 import tempfile
 import threading
@@ -210,6 +212,19 @@ def _p95(vals: list[float]) -> float:
     return float(s[idx])
 
 
+_LOG = logging.getLogger(__name__)
+
+
+def _resolve_special(model_path: str | Path, special: bool | None) -> bool:
+    if special is not None:
+        return bool(special)
+    try:
+        return gguf_ops.needs_special_tokens(model_path)
+    except (OSError, ValueError, struct.error) as exc:
+        _LOG.warning("cannot auto-detect --special from %s (%s); defaulting to False", model_path, exc)
+        return False
+
+
 def bench_one(
     llama_bin: str | Path,
     model_info: dict[str, Any],
@@ -221,6 +236,9 @@ def bench_one(
     gen_tokens: int = 128,
     runs: int = 3,
     extra: list[str] | None = None,
+    special: bool | None = None,
+    cache_prompt: bool = False,
+    flash_attn: str = "on",
 ) -> dict[str, Any]:
     tc = Toolchain(Path(llama_bin).resolve(), Path("/bin/true"), [gpu])
     prompt = _make_bench_prompt(prompt_tokens)
@@ -244,6 +262,7 @@ def bench_one(
         bench_extra = list(extra or [])
         if "-lv" not in bench_extra:
             bench_extra += ["-lv", "4"]
+        use_special = _resolve_special(model_info["model_path"], special)
         t_boot0 = time.perf_counter()
         with LlamaServer(
             tc,
@@ -255,8 +274,10 @@ def bench_one(
             log=log_p,
             extra=bench_extra,
             metrics=True,
-            cache_prompt=False,
+            cache_prompt=bool(cache_prompt),
             webui=False,
+            special=use_special,
+            flash_attn=flash_attn,
         ) as srv:
             boot_s = round(time.perf_counter() - t_boot0, 3)
             pid = srv.proc.pid if srv.proc else -1
@@ -269,7 +290,7 @@ def bench_one(
                     "max_tokens": gen_tokens,
                     "temperature": 0.0,
                     "seed": 42,
-                    "cache_prompt": False,
+                    "cache_prompt": bool(cache_prompt),
                 }
                 _ = srv.post("/v1/completions", {**body, "max_tokens": min(16, gen_tokens)})
                 prefill_tps: list[float] = []
@@ -313,7 +334,17 @@ def bench_one(
         "cache_key": model_info["cache_key"],
         "build_s": model_info["build_s"],
         "boot_s": boot_s,
-        "config": {"gpu": gpu, "slots": slots, "ctx_per_slot": ctx_per_slot, "kv_type": kv_type, "runs": runs, "gen_tokens": gen_tokens},
+        "config": {
+            "gpu": gpu,
+            "slots": slots,
+            "ctx_per_slot": ctx_per_slot,
+            "kv_type": kv_type,
+            "runs": runs,
+            "gen_tokens": gen_tokens,
+            "special": use_special,
+            "cache_prompt": bool(cache_prompt),
+            "flash_attn": str(flash_attn),
+        },
         "prompt_tokens_measured": int(statistics.median(prompt_n_vals)) if prompt_n_vals else 0,
         "gen_tokens_measured": int(statistics.median(pred_n_vals)) if pred_n_vals else 0,
         "prefill_tok_s_median": round(statistics.median(prefill_tps), 2),
@@ -377,6 +408,9 @@ def serve_live(
     webui: bool = False,
     log_path: str | Path | None = None,
     extra: list[str] | None = None,
+    special: bool | None = None,
+    cache_prompt: bool = False,
+    flash_attn: str = "on",
 ) -> dict[str, Any]:
     tc = Toolchain(Path(llama_bin).resolve(), Path("/bin/true"), [gpu])
     stop_ev = threading.Event()
@@ -392,6 +426,7 @@ def serve_live(
     t0 = time.perf_counter()
     peak_rss = 0.0
     peak_vram: float | None = None
+    use_special = _resolve_special(model_info["model_path"], special)
     try:
         with LlamaServer(
             tc,
@@ -406,8 +441,10 @@ def serve_live(
             port=port,
             metrics=metrics,
             alias=alias,
-            cache_prompt=True,
+            cache_prompt=bool(cache_prompt),
             webui=webui,
+            special=use_special,
+            flash_attn=flash_attn,
         ) as srv:
             pid = srv.proc.pid if srv.proc else -1
             startup = {
@@ -421,6 +458,9 @@ def serve_live(
                 "sha256": model_info["sha256"],
                 "cache_hit": model_info["cache_hit"],
                 "alias": alias,
+                "special": use_special,
+                "cache_prompt": bool(cache_prompt),
+                "flash_attn": str(flash_attn),
             }
             print(json.dumps(startup), flush=True)
             while not stop_ev.is_set():

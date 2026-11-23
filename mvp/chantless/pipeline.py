@@ -5,6 +5,7 @@ The exam split is unreadable before the exam phase (SplitGuard). Nothing from th
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -12,6 +13,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -134,6 +136,119 @@ class SplitGuard:
         return [t for t in self.tasks if t.split == split]
 
 
+class _SliceCacheBuilder:
+    """Single-slot K-slice cache for MoE experts during oneshot probing & final builds."""
+
+    def __init__(self, run: "Run", base_builder, im_path: str):
+        self.run = run
+        self.base_builder = base_builder
+        self.im_path = im_path
+        self.source_params = base_builder.source_params
+        self.groups = base_builder.groups
+        self.cache_dir = run.scratch / "slice_cache"
+        self._lock = threading.Lock()
+        self._cur_key: str | None = None
+        self._cur_gguf: Path | None = None
+        self._cur_im: Path | None = None
+        self._cur_builder = None
+
+    @staticmethod
+    def _slice_key(
+        kept_widths: dict[int, object],
+        kept_experts: dict[int, object],
+        drop: set[str],
+        im_path: str | None,
+    ) -> str:
+        import numpy as np
+
+        h = hashlib.sha256()
+        for kind, mapping in (("W", kept_widths), ("E", kept_experts)):
+            h.update(kind.encode("ascii"))
+            for il in sorted(mapping):
+                arr = np.sort(np.asarray(mapping[il], dtype=np.int64))
+                h.update(struct.pack("<iQ", int(il), len(arr)))
+                h.update(arr.tobytes())
+        h.update(b"D")
+        for name in sorted(drop):
+            h.update(name.encode("utf-8") + b"\0")
+        h.update(b"I" + str(im_path or "").encode("utf-8"))
+        return h.hexdigest()
+
+    def _ensure_slice(self, kept_experts: dict[int, object]):
+        drop = set(self.run.dead_tensors)
+        s_key = self._slice_key({}, kept_experts, drop, self.im_path)
+        if self._cur_key == s_key and self._cur_builder is not None:
+            return self._cur_builder
+        if self._cur_builder is not None:
+            self._cur_builder.cleanup()
+            self._cur_builder = None
+        if self._cur_gguf is not None:
+            self._cur_gguf.unlink(missing_ok=True)
+            self._cur_gguf = None
+        if self._cur_im is not None:
+            self._cur_im.unlink(missing_ok=True)
+            self._cur_im = None
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        s_gguf = self.cache_dir / f"slice-{s_key[:16]}.gguf"
+        im_src = self.im_path if self.im_path and Path(self.im_path).exists() else None
+        s_im = (self.cache_dir / f"im-{s_key[:16]}.gguf") if im_src else None
+        gguf_ops.write_variable_width(
+            self.run.probe_src,
+            s_gguf,
+            {},
+            drop_tensors=drop,
+            imatrix_src=im_src,
+            imatrix_dst=s_im,
+            kept_experts=kept_experts,
+        )
+        hf_dir = (self.run.cfg.get("source") or {}).get("hf_dir") if isinstance(getattr(self.run, "cfg", None), dict) else None
+        cur_groups, _ = gguf_ops.adapter_from_gguf(s_gguf, hf_dir)
+        for g, info in cur_groups.items():
+            if g in self.groups and "imatrix_ok" in self.groups[g]:
+                info["imatrix_ok"] = self.groups[g]["imatrix_ok"]
+        cur_builder = bmod.Builder(
+            self.run.tc,
+            str(s_gguf),
+            cur_groups,
+            str(s_im) if s_im else None,
+            self.cache_dir / f"work-{s_key[:16]}",
+            log=getattr(self.base_builder, "log", None),
+            threads=getattr(self.base_builder, "threads", 8),
+            quantize_shards=getattr(self.base_builder, "quantize_shards", 0),
+        )
+        cur_builder.source_params = self.source_params
+        self._cur_key = s_key
+        self._cur_gguf = s_gguf
+        self._cur_im = s_im
+        self._cur_builder = cur_builder
+        return cur_builder
+
+    def build(self, m: dict, out: str | Path | None = None, keep_pruned: bool = False):
+        experts = mk.kept_experts(m)
+        if not experts:
+            return self.base_builder.build(m, out, keep_pruned=keep_pruned)
+        with self._lock:
+            cur_builder = self._ensure_slice(experts)
+        m_sub = json.loads(json.dumps(m))
+        m_sub.pop("experts", None)
+        m_sub.pop("dead_tensors", None)
+        return cur_builder.build(m_sub, out, keep_pruned=keep_pruned)
+
+    def cleanup(self) -> None:
+        with self._lock:
+            if self._cur_builder is not None:
+                self._cur_builder.cleanup()
+                self._cur_builder = None
+            if self._cur_gguf is not None:
+                self._cur_gguf.unlink(missing_ok=True)
+                self._cur_gguf = None
+            if self._cur_im is not None:
+                self._cur_im.unlink(missing_ok=True)
+                self._cur_im = None
+            self._cur_key = None
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+
+
 class Run:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -141,12 +256,15 @@ class Run:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.log = Log(self.dir / "log.md")
         self.tc = Toolchain.from_config(cfg["toolchain"])
-        self.env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
+        self.env = load_environment(cfg["env"]["module"], **(cfg["env"].get("kwargs") or {}))
         self.guard = SplitGuard(self.env.tasks())
         self.by_id = {t.id: t for t in self.env.tasks()}
         self.src = cfg["source"]["gguf"]
         sr_cfg = cfg.get("scratch_root")
-        probe_cfg = cfg.get("probe", {})
+        probe_cfg = cfg.get("probe") or {}
+        serving = cfg.get("serving") or {}
+        scoring = cfg.get("scoring") or {}
+        decoding = cfg.get("decoding") or {"temperature": 0.0}
         src_sz = Path(self.src).stat().st_size if Path(self.src).exists() else 0
         self.scratch, should_stage = choose_scratch_layout(
             sr_cfg, src_sz, self.dir, cfg["run_id"],
@@ -175,24 +293,31 @@ class Run:
             self.annotate_imatrix(imx)
         self.info = gguf_ops.arch_info(self.src)
         self.ladder = cfg["ladder"]
-        self.mode = cfg.get("objective_mode", "preserve")
+        self.mode = cfg.get("objective_mode") or "preserve"
         self.dep = self.env.deployment
         # classifier environments (CLASSIFIER-CONTRACT.md) score documents in batches and judge each model at
         # its own calibrated rule; every other environment keeps the episode path
         self.classifier = getattr(self.env, "classifier", False)
         self.scorer = None
-        if self.classifier and cfg["sanity"].get("behavioral_items", 0):
+        if self.classifier and ((cfg.get("sanity") or {}).get("behavioral_items") or 0):
             raise ValueError("classifier environments have no chat servers: set sanity.behavioral_items to 0")
+        cache_prompt = bool(serving.get("cache_prompt", False))
+        special = serving.get("special")
+        flash_attn = serving.get("flash_attn") or "on"
+        serv_slots = serving.get("slots_per_gpu") or 4
+        ctx_per_slot = serving.get("ctx_per_slot") or 8192
         if self.classifier:
             from .runtime import BatchScorer
-            self.scorer = BatchScorer(self.tc, cfg.get("scoring", {}).get("slots_per_gpu", 2))
-            self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
-                                cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes", scorer=self.scorer)
-            if cfg.get("scoring", {}).get("seed"):
-                self._seed_source_scores(cfg["scoring"]["seed"])
+            self.scorer = BatchScorer(self.tc, scoring.get("slots_per_gpu") or 2)
+            self.ev = Evaluator(self.tc, self.env, decoding, serv_slots,
+                                ctx_per_slot, self.dep["kv_type"], self.dir / "episodes",
+                                scorer=self.scorer, cache_prompt=cache_prompt, special=special, flash_attn=flash_attn)
+            if scoring.get("seed"):
+                self._seed_source_scores(scoring["seed"])
         else:
-            self.ev = Evaluator(self.tc, self.env, cfg["decoding"], cfg["serving"]["slots_per_gpu"],
-                                cfg["serving"]["ctx_per_slot"], self.dep["kv_type"], self.dir / "episodes")
+            self.ev = Evaluator(self.tc, self.env, decoding, serv_slots,
+                                ctx_per_slot, self.dep["kv_type"], self.dir / "episodes",
+                                cache_prompt=cache_prompt, special=special, flash_attn=flash_attn)
         self.t0 = time.time()
 
     def _seed_source_scores(self, sd: dict):
@@ -201,15 +326,24 @@ class Run:
         any disagreement beyond 1e-3 in log-odds refuses the whole seed and the run scores fresh."""
         import numpy as np
         rec = {}
-        for f in sd["files"]:
+        for f in sd.get("files") or []:
             ids = [m["id"] for m in json.loads(Path(f["ids"]).read_text())]
             vals = np.load(f["npy"])
             assert len(ids) == len(vals), f["npy"]
             rec.update({f"{f['prefix']}:{i}": float(v) for i, v in zip(ids, vals) if f"{f['prefix']}:{i}" in self.by_id})
-        sample = random.Random(20261030).sample(sorted(rec), min(sd.get("check", 64), len(rec)))
+        if not rec:
+            self.log("seed skipped: no matching task ids")
+            return
+        check_n = 64 if sd.get("check") is None else sd["check"]
+        sample = random.Random(20261030).sample(sorted(rec), min(check_n, len(rec)))
         fresh = self.env.score([self.by_id[i] for i in sample], self.src, self.scorer)
+        if not all(i in fresh and math.isfinite(fresh[i]) for i in sample):
+            raise RuntimeError("seed check failed: fresh source scores contain missing or non-finite values")
+        if not all(math.isfinite(v) for v in rec.values()):
+            self.log("seed refused: recorded source scores contain non-finite values; scoring fresh")
+            return
         worst = max(abs(fresh[i] - rec[i]) for i in sample)
-        if worst > 1e-3:   # another backend or build: score fresh instead
+        if not math.isfinite(worst) or worst > 1e-3:   # another backend or build: score fresh instead
             self.log(f"seed refused: recorded source scores disagree with a fresh pass by {worst:.2e}; scoring fresh")
             return
         self.ev.seed(self.src, rec)
@@ -225,6 +359,22 @@ class Run:
         return {**base, "groups": {g: {"tier": mk.clip(self.groups[g], tier, self.ladder)} for g in base["groups"]}}
 
     # ------------------------------------------------------------------ helpers
+    def _sample_split(self, split: str, n: int, rng: random.Random | None = None) -> list:
+        pool = self.guard.get(split)
+        if not pool or n <= 0:
+            return []
+        if callable(getattr(self.env, "sample_tasks", None)):
+            return self.env.sample_tasks(split, int(n), stratified=True)
+        return _stratified_sample_subset(pool, int(n), rng)
+
+    def _make_renderer(self) -> kl.Renderer:
+        cfg = getattr(self, "cfg", None) or {}
+        dec = cfg.get("decoding") or {}
+        env = getattr(self, "env", None)
+        re_eff = dec.get("reasoning_effort") if dec.get("reasoning_effort") is not None else getattr(env, "reasoning_effort", "none")
+        en_th = dec.get("enable_thinking") if dec.get("enable_thinking") is not None else getattr(env, "enable_thinking", None)
+        return kl.Renderer(cfg["source"]["hf_dir"], reasoning_effort=re_eff, enable_thinking=en_th)
+
     def done(self, phase):
         return (self.dir / "phases" / f"{phase}.done").exists()
 
@@ -266,7 +416,7 @@ class Run:
                         "source_gguf_sha256": sha256_file(self.src), "llama_cpp_commit": commit,
                         "llama_cpp_patch_sha256": __import__("hashlib").sha256(diff.encode()).hexdigest(),
                         "traj_kl_sha256": sha256_file(c["toolchain"]["traj_kl"]),
-                        "env": {"name": self.env.name, "version": self.env.version, "kwargs": c["env"].get("kwargs", {})}},
+                        "env": {"name": self.env.name, "version": self.env.version, "kwargs": c["env"].get("kwargs") or {}}},
                "deployment": self.dep, "budget": self.env.budget}
         for k in ("source_revision",):
             if not run["pins"][k]:
@@ -294,27 +444,34 @@ class Run:
         if not src0.exists():
             gguf_ops.copy_without(self.src, src0, set(self.dead_tensors))
         if self.classifier and self.scorer is not None:
-            sample = self.guard.get("search")[:32]
+            sample = self._sample_split("search", 32, random.Random(stable_seed(self.cfg["run_id"], "prepass")))
             if sample:
                 s_full = self.env.score(sample, self.src, self.scorer)
                 s_cut = self.env.score(sample, str(src0), self.scorer)
+                if (
+                    not s_full
+                    or not all(k in s_cut and math.isfinite(s_full[k]) and math.isfinite(s_cut[k]) for k in s_full)
+                    or not all(math.isfinite(v) for v in s_cut.values())
+                ):
+                    raise RuntimeError("dead-tensor pre-pass returned missing or non-finite scores; aborting lossless removal")
                 worst = max(abs(s_full[k] - s_cut[k]) for k in s_full)
-                if worst > 1e-5:
+                if not math.isfinite(worst) or worst > 1e-5:
                     raise RuntimeError(f"dead-tensor pre-pass moved scores by {worst:.2e}; aborting lossless removal")
                 self.log(f"pre-pass: removed {len(self.dead_tensors)} dead tensors losslessly (max |diff|={worst:.2e})")
         self.probe_src = str(src0)
 
     # ------------------------------------------------------------------ pool (reliability screen, source only)
     def phase_pool(self):
-        pc = self.cfg["pool"]
+        pc = self.cfg.get("pool") or {}
+        runs = 1 if pc.get("runs") is None else pc["runs"]
+        min_pass = 1 if pc.get("min_pass") is None else pc["min_pass"]
         pool, rng = {}, random.Random(stable_seed(self.cfg["run_id"], "pool"))
         jobs = []
-        for split, n in pc["tasks_per_split"].items():
-            if split == "exam":  # exam reliability is measured inside the single-use exam phase
+        for split, n in (pc.get("tasks_per_split") or {}).items():
+            if split == "exam" or n is None:  # exam reliability is measured inside the single-use exam phase
                 continue
-            ts = self.guard.get(split)
-            rng.shuffle(ts)
-            jobs += self.jobs("pool", ts[:n], pc["runs"])
+            ts = self._sample_split(split, n, rng)
+            jobs += self.jobs("pool", ts, runs)
         rows = ok_rows(self.ev.run(self.src, jobs, "pool", side="src"))
         per = {}
         for r in rows:
@@ -322,9 +479,9 @@ class Run:
         for tid, xs in per.items():
             t = self.by_id[tid]
             pool.setdefault(t.split, {})[tid] = {"n": len(xs), "k": sum(xs)}
-        reliable = {s: sorted(t for t, v in d.items() if v["n"] >= pc["runs"] - 1 and v["k"] / v["n"] >= pc["min_pass"] / pc["runs"])
+        reliable = {s: sorted(t for t, v in d.items() if v["n"] >= runs - 1 and v["k"] / v["n"] >= min_pass / runs)
                     for s, d in pool.items()}
-        out = {"criterion": f">= {pc['min_pass']}/{pc['runs']}", "per_task": pool, "reliable": reliable,
+        out = {"criterion": f">= {min_pass}/{runs}", "per_task": pool, "reliable": reliable,
                "sizes": {s: {"screened": len(pool[s]), "reliable": len(reliable[s])} for s in pool},
                "pass_rate": sum(r["success"] for r in rows) / max(1, len(rows))}
         write_json(self.dir / "pool.json", out)
@@ -336,26 +493,40 @@ class Run:
 
     # ------------------------------------------------------------------ A/A calibration + gate sizing
     def phase_aa(self):
-        st = self.cfg["stats"]
+        st = self.cfg.get("stats") or {}
+        margin = 0.02 if st.get("margin") is None else st["margin"]
+        alpha = 0.05 if st.get("alpha") is None else st["alpha"]
+        power = 0.90 if st.get("power") is None else st["power"]
+        n_floor = 20 if st.get("n_floor") is None else st["n_floor"]
+        looks = 4 if st.get("looks") is None else st["looks"]
+        max_eps = 1 if st.get("max_eps_per_task") is None else st["max_eps_per_task"]
+        aa_tol = 0.02 if st.get("aa_tol") is None else st["aa_tol"]
+        aa_enforce = True if st.get("aa_enforce") is None else bool(st["aa_enforce"])
+        aa_replication = True if st.get("aa_replication") is None else bool(st["aa_replication"])
+        n_aa = 20 if st.get("n_aa") is None else st["n_aa"]
+        allow_small_pool = False if st.get("allow_small_pool") is None else bool(st["allow_small_pool"])
+        v_min_fin = 0.0 if st.get("v_min") is None else st["v_min"]
+        v_min_nan = 0.18 if st.get("v_min") is None else st["v_min"]
         sel = self.reliable("select")
-        n_aa = st["n_aa"]
         with self.ev.servers(self.src) as srvs:
-            a = ok_rows(self.ev.run(self.src, self.spread("aa-A", sel, n_aa, st["max_eps_per_task"]), "aa-A", "src", srvs=srvs))
-            b = ok_rows(self.ev.run(self.src, self.spread("aa-B", sel, n_aa, st["max_eps_per_task"]), "aa-B", "src", srvs=srvs))
-            beh_items = sanity.behavioral_items(self.cfg["sanity"]["behavioral_items"], 7)
-            bank = sanity.run_behavioral(srvs, self.cfg["decoding"], beh_items, list(range(self.cfg["sanity"]["behavioral_seeds"])), "src")
+            a = ok_rows(self.ev.run(self.src, self.spread("aa-A", sel, n_aa, max_eps), "aa-A", "src", srvs=srvs))
+            b = ok_rows(self.ev.run(self.src, self.spread("aa-B", sel, n_aa, max_eps), "aa-B", "src", srvs=srvs))
+            sc_cfg = self.cfg.get("sanity") or {}
+            beh_items = sanity.behavioral_items(sc_cfg.get("behavioral_items") or 0, 7)
+            beh_seeds = sc_cfg.get("behavioral_seeds")
+            bank = sanity.run_behavioral(srvs, self.cfg.get("decoding") or {"temperature": 0.0}, beh_items, list(range(1 if beh_seeds is None else beh_seeds)), "src", dialect=getattr(self.ev, "dialect", None), cache_prompt=getattr(self.ev, "cache_prompt", False))
         rows = [dict(r, side="cand") for r in a] + [dict(r, side="src") for r in b]
         d = stats.discordance(rows)
-        bnd = stats.delta_and_bounds(rows, st["alpha"])
-        v = max(d["v"], st.get("v_min", 0.0)) if not math.isnan(d["v"]) else st.get("v_min", 0.18)
+        bnd = stats.delta_and_bounds(rows, alpha)
+        v = max(d["v"], v_min_fin) if not math.isnan(d["v"]) else v_min_nan
         deff = max(1.0, d["deff"]) if not math.isnan(d["deff"]) else 1.0   # never size below iid
         n_fam_sel = len({t.family for t in sel})
-        n_req = stats.sample_size(v, st["margin"], st["alpha"], st["power"], deff, st["looks"], df=max(1, n_fam_sel - 1))
-        n_gate = max(st["n_floor"], n_req) if not st.get("n_override") else st["n_override"]
-        cap_sel = len(sel) * st["max_eps_per_task"]
+        n_req = stats.sample_size(v, margin, alpha, power, deff, looks, df=max(1, n_fam_sel - 1))
+        n_gate = max(n_floor, n_req) if not st.get("n_override") else st["n_override"]
+        cap_sel = len(sel) * max_eps
         two = stats.delta_and_bounds(rows, 0.025)  # two-sided 95%
         # Harness bias check: require 0 inside the two-sided 95% CI, and check |delta| <= aa_tol at gate scale.
-        point_ok = abs(bnd["delta"]) <= st["aa_tol"] if d["n_pairs"] >= st["n_floor"] else None
+        point_ok = abs(bnd["delta"]) <= aa_tol if d["n_pairs"] >= n_floor else None
         out = {"v": d["v"], "deff": d["deff"], "v_used": v, "deff_used": deff, "aa_delta": bnd["delta"], "aa_bounds": bnd,
                "aa_two_sided": {"L": two["L"], "U": two["U"]}, "aa_point_ok": point_ok, "n_pairs": d["n_pairs"],
                "aa_ok": (two["L"] <= 0 <= two["U"]) and point_ok is not False, "n_required": n_req, "n_gate": n_gate,
@@ -365,16 +536,16 @@ class Run:
         write_json(self.dir / "aa.json", out)
         write_json(self.dir / "behavioral_bank.json", bank)
         self.log(f"A/A: delta={bnd['delta']:+.4f} v={d['v']:.4f} deff={deff:.2f} n_gate={n_gate} capacity={cap_sel} aa_ok={out['aa_ok']}")
-        if not out["aa_ok"] and st.get("aa_replication"):
+        if not out["aa_ok"] and aa_replication:
             # pre-registered single replication with fresh seed sets, run in reverse order (order-effect check);
             # proceed only if the replication passes; both results are kept.
             self.log("A/A failed; running the pre-registered replication (sets D then C)")
             with self.ev.servers(self.src) as srvs:
-                d_ = ok_rows(self.ev.run(self.src, self.spread("aa-D", sel, n_aa, st["max_eps_per_task"]), "aa-D", "src", srvs=srvs))
-                c_ = ok_rows(self.ev.run(self.src, self.spread("aa-C", sel, n_aa, st["max_eps_per_task"]), "aa-C", "src", srvs=srvs))
+                d_ = ok_rows(self.ev.run(self.src, self.spread("aa-D", sel, n_aa, max_eps), "aa-D", "src", srvs=srvs))
+                c_ = ok_rows(self.ev.run(self.src, self.spread("aa-C", sel, n_aa, max_eps), "aa-C", "src", srvs=srvs))
             rr = [dict(r, side="cand") for r in c_] + [dict(r, side="src") for r in d_]
             t2 = stats.delta_and_bounds(rr, 0.025)
-            pt2 = abs(t2["delta"]) <= st["aa_tol"] if len(c_) >= st["n_floor"] else None
+            pt2 = abs(t2["delta"]) <= aa_tol if len(c_) >= n_floor else None
             rep = {"delta": t2["delta"], "L": t2["L"], "U": t2["U"], "point_ok": pt2, "n_pairs": min(len(c_), len(d_)),
                    "rate_C": sum(r["success"] for r in c_) / max(1, len(c_)), "rate_D": sum(r["success"] for r in d_) / max(1, len(d_))}
             rep["ok"] = (t2["L"] <= 0 <= t2["U"]) and pt2 is not False
@@ -385,10 +556,10 @@ class Run:
             if rep["ok"]:
                 out["aa_ok"] = True
         if not out["aa_ok"]:
-            if st.get("aa_enforce", True):
+            if aa_enforce:
                 raise RuntimeError("A/A check failed: harness, seeding or task isolation is biased; fix before search")
             self.log("WARNING: A/A check failed (aa_enforce=false; continuing)")
-        if not out["pool_rule_ok"] and not st.get("allow_small_pool"):
+        if not out["pool_rule_ok"] and not allow_small_pool:
             raise RuntimeError(f"pool-size rule failed: select capacity {cap_sel} < n_gate {n_gate}")
         self.mark("aa", {"n_gate": n_gate})
 
@@ -396,8 +567,11 @@ class Run:
     def phase_proxy(self):
         if self.classifier:
             return self._proxy_classifier()
-        pc = self.cfg["proxy"]
-        R = kl.Renderer(self.cfg["source"]["hf_dir"])
+        pc = self.cfg.get("proxy") or {}
+        gen_docs = 30 if pc.get("general_docs") is None else pc["general_docs"]
+        gen_seq_len = 1024 if pc.get("general_seq_len") is None else pc["general_seq_len"]
+        gen_n_seq = 4 if pc.get("general_n_seq") is None else pc["general_n_seq"]
+        R = self._make_renderer()
         pdir = self.dir / "proxy"
         pdir.mkdir(exist_ok=True)
         pool = read_json(self.dir / "pool.json")
@@ -406,24 +580,28 @@ class Run:
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "search" and r["success"] and r["task"] in rel_search:
                 try:
-                    rr = R.episode(r["messages"], self._task_tools(r.get("task")))
+                    t_tools = r["tools"] if "tools" in r else self._task_tools(r.get("task"))
+                    rr = R.episode(r["messages"], t_tools)
                 except kl.RenderError as e:
                     self.log(f"proxy: reject {r['task']}: {e}")
                     continue
                 recs += rr
                 stats_text.append(R.tok.decode(rr[-1][0]))
-        recs = kl.subsample(recs, pc["task_max_targets"], 20261012)
+        if not recs:
+            raise kl.RenderError("phase_proxy: zero trajectories rendered from pool.jsonl")
+        recs = kl.subsample(recs, pc.get("task_max_targets"), 20261012)
         meta_t = kl.write_trj(pdir / "task.bin", recs)
-        texts = sanity.general_texts(pc["general_docs"], 20261012, pdir / "general_texts.json")
-        grecs = kl.pack_text(R, texts, pc["general_seq_len"], pc["general_n_seq"])
+        texts = sanity.general_texts(gen_docs, 20261012, pdir / "general_texts.json")
+        grecs = kl.pack_text(R, texts, gen_seq_len, gen_n_seq)
         meta_g = kl.write_trj(pdir / "general.bin", grecs)
         for name in ("task", "general"):
             kl.traj_kl(self.tc, "base", self.src, str(pdir / f"{name}.bin"), str(pdir / f"store_{name}"), str(pdir / f"base_{name}.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
             s = kl.traj_kl(self.tc, "kl", self.src, str(pdir / f"{name}.bin"), str(pdir / f"store_{name}"), str(pdir / f"self_{name}.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
-            tol = pc.get("self_kl_tol", {}).get(name, 1e-5)
-            if s["kl"] > tol:
+            tol = _self_kl_tol(pc, name, 1e-5)
+            kl_val = float(s["kl"])
+            if not math.isfinite(kl_val) or kl_val > tol:
                 raise RuntimeError(f"self-KL check failed for {name}: {s['kl']} > {tol}")
-        (pdir / "stats_corpus.txt").write_text("\n\n".join(stats_text + texts[: pc["general_docs"] // 2]))
+        (pdir / "stats_corpus.txt").write_text("\n\n".join(stats_text + texts[: gen_docs // 2]))
         run_imatrix(self.tc, self.probe_src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
         self.annotate_imatrix(pdir / "imatrix.gguf")
         write_json(self.dir / "groups.json", self.groups)
@@ -436,12 +614,16 @@ class Run:
     def _proxy_classifier(self):
         """Classifier proxy: a log-odds store of the parts env.proxy_spec picks (random calibration humans, AI
         documents near the source's cutoff), scored by the configured objective; plus the usual general store."""
-        pc = self.cfg["proxy"]
+        pc = self.cfg.get("proxy") or {}
+        stats_docs = 200 if pc.get("stats_docs") is None else pc["stats_docs"]
+        gen_docs = 30 if pc.get("general_docs") is None else pc["general_docs"]
+        gen_seq_len = 1024 if pc.get("general_seq_len") is None else pc["general_seq_len"]
+        gen_n_seq = 4 if pc.get("general_n_seq") is None else pc["general_n_seq"]
         pdir = self.dir / "proxy"
         pdir.mkdir(exist_ok=True)
         by_split = lambda sp: [t for t in self.env.tasks() if t.split == sp]
         src_scores = self.ev.scores(self.src, by_split("calibration") + by_split("search"))
-        parts = self.env.proxy_spec(src_scores, **pc.get("spec", {}))
+        parts = self.env.proxy_spec(src_scores, **(pc.get("spec") or {}))
         tasks = [self.by_id[i] for p in parts for i in p["ids"]]
         trj = pdir / "task.bin"
         shutil.copyfile(self.env.trj_for(tasks), trj)
@@ -454,22 +636,23 @@ class Run:
         again = np.asarray(self.scorer.score_trj(self.src, str(trj), tuple(self.env.pair)), dtype=float)
         meta_task = {"kind": "logodds", "n_seq": len(tasks), "n_targets": len(tasks),
                      "meta": {"parts": [{"name": p["name"], "role": p["role"], "n": p["n"]} for p in parts],
-                              "pair": list(self.env.pair), "objective": pc.get("objective", "pauc"),
-                              "objective_args": pc.get("objective_args", {})}}
+                              "pair": list(self.env.pair), "objective": pc.get("objective") or "pauc",
+                              "objective_args": pc.get("objective_args") or {}}}
         split = lambda x: {r: np.concatenate([x[sum(q["n"] for q in parts[:k]):][: p["n"]] for k, p in enumerate(parts)
                                               if p["role"] == r]) for r in ("pos", "neg")}
         self_damage = abs(objectives.OBJECTIVES[meta_task["meta"]["objective"]](split(again), split(src),
                                                                                 **meta_task["meta"]["objective_args"]))
         write_json(pdir / "parts.json", parts)
-        R = kl.Renderer(self.cfg["source"]["hf_dir"])
-        texts = sanity.general_texts(pc["general_docs"], 20261012, pdir / "general_texts.json")
-        meta_g = kl.write_trj(pdir / "general.bin", kl.pack_text(R, texts, pc["general_seq_len"], pc["general_n_seq"]))
+        R = self._make_renderer()
+        texts = sanity.general_texts(gen_docs, 20261012, pdir / "general_texts.json")
+        meta_g = kl.write_trj(pdir / "general.bin", kl.pack_text(R, texts, gen_seq_len, gen_n_seq))
         kl.traj_kl(self.tc, "base", self.src, str(pdir / "general.bin"), str(pdir / "store_general"), str(pdir / "base_general.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
         sg = kl.traj_kl(self.tc, "kl", self.src, str(pdir / "general.bin"), str(pdir / "store_general"), str(pdir / "self_general.json"), str(pdir / "kl.log"), gpu=self.tc.gpus[0])
-        tol = pc.get("self_kl_tol", {})
-        if self_damage > tol.get("task", 1e-5) or sg["kl"] > tol.get("general", 1e-4):
+        task_tol = _self_kl_tol(pc, "task", 1e-5)
+        gen_tol = _self_kl_tol(pc, "general", 1e-4)
+        if not math.isfinite(float(self_damage)) or not math.isfinite(float(sg["kl"])) or float(self_damage) > task_tol or float(sg["kl"]) > gen_tol:
             raise RuntimeError(f"self-check failed: task damage {self_damage}, general KL {sg['kl']}")
-        (pdir / "stats_corpus.txt").write_text("\n\n".join(self.env.stats_texts(pc.get("stats_docs", 200)) + texts[: pc["general_docs"] // 2]))
+        (pdir / "stats_corpus.txt").write_text("\n\n".join(self.env.stats_texts(stats_docs) + texts[: gen_docs // 2]))
         run_imatrix(self.tc, self.probe_src, str(pdir / "stats_corpus.txt"), str(pdir / "imatrix.gguf"), str(pdir / "imatrix.log"), gpu=self.tc.gpus[0])
         self.annotate_imatrix(pdir / "imatrix.gguf")
         write_json(self.dir / "groups.json", self.groups)
@@ -487,11 +670,12 @@ class Run:
         shutil.rmtree(b_dir, ignore_errors=True)
         shutil.rmtree(c_dir, ignore_errors=True)
         B = bmod.Builder(self.tc, weights, self.groups, str(pdir / "imatrix.gguf"), b_dir, log=str(self.dir / "build.log"))
-        probe_cfg = self.cfg.get("probe", {})
-        B.threads = probe_cfg.get("quantize_threads", 8)
-        B.max_pruned = probe_cfg.get("max_pruned", 1 if str(self.scratch).startswith("/dev/shm") else 4)
+        probe_cfg = self.cfg.get("probe") or {}
+        B.threads = probe_cfg.get("quantize_threads") or 8
+        default_pruned = 1 if str(self.scratch).startswith("/dev/shm") else 4
+        B.max_pruned = default_pruned if probe_cfg.get("max_pruned") is None else probe_cfg["max_pruned"]
         req_workers = probe_cfg.get("workers")
-        clamp_enabled = probe_cfg.get("clamp_workers", True)
+        clamp_enabled = True if probe_cfg.get("clamp_workers") is None else bool(probe_cfg["clamp_workers"])
         w_sz = Path(weights).stat().st_size if Path(weights).exists() else 0
         workers, cap, free_b = clamp_probe_workers(
             req_workers, self.scratch, w_sz, n_gpus=max(1, len(self.tc.gpus)), clamp_enabled=clamp_enabled,
@@ -500,8 +684,8 @@ class Run:
             self.log(f"probe({tag}): clamped workers {req_workers} -> {workers} (cap={cap}, free={free_b / (1 << 30):.1f} GiB)")
         P = Prober(self.tc, B, self.dir / "probe" / tag, str(self.dir / "probe.log"), workers=workers,
                    scratch=c_dir, scorer=self.scorer)
-        if self.cfg.get("probe", {}).get("slots_per_gpu"):   # several concurrent probes per GPU
-            P._free = [g for g in self.tc.gpus for _ in range(self.cfg["probe"]["slots_per_gpu"])]
+        if probe_cfg.get("slots_per_gpu"):   # several concurrent probes per GPU
+            P._free = [g for g in self.tc.gpus for _ in range(probe_cfg["slots_per_gpu"])]
         P.add_store(Store("task", str(pdir / "task.bin"), self._staged(pdir / "store_task"), meta["task"]["n_targets"],
                           kind=meta["task"].get("kind", "kl"), meta=meta["task"].get("meta", {})))
         P.add_store(Store("general", str(pdir / "general.bin"), self._staged(pdir / "store_general"), meta["general"]["n_targets"]))
@@ -526,8 +710,9 @@ class Run:
 
     # ------------------------------------------------------------------ sanity: cap curve, floors, initial mask
     def phase_sanity(self):
-        sc = self.cfg["sanity"]
-        probe_cfg = self.cfg.get("probe", {})
+        sc = self.cfg.get("sanity") or {}
+        probe_cfg = self.cfg.get("probe") or {}
+        allow_drop = _reconciled_flag(self.cfg, "allow_drop", True)
         P = self.make_prober(self.probe_src, "sanity")
         src_bytes = gguf_ops.file_bytes(self.probe_src)
         base = mk.new_mask(self.groups, "BF16", self._source_pin(), self.mode)
@@ -537,19 +722,41 @@ class Run:
         solo, masks, keys = {}, [], []
         tiers_all = sc.get("solo_tiers") or self.ladder[1:]
         for g in base["groups"]:
-            for t in [x for x in tiers_all if mk.tier_allowed(self.groups[g], x)] + (["drop"] if self.groups[g]["droppable"] else []):
+            for t in [x for x in tiers_all if mk.tier_allowed(self.groups[g], x)] + (["drop"] if (self.groups[g]["droppable"] and allow_drop) else []):
                 masks.append(mk.apply(base, g, t))
                 keys.append((g, t))
-        fkey = sc.get("floor_key", "kl_gen")
-        cap_off = sc.get("cap", "general_kl") == "off"
-        if fkey == "task" and cap_off:
+        fkey = sc.get("floor_key") or "task"
+        cap_off = (sc.get("cap") or "off") == "off"
+        raw_want_solo = probe_cfg.get("want_solo")
+        if raw_want_solo is not None:
+            want_solo = list(raw_want_solo)
+            if not want_solo or len(set(want_solo)) != len(want_solo) or not set(want_solo) <= {"general", "task"}:
+                raise ValueError(f"invalid probe.want_solo: {raw_want_solo!r}")
+            if (fkey == "task" or (self.cfg.get("learner") or {}).get("algo") == "oneshot") and "task" not in want_solo:
+                raise ValueError("probe.want_solo must include 'task' when learner.algo == 'oneshot' or sanity.floor_key == 'task'")
+            if (fkey == "kl_gen" or not cap_off) and "general" not in want_solo:
+                raise ValueError("probe.want_solo must include 'general' when sanity.floor_key == 'kl_gen' or sanity.cap != 'off'")
+        elif fkey == "task" and cap_off:
             want_solo = ["task"]
-        elif fkey == "task" or self.cfg.get("learner", {}).get("algo") == "oneshot":
+        elif fkey == "task" or (self.cfg.get("learner") or {}).get("algo") == "oneshot":
             want_solo = ["general", "task"]
         else:
             want_solo = ["general"]
+        raw_task_tiers = probe_cfg.get("solo_task_tiers") if probe_cfg.get("solo_task_tiers") is not None else sc.get("solo_task_tiers")
+        task_tiers = set(raw_task_tiers or [])
+        if fkey == "task" and task_tiers and set(want_solo) == {"general", "task"}:
+            solo_present = {t for (_g, t) in keys}
+            missing = sorted(solo_present - task_tiers)
+            if missing:
+                raise ValueError(
+                    f"probe.solo_task_tiers must cover all sanity.solo_tiers when sanity.floor_key == 'task'; missing {missing}"
+                )
 
-        splice_flag = probe_cfg["splice_cache"] if "splice_cache" in probe_cfg else sc.get("splice_cache", True)
+        splice_flag = (
+            probe_cfg["splice_cache"]
+            if probe_cfg.get("splice_cache") is not None
+            else (True if sc.get("splice_cache") is None else sc["splice_cache"])
+        )
         solo_needed = bmod.reachable_tiers(masks, self.groups, self.ladder)
         splice_b = None
         if splice_flag and len(masks) >= 16 and solo_needed and Path(self.probe_src).exists():
@@ -572,23 +779,24 @@ class Run:
             um_hits = splice_b.hits if splice_b is not None else 0
             um_fb = splice_b.fallbacks if splice_b is not None else 0
             pts = [(bmod_bpw(src_bytes, P.builder.source_params), 0.0)] + [(u["bpw"], u["kl_gen"]) for u in uniform.values()]
-            cap = sanity.make_cap(sc.get("cap", "general_kl"), pts)
+            cap = sanity.make_cap(sc.get("cap") or "off", pts)
             if fkey == "task":
                 for u in uniform.values():
                     u["task"] = u["kl_task"]
             selfkl = read_json(self.dir / "proxy" / "proxy.json")["self_kl"]
-            ft = self.cfg["proxy"].get("floor_tier", "Q8_0")
+            ft_cfg = (self.cfg.get("proxy") or {}).get("floor_tier")
+            ft = ft_cfg if (ft_cfg and ft_cfg in uniform) else ("Q4_K" if "Q4_K" in uniform else ("Q8_0" if "Q8_0" in uniform else next(iter(uniform))))
             for name, key in (("general", "kl_gen"), ("task", "kl_task")):
                 ref = uniform[ft][key]
                 if self.classifier and name == "task":
                     ref = abs(ref)
-                if selfkl[name] > 0.05 * ref:
+                sk = float(selfkl[name])
+                rf = float(ref)
+                if not math.isfinite(sk) or not math.isfinite(rf) or sk > max(1e-6, 0.05 * rf):
                     raise RuntimeError(f"measurement floor too high for {name}: self-KL {selfkl[name]} > 5% of uniform {ft} KL {ref}")
             self.log(f"sanity: {len(masks)} solo probes")
 
-            raw_task_tiers = probe_cfg.get("solo_task_tiers") if probe_cfg.get("solo_task_tiers") is not None else sc.get("solo_task_tiers")
-            task_tiers = set(raw_task_tiers or [])
-            if task_tiers and want_solo == ["general", "task"]:
+            if task_tiers and set(want_solo) == {"general", "task"}:
                 full_i = [i for i, (_g, t) in enumerate(keys) if t in task_tiers]
                 gen_i = [i for i, (_g, t) in enumerate(keys) if t not in task_tiers]
                 res_map = {}
@@ -614,9 +822,11 @@ class Run:
                 solo[g][t]["kl_task"] = r.kl["task"]
             if fkey == "task":
                 solo[g][t]["task"] = r.kl["task"]
-        floors = (sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"]) if fkey == "kl_gen" else
-                  sanity.floors_from_solo(solo, uniform, self.ladder, sc["floor_factor"], key=fkey))
-        init = mk.new_mask(self.groups, self.cfg["start_tier"], self._source_pin(), self.mode)
+        ff = sc.get("floor_factor") if sc.get("floor_factor") is not None else 4.0
+        floors = (sanity.floors_from_solo(solo, uniform, self.ladder, ff) if fkey == "kl_gen" else
+                  sanity.floors_from_solo(solo, uniform, self.ladder, ff, key=fkey))
+        start_tier = self.cfg.get("start_tier") or ("Q4_K" if "Q4_K" in self.ladder else self.ladder[-1])
+        init = mk.new_mask(self.groups, start_tier, self._source_pin(), self.mode)
         for g, f in floors.items():
             init["floors"][g] = {"min_tier": f["min_tier"], "drop_ok": f["drop_ok"]}
             if mk.rank(init["groups"][g]["tier"]) > mk.rank(f["min_tier"]):
@@ -638,25 +848,31 @@ class Run:
 
     # ------------------------------------------------------------------ screens and gates
     def screen(self, model: str, tag: str) -> dict:
-        sc = self.cfg["screen"]
+        sc = self.cfg.get("screen") or {}
+        pairs = 32 if sc.get("pairs") is None else sc["pairs"]
+        fail_below = -0.05 if sc.get("fail_below") is None else sc["fail_below"]
         sel = self.reliable("select")
         rng = random.Random(stable_seed(self.cfg["run_id"], "screen", tag))
-        tasks = rng.sample(sel, min(sc["pairs"], len(sel)))
+        tasks = _stratified_sample_subset(sel, pairs, rng)
         src_bank = {}
         for r in read_jsonl(self.dir / "episodes" / "aa-B.jsonl"):
             if r["success"] is not None:
                 src_bank.setdefault(r["task"], []).append(r)
         with self.ev.servers(model) as srvs:
             cand = ok_rows(self.ev.run(model, [(t, stable_seed(tag, t.id)) for t in tasks], f"screen-{tag}", "cand", srvs=srvs))
-            beh = sanity.run_behavioral(srvs, self.cfg["decoding"], sanity.behavioral_items(self.cfg["sanity"]["behavioral_items"], 7),
-                                        list(range(self.cfg["sanity"]["behavioral_seeds"])), "cand")
+            sc_cfg = self.cfg.get("sanity") or {}
+            beh_items_n = sc_cfg.get("behavioral_items") or 0
+            beh_seeds_n = 1 if sc_cfg.get("behavioral_seeds") is None else sc_cfg.get("behavioral_seeds")
+            beh = sanity.run_behavioral(srvs, self.cfg.get("decoding") or {"temperature": 0.0}, sanity.behavioral_items(beh_items_n, 7),
+                                        list(range(beh_seeds_n)), "cand", dialect=getattr(self.ev, "dialect", None), cache_prompt=getattr(self.ev, "cache_prompt", False))
         rows = cand + [dict(src_bank[t.id][0], side="src") for t in tasks if t.id in src_bank]
         b = stats.delta_and_bounds(rows, 0.05, n_boot=1000)
         bank = read_json(self.dir / "behavioral_bank.json")
         beh_rate = sum(bool(r["success"]) for r in beh if r["success"] is not None) / max(1, len(beh))
         src_beh = sum(bool(r["success"]) for r in bank if r["success"] is not None) / max(1, len(bank))
-        beh_ok = beh_rate >= src_beh - self.cfg["sanity"]["behavioral_margin"]
-        task_ok = b["delta"] >= sc["fail_below"]
+        beh_margin = 0.1 if sc_cfg.get("behavioral_margin") is None else sc_cfg.get("behavioral_margin")
+        beh_ok = beh_rate >= src_beh - beh_margin
+        task_ok = b["delta"] >= fail_below
         out = {"tag": tag, "delta": b["delta"], "task_ok": task_ok, "behavioral_rate": beh_rate, "behavioral_source": src_beh,
                "behavioral_ok": beh_ok, "pass": task_ok and beh_ok, "n": len(cand)}
         # only candidate-specific failures carry feedback signal: items the source passed on the same seed
@@ -666,11 +882,16 @@ class Run:
         return out
 
     def gate(self, model: str, tag: str, split: str = "select") -> dict:
-        st = self.cfg["stats"]
+        st = self.cfg.get("stats") or {}
+        max_eps = 1 if st.get("max_eps_per_task") is None else st["max_eps_per_task"]
+        cfg_looks = 4 if st.get("looks") is None else st["looks"]
+        margin = 0.02 if st.get("margin") is None else st["margin"]
+        alpha = 0.05 if st.get("alpha") is None else st["alpha"]
+        det_bound = 0.03 if st.get("detector_bound") is None else st["detector_bound"]
         n_gate = read_json(self.dir / "aa.json")["n_gate"]
         tasks = self.reliable(split) if split != "exam" else self.exam_pool
-        k = min(st["max_eps_per_task"], max(1, math.ceil(n_gate / max(1, len(tasks)))))
-        looks = min(st["looks"], k) if split != "exam" else 1
+        k = min(max_eps, max(1, math.ceil(n_gate / max(1, len(tasks)))))
+        looks = min(cfg_looks, k) if split != "exam" else 1
         rows, res = [], None
         import contextlib
         stack = contextlib.ExitStack()
@@ -692,22 +913,26 @@ class Run:
                 for r in reused:
                     append_jsonl(self.dir / "episodes" / f"gate-{tag}-src.jsonl", r)
                 rows += reused
-            res = stats.sequential_decision(rows, look, looks, st["margin"], st["alpha"], final=(look == looks))
+            res = stats.sequential_decision(rows, look, looks, margin, alpha, final=(look == looks))
             self.log(f"gate {tag} look {look}/{looks}: delta={res['delta']:+.4f} L={res['L']:+.4f} U={res['U']:+.4f} -> {res['decision']}")
             if res["decision"] != "continue":
                 break
-        det = stats.detector_bounds(rows, st["alpha"], st["detector_bound"])
+        det = stats.detector_bounds(rows, alpha, det_bound)
         res["detectors"] = det
         res["pass"] = res["decision"] == "pass" and all(d["ok"] for d in det.values())
-        beh = sanity.run_behavioral(cs, self.cfg["decoding"], sanity.behavioral_items(self.cfg["sanity"]["behavioral_items"], 7),
-                                    list(range(self.cfg["sanity"]["behavioral_seeds"])), "cand")
+        sc_cfg = self.cfg.get("sanity") or {}
+        beh_items_n = sc_cfg.get("behavioral_items") or 0
+        beh_seeds_n = 1 if sc_cfg.get("behavioral_seeds") is None else sc_cfg.get("behavioral_seeds")
+        beh = sanity.run_behavioral(cs, self.cfg.get("decoding") or {"temperature": 0.0}, sanity.behavioral_items(beh_items_n, 7),
+                                    list(range(beh_seeds_n)), "cand", dialect=getattr(self.ev, "dialect", None), cache_prompt=getattr(self.ev, "cache_prompt", False))
         stack.close()
         bank = read_json(self.dir / "behavioral_bank.json")
         brows = [dict(r, side="cand") for r in beh if r["success"] is not None] + [dict(r, side="src") for r in bank if r["success"] is not None]
-        bb = stats.delta_and_bounds(brows, st["alpha"], n_boot=2000)
+        bb = stats.delta_and_bounds(brows, alpha, n_boot=2000)
         res["behavioral"] = bb
-        res["behavioral_ok"] = (stats.empty_ok(bb, self.cfg["sanity"]["behavioral_margin"]) if self.classifier and not brows
-                                else bb["L"] > -self.cfg["sanity"]["behavioral_margin"])
+        beh_margin = 0.1 if sc_cfg.get("behavioral_margin") is None else sc_cfg.get("behavioral_margin")
+        res["behavioral_ok"] = (stats.empty_ok(bb, beh_margin) if (self.classifier or beh_items_n == 0) and not brows
+                                else bb["L"] > -beh_margin)
         res["pass"] = res["pass"] and res["behavioral_ok"]
         res.update(tag=tag, split=split, n_gate=n_gate, eps_per_task=k, n_tasks=len(tasks))
         write_json(self.dir / "gates" / f"{tag}.json", res)
@@ -719,7 +944,7 @@ class Run:
 
         Only valid for deterministic environments where re-scoring the frozen source is invariant.
         Select rows come from the pool and A/A episodes, exam rows from the exam-pool episodes."""
-        if not self.cfg["stats"].get("reuse_source"):
+        if not (self.cfg.get("stats") or {}).get("reuse_source"):
             return None
         files = ["pool.jsonl", "aa-A.jsonl", "aa-B.jsonl"] if split != "exam" else ["exam-pool.jsonl"]
         bank = {}
@@ -734,8 +959,11 @@ class Run:
         """Exam-pool source rows from the source's recorded per-document scores (exam.source_scores), instead
         of a fresh source pass; a row counts as success when the label at the environment's cutoff is right."""
         import glob
+        src_scores_dir = (self.cfg.get("exam") or {}).get("source_scores")
+        if not src_scores_dir:
+            raise ValueError("exam.source_scores is required")
         sc = {}
-        for f in glob.glob(str(Path(self.cfg["exam"]["source_scores"]) / "*.jsonl")):
+        for f in glob.glob(str(Path(src_scores_dir) / "*.jsonl")):
             for r in read_jsonl(f):
                 sc[r["id"]] = r
         rows = []
@@ -747,7 +975,7 @@ class Run:
             pred = "ai" if r["p_human"] < self.env.cutoff else "human"
             row = {"task": t.id, "family": t.family, "split": t.split, "seed": 0, "side": "src", "success": pred == r["label"],
                    "tests_passed": pred == r["label"], "detectors": {}, "infra_error": None, "turns": 1, "tokens": 1, "wall_s": 0.0,
-                   "p_human": r["p_human"], "reused_from": self.cfg["exam"]["source_scores"]}
+                   "p_human": r["p_human"], "reused_from": src_scores_dir}
             append_jsonl(out, row)
             rows.append(row)
         return rows
@@ -757,15 +985,21 @@ class Run:
         """Render failed trajectories, compute the frozen-source reference on them, register as a store."""
         if self.classifier:
             return self._failure_store_classifier(eps_rows, name)
-        R = kl.Renderer(self.cfg["source"]["hf_dir"])
+        R = self._make_renderer()
         recs = []
         for r in eps_rows:
+            if not isinstance(r, dict) or "messages" not in r:
+                task_lbl = r.get("task") if isinstance(r, dict) else "<non-dict>"
+                self.log(f"failure_store {name}: reject {task_lbl}: missing 'messages'")
+                continue
             try:
-                t_tools = self._task_tools(r.get("task")) if r.get("family") in self._task_families() else None
+                t_tools = r["tools"] if "tools" in r else (self._task_tools(r.get("task")) if r.get("family") in self._task_families() else None)
                 recs += R.episode(r["messages"], t_tools)
-            except kl.RenderError:
+            except kl.RenderError as e:
+                self.log(f"failure_store {name}: reject {r.get('task')}: {e}")
                 continue
         if not recs:
+            self.log(f"failure_store {name}: zero trajectories rendered; skipped")
             return None
         cap_t = read_json(self.dir / "proxy" / "proxy.json")["task"]["n_targets"]
         recs = kl.subsample(recs, max(500, cap_t // 4), stable_seed(name))
@@ -809,16 +1043,22 @@ class Run:
 
     def _task_tools(self, task_id: str | None):
         if task_id and task_id in self.by_id:
-            p = self.by_id[task_id].prompt
+            t_obj = self.by_id[task_id]
+            prep = getattr(self.env, "prepare_request_messages_and_tools", None)
+            if callable(prep):
+                return prep(t_obj)[1]
+            p = t_obj.prompt
             if isinstance(p, dict) and "tools" in p:
                 return p["tools"]
         return _tools(self.env)
 
     def phase_search(self):
-        lc = self.cfg["learner"]
+        raw_lc = self.cfg.get("learner") or {}
+        lc = {k: v for k, v in raw_lc.items() if v is not None}
         init = read_json(self.dir / "sanity" / "sanity_mask.json")
         cd = read_json(self.dir / "sanity" / "cap.json")
-        cap = sanity.make_cap("off") if cd.get("kind") == "off" else sanity.SizeMatchedCap([tuple(p) for p in cd["points"]])
+        enforce_gen_cap = _reconciled_flag(self.cfg, "enforce_general_cap", True)
+        cap = sanity.make_cap("off") if (cd.get("kind") == "off" or not enforce_gen_cap) else sanity.SizeMatchedCap([tuple(p) for p in cd["points"]])
         P = self.make_prober(self.probe_src, "search")
         L = Learner(P, self.groups, self.ladder, cap, self.mode, lc, self.log, self.record)
         S = LearnerState(mask=init)
@@ -830,27 +1070,34 @@ class Run:
             base = P.probe(S.mask)
             self.record("history", {"step": 0, "mask_key": base.key, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl, "event": "start"})
             L.full_reprobe(S, base)
-            fb_i, consecutive_fail, deadline = 0, 0, self.t0 + 3600 * self.cfg["budget"]["max_hours"]
+            max_hours = (self.cfg.get("budget") or {}).get("max_hours")
+            max_moves = lc.get("max_moves", 10 ** 9)
+            target_bytes = lc.get("target_bytes", 0)
+            exch_rounds = lc.get("exchange_rounds", 0)
+            screen_every = lc.get("screen_every", 4)
+            gate_every = lc.get("gate_every", 16)
+            fb_tasks_n = lc.get("feedback_tasks", 200)
+            fb_i, consecutive_fail, deadline = 0, 0, self.t0 + 3600 * (1e9 if max_hours is None else max_hours)
             stop_reason = "exhausted"
             exch, n_exch = False, 0   # exchange phase (learner.exchange_rounds > 0): at the budget, one up + one down per round
             while True:
                 if time.time() > deadline:
                     stop_reason = "budget"
                     break
-                if S.accepted >= lc.get("max_moves", 10 ** 9):
+                if S.accepted >= max_moves:
                     stop_reason = "max_moves"
                     break
-                if base.bytes <= lc.get("target_bytes", 0) and not exch:
-                    if lc.get("exchange_rounds", 0) <= 0:
+                if base.bytes <= target_bytes and not exch:
+                    if exch_rounds <= 0:
                         stop_reason = "target_bytes"
                         break
                     exch = True
                 if exch:
-                    if n_exch >= lc["exchange_rounds"]:
+                    if n_exch >= exch_rounds:
                         stop_reason = "exchange_rounds_done"
                         break
                     n_exch += 1
-                    best = L.exchange(S, base, lc["target_bytes"])
+                    best = L.exchange(S, base, target_bytes)
                     if best is None:
                         stop_reason = "exchange_converged"
                         break
@@ -865,11 +1112,11 @@ class Run:
                 self.record("history", {"step": S.accepted, "move": label, "bytes": base.bytes, "bpw": base.bpw, "kl": base.kl,
                                         "score": best["score"], "event": "exchange" if exch else "accept"})
                 self.log(f"{'exchange' if exch else 'move'} {S.accepted}: {label} bytes={base.bytes} bpw={base.bpw:.3f} kl_task={base.kl['task']:.5f} kl_gen={base.kl['general']:.5f}")
-                if S.accepted % lc["screen_every"] == 0 or exch:
+                if (screen_every > 0 and S.accepted % screen_every == 0) or exch:
                     cand = P.builder.build(S.mask, self.scratch / "build" / "screen.gguf").path
                     sc = self.screen(cand, f"m{S.accepted:04d}")
                     # failure feedback from search-split episodes (never the select split)
-                    fb_tasks = random.Random(stable_seed("fb", S.accepted)).sample(self.reliable("search"), min(lc["feedback_tasks"], len(self.reliable("search"))))
+                    fb_tasks = _stratified_sample_subset(self.reliable("search"), fb_tasks_n, random.Random(stable_seed("fb", S.accepted)))
                     fb_rows = ok_rows(self.ev.run(cand, [(t, stable_seed("fb", S.accepted, t.id)) for t in fb_tasks], f"fb-{S.accepted:04d}", "cand"))
                     fails = [r for r in read_jsonl(self.dir / "episodes" / f"fb-{S.accepted:04d}.jsonl") if r["success"] is False]
                     fails += sc["_beh_fail"]
@@ -898,7 +1145,7 @@ class Run:
                     last_screen = S.mask
                     if lc.get("reprobe_after_screen", True):
                         L.full_reprobe(S, base)
-                    if S.accepted % lc["gate_every"] == 0:
+                    if gate_every > 0 and S.accepted % gate_every == 0:
                         g = self.gate(P.builder.build(S.mask, self.scratch / "build" / "gate.gguf").path, f"m{S.accepted:04d}")
                         if not g["pass"]:
                             S.mask = last_gate or init
@@ -910,7 +1157,7 @@ class Run:
         self.log(f"search stopped: {stop_reason} after {S.accepted} accepted moves")
         # optional weight repair on the selected mask
         final_weights, lineage = self.src, []
-        if self.cfg.get("repair", {}).get("enabled"):
+        if (self.cfg.get("repair") or {}).get("enabled"):
             final_weights, lineage, S.mask = self._repair(S.mask, P)
         cand_mask = S.mask
         sel_mask = cand_mask
@@ -952,7 +1199,7 @@ class Run:
         logodds_stores = [s for s in P.stores if s.kind == "logodds" and s.name != "general"]
         is_kl_mode = len(logodds_stores) == 0
         task_stores = [s for s in P.stores if s.kind == "kl" and s.name != "general"] if is_kl_mode else logodds_stores
-        tiers = self.cfg["sanity"].get("solo_tiers") or self.ladder[1:]
+        tiers = (self.cfg.get("sanity") or {}).get("solo_tiers") or self.ladder[1:]
 
         def _load_vec(key_str: str, s_name: str, expected_src: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
             if not is_kl_mode:
@@ -999,8 +1246,10 @@ class Run:
             raise RuntimeError("oneshot needs per-trajectory sanity solo receipts on at least one task store")
 
         # Optional general-KL cap surrogate for generative runs (`SizeMatchedCap(bpw)`)
+        enforce_gen_cap = _reconciled_flag(self.cfg, "enforce_general_cap", True, lc_override=lc)
+        allow_drop = _reconciled_flag(self.cfg, "allow_drop", True, lc_override=lc)
         gen_store = next((s for s in P.stores if s.name == "general" and s.kind == "kl"), None)
-        use_gen_guard = is_kl_mode and gen_store is not None and cap is not None and lc.get("enforce_general_cap", True)
+        use_gen_guard = is_kl_mode and gen_store is not None and cap is not None and not isinstance(cap, sanity.NoCap) and enforce_gen_cap
         gen_solo: dict = {}
         gen_used = []
         if use_gen_guard:
@@ -1019,6 +1268,7 @@ class Run:
         respect_floors = lc.get("respect_floors", False)
         floors = init.get("floors", {}) if respect_floors else {}
         allowed_tiers: dict[str, list[str]] = {}
+        warned_unprobed_q8 = False
         for g in base["groups"]:
             cand_t = group_tier_overrides.get(g, default_tiers)
             fl = floors.get(g)
@@ -1040,10 +1290,13 @@ class Run:
                         if fg is not None:
                             cg, sg, _ = oneshot.extract_traj_kl(read_json(fg), "preserve")
                             gen_solo[(g, t)] = cg - sg
-                elif t in ("BF16", "Q8_0"):
+                elif t == "BF16":
                     allowed_tiers[g].append(t)
+                elif t == "Q8_0" and not warned_unprobed_q8:
+                    warned_unprobed_q8 = True
+                    self.log("oneshot: skipping unprobed Q8_0 (no solo sanity receipts)")
             drop_ok_by_floor = (fl is None) or bool(fl.get("drop_ok", True))
-            if self.groups[g]["droppable"] and lc.get("allow_drop", True) and drop_ok_by_floor:
+            if self.groups[g]["droppable"] and allow_drop and drop_ok_by_floor:
                 key_dr = bmod.mask_key(mk.apply(base, g, "drop"))
                 shifts = []
                 for name, _, _, src in used:
@@ -1057,54 +1310,6 @@ class Run:
                         if fg is not None:
                             cg, sg, _ = oneshot.extract_traj_kl(read_json(fg), "preserve")
                             gen_solo[(g, "drop")] = cg - sg
-
-        # Optional Wanda neuron ordering + per-MLP width probes
-        n_ff0 = gguf_ops.ffn_widths(self.probe_src)
-        width_cuts: dict[tuple[int, int], np.ndarray] = {}
-        gen_width_cuts: dict[tuple[int, int], np.ndarray] = {}
-        neuron_order: dict[int, np.ndarray] = {}
-        if lc.get("widths"):
-            order_file = self.dir / "wanda_order.json"
-            if order_file.exists():
-                neuron_order = {int(k): np.asarray(v, dtype=np.int64) for k, v in read_json(order_file).items()}
-            else:
-                neuron_order = gguf_ops.wanda_order(self.probe_src, str(self.dir / "proxy" / "imatrix.gguf"))
-                write_json(order_file, {str(k): v.tolist() for k, v in neuron_order.items()})
-            fracs = lc.get("width_fractions", [0.75, 0.5, 0.25, 0.0625])
-            step = int(lc.get("width_step", 256))
-            ext = "json" if is_kl_mode else "npy"
-            want_stores = (["general"] if gen_used else []) + [name for name, _, _, _ in used]
-            w_masks, w_keys = [], []
-            for il, full in sorted(n_ff0.items()):
-                if il not in neuron_order:
-                    continue
-                for f in fracs:
-                    w = int(full * f) // step * step
-                    if 0 < w < full:
-                        mw = json.loads(json.dumps(base))
-                        mw["widths"] = {str(il): mk.pack_bitmap(neuron_order[il][:w], full)}
-                        key_w = bmod.mask_key(mw)
-                        need = any(_find_probe(f"p-{key_w}-{sname}.{ext}") is None for sname in want_stores)
-                        if need:
-                            w_masks.append(mw)
-                        w_keys.append((il, w, mw))
-            if w_masks:
-                self.log(f"oneshot: probing {len(w_masks)} MLP width settings")
-                P.probe_many(w_masks, want_stores)
-            for il, w, mw in w_keys:
-                key_w = bmod.mask_key(mw)
-                shifts = []
-                for name, _, _, src in used:
-                    got = _load_vec(key_w, name, src)
-                    if got is not None:
-                        shifts.append(got[0] - src)
-                if len(shifts) == len(used):
-                    width_cuts[(il, w)] = np.concatenate(shifts)
-                if gen_used:
-                    fg = _find_probe(f"p-{key_w}-general.json")
-                    if fg is not None:
-                        cg, sg, _ = oneshot.extract_traj_kl(read_json(fg), "preserve")
-                        gen_width_cuts[(il, w)] = cg - sg
 
         # Optional Merge-Closed Rule-P vocabulary keep-set (fixed K or automatic scan)
         keep_vocab = None
@@ -1133,7 +1338,7 @@ class Run:
                             counts += 10 * np.bincount(sa, minlength=v_sz)[:v_sz]
             must_keep = list(getattr(env_obj, "pair", ()))
             if vocab_cfg == "auto":
-                cand_ks = lc.get("vocab_candidates", [50000, 65000, 80000, 100000])
+                cand_vks = lc.get("vocab_candidates", [50000, 65000, 80000, 100000])
                 min_fid = float(lc.get("vocab_min_fidelity", 0.998 if not is_kl_mode else 0.995))
                 if not is_kl_mode:
                     parts = read_json(self.dir / "proxy" / "parts.json")
@@ -1166,7 +1371,7 @@ class Run:
                         if len(all_tgt) == 0:
                             return 1.0
                         return float(np.isin(all_tgt, keep_arr).mean())
-                chosen_k, keep_vocab, v_meas = vocabmod.pick_vocab_k(self.probe_src, counts, cand_ks, _eval_vocab, min_fidelity=min_fid, must_keep=must_keep)
+                chosen_k, keep_vocab, v_meas = vocabmod.pick_vocab_k(self.probe_src, counts, cand_vks, _eval_vocab, min_fidelity=min_fid, must_keep=must_keep)
                 self.log(f"oneshot: auto-selected vocab K={chosen_k} (kept={len(keep_vocab)}), fidelities={v_meas}")
             else:
                 keep_vocab = vocabmod.rule_p_keep_set(self.probe_src, counts, int(vocab_cfg), must_keep=must_keep)
@@ -1179,95 +1384,293 @@ class Run:
         if keep_vocab is not None:
             bm.set_vocab_trim(keep_vocab)
 
-        use_joint = bool(width_cuts)
-        if use_joint:
-            options = oneshot.build_joint_options(self.groups, allowed_tiers, solo, width_cuts, n_ff0,
-                                                  width_step=int(lc.get("width_step", 256)), allow_drop=lc.get("allow_drop", True))
-            ref_sol = {g: options[g][0] for g in options}
-            ref_t, ref_w = oneshot.unpack_solution(ref_sol)
-            ref_bytes = bm.spec_bytes(ref_t, ref_w)
-            cost = {}
-            for g, o in options.items():
-                for opt in o:
-                    s1 = dict(ref_sol); s1[g] = opt
-                    cost[(g, opt)] = bm.spec_bytes(*oneshot.unpack_solution(s1)) - ref_bytes
-            hdr = ref_bytes
+        # Optional MoE expert importance ranking + K-sweep, coupled with K-conditioned Wanda MLP width probes
+        im_path = str(self.dir / "proxy" / "imatrix.gguf")
+        im_sha = sha256_file(im_path) if Path(im_path).exists() else None
+        src_sha = sha256_file(self.probe_src) if Path(self.probe_src).exists() else None
+        n_ff0 = gguf_ops.ffn_widths(self.probe_src)
+        n_expert = int(self.info.get("n_expert") or 0)
+        n_expert_used = int(self.info.get("n_expert_used") or 1)
+        use_experts = bool(lc.get("experts")) and n_expert > 0
+        exp_order: dict[int, np.ndarray] = {}
+        moe_layers: list[int] = []
+        if use_experts:
+            exp_order_file = self.dir / "expert_order.json"
+            cached_exp = read_json(exp_order_file) if exp_order_file.exists() else None
+            if (
+                isinstance(cached_exp, dict)
+                and "order" in cached_exp
+                and cached_exp.get("imatrix_sha256") == im_sha
+                and cached_exp.get("source_sha256") == src_sha
+            ):
+                exp_order = {int(k): np.asarray(v, dtype=np.int64) for k, v in cached_exp["order"].items()}
+            else:
+                exp_order = gguf_ops.expert_importance_from_imatrix(self.probe_src, im_path)
+                write_json(exp_order_file, {
+                    "imatrix_sha256": im_sha,
+                    "source_sha256": src_sha,
+                    "order": {str(k): v.tolist() for k, v in exp_order.items()},
+                })
+            moe_layers = sorted(exp_order)
+            raw_ks = lc.get("expert_counts")
+            if raw_ks is not None:
+                cand_ks = sorted({int(k) for k in raw_ks if n_expert_used <= int(k) <= n_expert}, reverse=True)
+                if not cand_ks:
+                    raise ValueError(f"expert_counts {raw_ks!r} has no values in [{n_expert_used}, {n_expert}]")
+            else:
+                auto_ks = [n_expert, (3 * n_expert) // 4, n_expert // 2, (3 * n_expert) // 8, n_expert // 4]
+                cand_ks = sorted({k for k in auto_ks if n_expert_used <= k <= n_expert}, reverse=True) or [n_expert]
         else:
-            options = {g: list(allowed_tiers[g]) + (["drop"] if (g, "drop") in solo else []) for g in base["groups"]}
-            cost = {}
-            ref_tier = "Q8_0" if "Q8_0" in self.ladder else self.ladder[0]
-            ref_m = self.uniform_mask(base, ref_tier)
-            ref_bytes = bm(ref_m)
-            for g, o in options.items():
-                for t in o:
-                    cost[(g, t)] = bm(mk.apply(ref_m, g, t)) - ref_bytes
-            hdr = ref_bytes - sum(cost.get((g, ref_tier), 0) for g in options)
+            cand_ks = [n_expert]
 
         default_obj = "proxy" if is_kl_mode else "fidelity"
         use_fid = (not is_kl_mode) and (lc.get("oneshot_objective", default_obj) == "fidelity")
         sur_cls = oneshot.FidelitySurrogate if use_fid else oneshot.Surrogate
-        sur = sur_cls(used, solo, width_cuts=width_cuts, n_ff0=n_ff0)
-
-        guard_fn = None
-        if gen_used and cap is not None:
-            gen_sur = oneshot.Surrogate(gen_used, gen_solo, width_cuts=gen_width_cuts, n_ff0=n_ff0)
-            src_params = P.builder.source_params
-            gen_dvc = {(g, t): gen_sur.shift(g, t) for g, o in options.items() for t in o}
-            def _gen_guard(m_cand: dict, b_cand: int) -> float:
-                vs = 0
-                if keep_vocab is not None:
-                    tiers_c, _ = oneshot.unpack_solution(m_cand)
-                    t_tiers = {
-                        tab: tiers_c.get("output" if tab == "output.weight" else "token_embd", "Q4_K")
-                        for tab in ("token_embd.weight", "per_layer_token_embd.weight", "output.weight")
-                        if tab in bm.inv
-                    }
-                    vs = vocabmod.vocab_trim_byte_savings(self.probe_src, keep_vocab, t_tiers)
-                gx = gen_sur.src + sum(gen_dvc[(g, t)] for g, t in m_cand.items())
-                return float(gen_sur.damage(gx) - cap(bmod_bpw(b_cand + vs, src_params)))
-            guard_fn = _gen_guard
-
+        ext = "json" if is_kl_mode else "npy"
+        want_stores = (["general"] if gen_used else []) + [name for name, _, _, _ in used]
+        if lc.get("target_bytes") is None:
+            raise ValueError("learner.target_bytes is required when learner.algo == 'oneshot'")
         budget, target = lc["target_bytes"], lc["target_bytes"]
         full_vocab_n = vocabmod.read_tokenizer(self.src)["vocab_size"] if keep_vocab is not None else 0
-        final_builder = bmod.Builder(self.tc, self.src, self.groups, str(self.dir / "proxy" / "imatrix.gguf"), self.scratch / "build" / "oneshot-final", log=str(self.dir / "build.log"))
 
-        for attempt in range(3):
-            sol = oneshot.solve(sur, options, cost, budget, hdr, log=self.log, guard_fn=guard_fn)
-            tiers_of, widths_of = oneshot.unpack_solution(sol)
-            m = mk.upgrade_v2({**init, "groups": {g: {"tier": t} for g, t in tiers_of.items()}, "floors": {}})
-            m["dead_tensors"] = list(self.dead_tensors)
-            m["widths"] = {str(il): mk.pack_bitmap(neuron_order[il][:w], n_ff0[il]) for il, w in sorted(widths_of.items()) if w < n_ff0[il]}
-            if keep_vocab is not None and len(keep_vocab) < full_vocab_n:
-                m["vocab_keep"] = mk.pack_bitmap(keep_vocab, full_vocab_n)
-            mk.validate(m, self.groups)
-            if mk.has_v3_cuts(m):
-                br = final_builder.build(m, self.scratch / "build" / "oneshot-final" / f"attempt-{attempt}.gguf")
-                built_bytes, built_bpw, built_key = br.file_bytes, br.bpw, bmod.mask_key(m)
-                Path(br.path).unlink(missing_ok=True)
-                kl_rec = {}
+        orig_builder = P.builder
+        slice_builder = _SliceCacheBuilder(self, orig_builder, im_path)
+        P.builder = slice_builder
+        final_builder = None
+        try:
+            best_k = None
+            for K in cand_ks:
+                kept_exp = {il: np.sort(exp_order[il][:K]) for il in moe_layers} if (use_experts and moe_layers and K < n_expert) else {}
+                if kept_exp:
+                    m_exp = json.loads(json.dumps(base))
+                    m_exp["experts"] = {str(il): mk.pack_bitmap(kept_exp[il], n_expert) for il in moe_layers}
+                    key_exp = bmod.mask_key(m_exp)
+                    if any(_find_probe(f"p-{key_exp}-{sname}.{ext}") is None for sname in want_stores):
+                        self.log(f"oneshot: probing MoE experts K={K}/{n_expert}")
+                        P.probe(m_exp, want_stores)
+                    exp_shifts = []
+                    for name, _, _, src in used:
+                        got = _load_vec(key_exp, name, src)
+                        if got is None:
+                            raise RuntimeError(f"oneshot: missing expert probe receipt for K={K}, store={name}")
+                        exp_shifts.append(got[0] - src)
+                    exp_shift = np.concatenate(exp_shifts)
+                    gen_exp_shift = np.zeros(len(gen_used[0][3]), dtype=np.float64) if gen_used else np.zeros(0, dtype=np.float64)
+                    if gen_used:
+                        fg = _find_probe(f"p-{key_exp}-general.json")
+                        if fg is not None:
+                            cg, sg, _ = oneshot.extract_traj_kl(read_json(fg), "preserve")
+                            gen_exp_shift = cg - sg
+                else:
+                    m_exp = None
+                    exp_shift = np.zeros(sum(len(u[3]) for u in used), dtype=np.float64)
+                    gen_exp_shift = np.zeros(len(gen_used[0][3]), dtype=np.float64) if gen_used else np.zeros(0, dtype=np.float64)
+
+                width_cuts_k: dict[tuple[int, int], np.ndarray] = {}
+                gen_width_cuts_k: dict[tuple[int, int], np.ndarray] = {}
+                neuron_order_k: dict[int, np.ndarray] = {}
+                if lc.get("widths"):
+                    order_fname = "wanda_order.json" if not kept_exp else f"wanda_order_k{K}.json"
+                    order_file = self.dir / order_fname
+                    exp_fp = {str(il): kept_exp[il].tolist() for il in sorted(kept_exp)} if kept_exp else None
+                    cached_w = read_json(order_file) if order_file.exists() else None
+                    if (
+                        isinstance(cached_w, dict)
+                        and "order" in cached_w
+                        and cached_w.get("imatrix_sha256") == im_sha
+                        and cached_w.get("source_sha256") == src_sha
+                        and cached_w.get("kept_experts") == exp_fp
+                    ):
+                        neuron_order_k = {int(k): np.asarray(v, dtype=np.int64) for k, v in cached_w["order"].items()}
+                    else:
+                        neuron_order_k = gguf_ops.wanda_order(
+                            self.probe_src, im_path, kept_experts=kept_exp if kept_exp else None
+                        )
+                        write_json(order_file, {
+                            "imatrix_sha256": im_sha,
+                            "source_sha256": src_sha,
+                            "kept_experts": exp_fp,
+                            "order": {str(k): v.tolist() for k, v in neuron_order_k.items()},
+                        })
+                    fracs = lc.get("width_fractions") or [0.75, 0.5, 0.25, 0.0625]
+                    step = int(lc.get("width_step") or 256)
+                    w_masks, w_keys = [], []
+                    for il, full in sorted(n_ff0.items()):
+                        if il not in neuron_order_k:
+                            continue
+                        seen_w: set[int] = set()
+                        for f in fracs:
+                            w = round(full * f / step) * step
+                            if 0 < w < full and w not in seen_w:
+                                seen_w.add(w)
+                        if not seen_w:
+                            top_aligned = (full - 1) // step * step
+                            if 0 < top_aligned < full:
+                                seen_w.add(top_aligned)
+                        for w in sorted(seen_w, reverse=True):
+                            mw = json.loads(json.dumps(base))
+                            if kept_exp:
+                                mw["experts"] = m_exp["experts"]
+                            mw["widths"] = {str(il): mk.pack_bitmap(neuron_order_k[il][:w], full)}
+                            key_w = bmod.mask_key(mw)
+                            if any(_find_probe(f"p-{key_w}-{sname}.{ext}") is None for sname in want_stores):
+                                w_masks.append(mw)
+                            w_keys.append((il, w, mw))
+                    if w_masks:
+                        self.log(f"oneshot: probing {len(w_masks)} MLP width settings" + (f" (K={K})" if use_experts else ""))
+                        P.probe_many(w_masks, want_stores)
+                    for il, w, mw in w_keys:
+                        key_w = bmod.mask_key(mw)
+                        shifts = []
+                        for name, _, _, src in used:
+                            got = _load_vec(key_w, name, src)
+                            if got is not None:
+                                shifts.append(got[0] - src)
+                        if len(shifts) == len(used):
+                            width_cuts_k[(il, w)] = np.concatenate(shifts) - exp_shift
+                        if gen_used:
+                            fg = _find_probe(f"p-{key_w}-general.json")
+                            if fg is not None:
+                                cg, sg, _ = oneshot.extract_traj_kl(read_json(fg), "preserve")
+                                gen_width_cuts_k[(il, w)] = (cg - sg) - gen_exp_shift
+
+                exp_counts_k = {il: K for il in moe_layers} if kept_exp else None
+                use_joint_k = bool(width_cuts_k)
+                if use_joint_k:
+                    options_k = oneshot.build_joint_options(
+                        self.groups, allowed_tiers, solo, width_cuts_k, n_ff0,
+                        width_step=int(lc.get("width_step") or 256), allow_drop=allow_drop,
+                    )
+                    ref_sol = {g: options_k[g][0] for g in options_k}
+                    ref_t, ref_w = oneshot.unpack_solution(ref_sol)
+                    ref_bytes = bm.spec_bytes(ref_t, ref_w, experts=exp_counts_k)
+                    cost_k = {}
+                    for g, o in options_k.items():
+                        for opt in o:
+                            s1 = dict(ref_sol); s1[g] = opt
+                            cost_k[(g, opt)] = bm.spec_bytes(*oneshot.unpack_solution(s1), experts=exp_counts_k) - ref_bytes
+                    hdr_k = ref_bytes
+                else:
+                    options_k = {g: list(allowed_tiers[g]) + (["drop"] if (allow_drop and (g, "drop") in solo) else []) for g in base["groups"]}
+                    empty_g = [g for g, o in options_k.items() if not o]
+                    if empty_g:
+                        raise ValueError(f"oneshot: no probed/allowed tiers remain for groups {empty_g[:5]}")
+                    cost_k = {}
+                    ref_tier = "Q8_0" if "Q8_0" in self.ladder else self.ladder[0]
+                    ref_m = self.uniform_mask(base, ref_tier)
+                    if kept_exp:
+                        ref_m["experts"] = m_exp["experts"]
+                    ref_bytes = bm(ref_m)
+                    for g, o in options_k.items():
+                        for t in o:
+                            cost_k[(g, t)] = bm(mk.apply(ref_m, g, t)) - ref_bytes
+                    hdr_k = ref_bytes - sum(cost_k.get((g, ref_tier), 0) for g in options_k)
+
+                sur_k = sur_cls(
+                    used, solo, width_cuts=width_cuts_k, n_ff0=n_ff0,
+                    base_shift=(exp_shift if kept_exp else None),
+                )
+                guard_fn_k = None
+                if gen_used and cap is not None:
+                    gen_sur_k = oneshot.Surrogate(
+                        gen_used, gen_solo, width_cuts=gen_width_cuts_k, n_ff0=n_ff0,
+                        base_shift=(gen_exp_shift if kept_exp else None),
+                    )
+                    src_params = orig_builder.source_params
+                    gen_dvc_k = {(g, t): gen_sur_k.shift(g, t) for g, o in options_k.items() for t in o}
+                    def _make_gen_guard(gsur, gdvc):
+                        def _gen_guard(m_cand: dict, b_cand: int) -> float:
+                            vs = 0
+                            if keep_vocab is not None:
+                                tiers_c, _ = oneshot.unpack_solution(m_cand)
+                                t_tiers = {
+                                    tab: tiers_c.get("output" if tab == "output.weight" else "token_embd", "Q4_K")
+                                    for tab in ("token_embd.weight", "per_layer_token_embd.weight", "output.weight")
+                                    if tab in bm.inv
+                                }
+                                vs = vocabmod.vocab_trim_byte_savings(self.probe_src, keep_vocab, t_tiers)
+                            gx = gsur.base_x + sum(gdvc[(g, t)] for g, t in m_cand.items())
+                            return float(gsur.damage(gx) - cap(bmod_bpw(b_cand + vs, src_params)))
+                        return _gen_guard
+                    guard_fn_k = _make_gen_guard(gen_sur_k, gen_dvc_k)
+
+                try:
+                    sol_k = oneshot.solve(sur_k, options_k, cost_k, budget, hdr_k, log=self.log, guard_fn=guard_fn_k)
+                except RuntimeError as e:
+                    if len(cand_ks) == 1:
+                        raise
+                    self.log(f"oneshot: skipping K={K}: {e}")
+                    continue
+
+                x_k = sur_k.base_x + sum(sur_k.shift(g, t) for g, t in sol_k.items())
+                dmg_k = float(sur_k.damage(x_k))
+                b_k = hdr_k + sum(cost_k[(g, t)] for g, t in sol_k.items())
+                viol_k = max(0.0, float(guard_fn_k(sol_k, b_k))) if guard_fn_k is not None else 0.0
+                cand_key = (0 if viol_k <= 0.0 else 1, viol_k, dmg_k)
+                if use_experts:
+                    self.log(f"oneshot: K={K} bytes={b_k} dmg={dmg_k:.6f} guard_viol={viol_k:.6f}")
+                if best_k is None or cand_key < best_k[0]:
+                    best_k = (cand_key, K, kept_exp, m_exp, neuron_order_k, options_k, cost_k, hdr_k, sur_k, guard_fn_k, sol_k)
+
+            if best_k is None:
+                raise RuntimeError(f"oneshot: budget {budget} is below the cheapest mask for all candidate expert counts {cand_ks}")
+
+            _, win_k, kept_exp, m_exp, neuron_order, options, cost, hdr, sur, guard_fn, first_sol = best_k
+            if kept_exp:
+                self.log(f"oneshot: selected expert count K={win_k}/{n_expert}")
             else:
-                r = P.probe(m)
-                built_bytes, built_bpw, built_key, kl_rec = r.bytes, r.bpw, r.key, r.kl
-            self.record("history", {"step": 0, "mask_key": built_key, "bytes": built_bytes, "bpw": built_bpw, "kl": kl_rec, "event": "oneshot", "budget": budget})
-            self.log(f"oneshot attempt {attempt + 1}: built {built_bytes} bytes for budget {budget} (target {target})")
-            if built_bytes <= target:
+                final_builder = bmod.Builder(
+                    self.tc, self.src, self.groups, im_path,
+                    self.scratch / "build" / "oneshot-final", log=str(self.dir / "build.log"),
+                )
+
+            for attempt in range(3):
+                sol = first_sol if attempt == 0 else oneshot.solve(sur, options, cost, budget, hdr, log=self.log, guard_fn=guard_fn)
+                tiers_of, widths_of = oneshot.unpack_solution(sol)
+                m = mk.upgrade_v2({**init, "groups": {g: {"tier": t} for g, t in tiers_of.items()}, "floors": {}})
+                m["dead_tensors"] = list(self.dead_tensors)
+                m["widths"] = {str(il): mk.pack_bitmap(neuron_order[il][:w], n_ff0[il]) for il, w in sorted(widths_of.items()) if w < n_ff0[il]}
+                if kept_exp:
+                    m["experts"] = {str(il): mk.pack_bitmap(kept_exp[il], n_expert) for il in moe_layers}
+                else:
+                    m.pop("experts", None)
+                if keep_vocab is not None and len(keep_vocab) < full_vocab_n:
+                    m["vocab_keep"] = mk.pack_bitmap(keep_vocab, full_vocab_n)
+                mk.validate(m, self.groups)
+                if mk.has_v3_cuts(m):
+                    build_fn = P.builder.build if kept_exp else final_builder.build
+                    br = build_fn(m, self.scratch / "build" / "oneshot-final" / f"attempt-{attempt}.gguf")
+                    built_bytes, built_bpw, built_key = br.file_bytes, br.bpw, bmod.mask_key(m)
+                    Path(br.path).unlink(missing_ok=True)
+                    kl_rec = {}
+                else:
+                    r = P.probe(m)
+                    built_bytes, built_bpw, built_key, kl_rec = r.bytes, r.bpw, r.key, r.kl
+                self.record("history", {"step": 0, "mask_key": built_key, "bytes": built_bytes, "bpw": built_bpw, "kl": kl_rec, "event": "oneshot", "budget": budget})
+                self.log(f"oneshot attempt {attempt + 1}: built {built_bytes} bytes for budget {budget} (target {target})")
+                if built_bytes <= target:
+                    return m
+                budget -= built_bytes - target
+            raise RuntimeError("oneshot: the built file stayed over target after three solves")
+        finally:
+            if final_builder is not None:
                 final_builder.cleanup()
-                return m
-            budget -= built_bytes - target
-        final_builder.cleanup()
-        raise RuntimeError("oneshot: the built file stayed over target after three solves")
+            P.builder = orig_builder
+            slice_builder.cleanup()
 
     def _repair(self, m, P):
         from . import repair
-        rc = self.cfg["repair"]
-        R = kl.Renderer(self.cfg["source"]["hf_dir"])
+        raw_rc = self.cfg.get("repair") or {}
+        rc = {k: v for k, v in raw_rc.items() if v is not None}
+        R = self._make_renderer()
         recs = []
         for r in read_jsonl(self.dir / "episodes" / "pool.jsonl"):
             if r["split"] == "train" and r["success"]:
                 try:
-                    recs += R.episode(r["messages"], self._task_tools(r.get("task")))
-                except kl.RenderError:
-                    pass
+                    t_tools = r["tools"] if "tools" in r else self._task_tools(r.get("task"))
+                    recs += R.episode(r["messages"], t_tools)
+                except kl.RenderError as e:
+                    self.log(f"repair: reject {r.get('task')}: {e}")
         if not recs:
             self.log("repair: no train-split trajectories; skipped")
             return self.src, [], m
@@ -1311,9 +1714,19 @@ class Run:
                  "dropped_absent": all(n not in inv for n in drop), "fallbacks": r1.fallbacks,
                  "rebuild_sha256_equal": h1 == h2, "sha256": h1}
         mem = self.measure_memory(r1.path)
-        n_attn_kept = sum(1 for g, e in m["groups"].items()
-                          if g.endswith(".attn") and self.groups[g].get("kv", True) and e["tier"] != "drop")
-        kvb = bmod.kv_bytes(self.info, n_attn_kept, self.dep["context"], self.dep["concurrency"], self.dep["kv_type"])
+        kept_attn_layers = sorted(
+            int(g.split(".")[1])
+            for g, e in m["groups"].items()
+            if g.endswith(".attn") and self.groups[g].get("kv", True) and e["tier"] != "drop"
+        )
+        kvb = bmod.kv_bytes(
+            self.info,
+            len(kept_attn_layers),
+            self.dep["context"],
+            self.dep["concurrency"],
+            self.dep["kv_type"],
+            kept_attn_layers=kept_attn_layers,
+        )
         limit = self.dep.get("max_total_memory_bytes")
         constraint = {"limit": limit, "measured_total": mem.get("total_bytes"), "kv_formula_bytes": kvb,
                       "kv_measured_bytes": mem.get("kv_bytes"), "ok": (limit is None) or (mem.get("total_bytes", 0) <= limit)}
@@ -1332,11 +1745,31 @@ class Run:
     def measure_memory(self, model: str) -> dict:
         log = self.dir / "final" / "memory-server.log"
         log.unlink(missing_ok=True)
+        ev = getattr(self, "ev", None)
+        serving = (getattr(self, "cfg", None) or {}).get("serving") or {}
+        ev_dialect = getattr(ev, "dialect", None) or getattr(getattr(self, "env", None), "dialect", None)
+        if ev_dialect is None and (getattr(self, "info", None) or {}).get("arch") in ("inkling2", "inkling2_loop"):
+            ev_dialect = "inkling2"
+        explicit_special = getattr(ev, "_special_override", None)
+        if explicit_special is None and "special" in serving and serving["special"] is not None:
+            explicit_special = bool(serving["special"])
+        if explicit_special is not None:
+            ev_special = bool(explicit_special)
+        else:
+            ev_special = bool(getattr(ev, "special", False)) or ev_dialect == "inkling2"
+            if not ev_special and Path(model).is_file():
+                try:
+                    ev_special = gguf_ops.needs_special_tokens(model)
+                except (OSError, ValueError, struct.error):
+                    pass
+        if ev_dialect is None and ev_special:
+            ev_dialect = "inkling2"
+        flash_attn = getattr(ev, "flash_attn", None) or serving.get("flash_attn") or "on"
         with LlamaServer(self.tc, model, gpu=self.tc.gpus[0], slots=self.dep["concurrency"], ctx_per_slot=self.dep["context"],
-                         kv_type=self.dep["kv_type"], log=log, extra=["-v"]) as s:
+                         kv_type=self.dep["kv_type"], log=log, extra=["-v"], cache_prompt=False, special=ev_special, flash_attn=flash_attn) as s:
             t0 = time.time()
             from .client import ChatClient
-            r = ChatClient(s.url, {"temperature": 0.0}).chat([{"role": "user", "content": "Count from 1 to 50."}], seed=1, max_tokens=128)
+            r = ChatClient(s.url, {"temperature": 0.0}, dialect=ev_dialect, cache_prompt=False).chat([{"role": "user", "content": "Count from 1 to 50."}], seed=1, max_tokens=128)
             dt = time.time() - t0
         txt = log.read_text(errors="ignore")
         mib = lambda pat: sum(float(x) for x in re.findall(pat, txt))
@@ -1352,28 +1785,34 @@ class Run:
     def phase_exam(self):
         if (self.dir / "gates" / "exam.json").exists():
             raise RuntimeError("exam split already spent")
-        pc, st = self.cfg["pool"], self.cfg["stats"]
-        ex_tasks = self.guard.get("exam")
-        rng = random.Random(stable_seed(self.cfg["run_id"], "exam-pool"))
-        rng.shuffle(ex_tasks)
-        ex_tasks = ex_tasks[: pc["tasks_per_split"].get("exam", pc["tasks_per_split"]["select"])]
-        if self.cfg["exam"].get("source_scores"):
+        pc, st = self.cfg.get("pool") or {}, self.cfg.get("stats") or {}
+        runs = 1 if pc.get("runs") is None else pc["runs"]
+        min_pass = 1 if pc.get("min_pass") is None else pc["min_pass"]
+        tps = pc.get("tasks_per_split") or {}
+        n_ex = tps.get("exam")
+        if n_ex is None:
+            n_ex = tps.get("select")
+        if n_ex is None:
+            n_ex = len(self.guard.get("exam"))
+        ex_tasks = self._sample_split("exam", n_ex, random.Random(stable_seed(self.cfg["run_id"], "exam-pool")))
+        exam_cfg = self.cfg.get("exam") or {}
+        if exam_cfg.get("source_scores"):
             rows = self._exam_pool_from_scores(ex_tasks)
         else:
-            rows = ok_rows(self.ev.run(self.src, self.jobs("exam-pool", ex_tasks, pc["runs"]), "exam-pool", "src"))
+            rows = ok_rows(self.ev.run(self.src, self.jobs("exam-pool", ex_tasks, runs), "exam-pool", "src"))
         per = {}
         for r in rows:
             per.setdefault(r["task"], []).append(r["success"])
-        self.exam_pool = [self.by_id[t] for t, xs in per.items() if len(xs) >= pc["runs"] - 1 and sum(xs) / len(xs) >= pc["min_pass"] / pc["runs"]]
+        self.exam_pool = [self.by_id[t] for t, xs in per.items() if len(xs) >= runs - 1 and sum(xs) / len(xs) >= min_pass / runs]
         self.log(f"exam pool: {len(self.exam_pool)} reliable of {len(ex_tasks)}")
         spec = str(self.dir / "final" / "specialist.gguf")
         res = self.gate(spec, "exam", split="exam")
         res["claim"] = ("non-inferior to source" if self.mode == "preserve" else "superior to source")
-        res["claim_holds"] = res["pass"] if self.mode == "preserve" else (res["L"] > 0)
+        res["claim_holds"] = res["pass"] if self.mode == "preserve" else bool(res["pass"] and res["L"] > 0)
         write_json(self.dir / "gates" / "exam.json", res)
         # size-matched baselines
         self.exam_baselines(spec)
-        if self.classifier and self.cfg["exam"].get("external"):
+        if self.classifier and exam_cfg.get("external"):
             self.exam_compare(spec)
         self.mark("exam", {"claim_holds": res["claim_holds"]})
 
@@ -1390,7 +1829,7 @@ class Run:
         for name, path in (("specialist", spec), ("source", self.src)):
             sc = self.ev.scores(path, cal + tasks)
             models[name] = {"cal": np.array([sc[t.id] for t in cal]), "scores": {strip(t.id): sc[t.id] for t in tasks}}
-        for ext in self.cfg["exam"]["external"]:
+        for ext in ((self.cfg.get("exam") or {}).get("external") or []):
             rows = [r for f in glob.glob(str(Path(ext["scores"]) / "*.jsonl")) for r in read_jsonl(f)]
             cal_ids = {strip(t.id) for t in cal}
             models[ext["name"]] = {"cal": np.array([r["p_human"] for r in rows if r["id"] in cal_ids]),
@@ -1402,7 +1841,8 @@ class Run:
             labels = {strip(t.id): "pos" if self.env.decide(t, -1e9, self.ev.rule(self.src)).tests_passed else "neg" for t in sel}
             kinds = {strip(t.id): t.meta.get("kind", "") for t in sel}
             ms = {m: {"cal": v["cal"], "scores": {i: x for i, x in v["scores"].items() if i in labels}} for m, v in models.items()}
-            out[source] = compare.compare(ms, labels, kinds, boot=self.cfg["exam"].get("boot", 1000), seed=rng)
+            boot_raw = (self.cfg.get("exam") or {}).get("boot")
+            out[source] = compare.compare(ms, labels, kinds, boot=(1000 if boot_raw is None else boot_raw), seed=rng)
             for m in models:
                 if m != "specialist":
                     out[source].setdefault("beats", {})[m] = compare.beats(out[source], "specialist", m)
@@ -1453,7 +1893,7 @@ class Run:
             cands[best[1]] = best[2]
         ranked = rankings
         out = {"target_bytes": target, "ranking": ranked, "points": {}}
-        n = self.cfg["exam"]["baseline_eps_per_task"]
+        n = (self.cfg.get("exam") or {}).get("baseline_eps_per_task") or 1
         for name, m in cands.items():
             path = P.builder.build(m, self.scratch / "build" / f"{name}.gguf").path
             rows = ok_rows(self.ev.run(path, self.jobs(f"exam-{name}", self.exam_pool, n), f"exam-{name}", "cand"))
@@ -1467,7 +1907,7 @@ class Run:
         P.builder.cleanup()
 
     def _weights_outcome(self):
-        if not self.cfg.get("repair", {}).get("enabled"):
+        if not (self.cfg.get("repair") or {}).get("enabled"):
             return "mask-only"
         lp = self.dir / "repair" / "lineage.json"
         if not lp.exists():
@@ -1482,13 +1922,17 @@ class Run:
         g = lambda p: read_json(self.dir / p) if (self.dir / p).exists() else None
         run, pool, aa, fr, ex, bl, sr = g("run.json"), g("pool.json"), g("aa.json"), g("final/freeze.json"), g("gates/exam.json"), g("gates/exam_baselines.json"), g("search_result.json")
         src_bytes = gguf_ops.file_bytes(self.src)
+        st_cfg = self.cfg.get("stats") or {}
+        margin = 0.02 if st_cfg.get("margin") is None else st_cfg["margin"]
+        alpha = 0.05 if st_cfg.get("alpha") is None else st_cfg["alpha"]
+        det_bound = 0.03 if st_cfg.get("detector_bound") is None else st_cfg["detector_bound"]
         lines = [f"# Chantless run `{self.cfg['run_id']}`", "",
                  f"Source `{self.cfg['source']['repo']}` @ `{self.cfg['source']['revision'][:12]}`; env `{self.env.name}` v{self.env.version}; objective mode {self.mode}; weights: {self._weights_outcome()}.",
                  f"Gate on record: **{'yes' if sr.get('gate_on_record') else 'no (fell back to sanity mask)'}**.", "",
                  "## Exam (single use)",
-                 f"- Claim tested: **{ex['claim']}** at margin {self.cfg['stats']['margin']}, one-sided alpha {self.cfg['stats']['alpha']}. Result: **{'HOLDS' if ex['claim_holds'] else 'DOES NOT HOLD'}**.",
+                 f"- Claim tested: **{ex['claim']}** at margin {margin}, one-sided alpha {alpha}. Result: **{'HOLDS' if ex['claim_holds'] else 'DOES NOT HOLD'}**.",
                  f"- delta (specialist - source) = {ex['delta']:+.4f}, one-sided bounds L={ex['L']:+.4f}, U={ex['U']:+.4f}; {ex.get('n_cand')} specialist / {ex.get('n_src')} source episodes on {ex['n_tasks']} reliable exam tasks.",
-                 f"- Detectors (upper bound on cand-src rate <= {self.cfg['stats']['detector_bound']}): " + ", ".join(f"{k} {'ok' if v['ok'] else 'FAIL'} (U={v['U']:+.3f})" for k, v in ex["detectors"].items()),
+                 f"- Detectors (upper bound on cand-src rate <= {det_bound}): " + ", ".join(f"{k} {'ok' if v['ok'] else 'FAIL'} (U={v['U']:+.3f})" for k, v in ex["detectors"].items()),
                  f"- Behavioral sanity: delta={ex['behavioral']['delta']:+.4f}, L={ex['behavioral']['L']:+.4f} -> {'ok' if ex['behavioral_ok'] else 'FAIL'}.", "",
                  "## Artifact",
                  f"- `final/specialist.gguf`: {fr['build']['file_bytes']:,} bytes ({fr['build']['bpw']:.3f} bpw) vs source {src_bytes:,} bytes ({fr['build']['file_bytes'] / src_bytes:.1%}). Dropped tensors: {len(fr['build']['dropped'])}.",
@@ -1514,13 +1958,71 @@ class Run:
         self.mark("report")
 
 
+def _stratified_sample_subset(tasks: list, n: int, rng: random.Random | None = None) -> list:
+    """Deterministically sample up to `n` tasks stratified round-robin across `(label, family)`."""
+    if n <= 0 or not tasks:
+        return []
+    buckets: dict[tuple[str, str], list] = {}
+    for t in tasks:
+        meta = getattr(t, "meta", None) or {}
+        lbl = str(meta.get("label", "")) if isinstance(meta, dict) else ""
+        fam = str(getattr(t, "family", "") or "")
+        buckets.setdefault((lbl, fam), []).append(t)
+    keys = sorted(buckets)
+    for k in keys:
+        buckets[k].sort(key=lambda t: str(getattr(t, "id", "")))
+        if rng is not None:
+            rng.shuffle(buckets[k])
+    if rng is not None:
+        rng.shuffle(keys)
+    out = []
+    idx = 0
+    cap = min(int(n), len(tasks))
+    while len(out) < cap:
+        progressed = False
+        for k in keys:
+            b = buckets[k]
+            if idx < len(b):
+                out.append(b[idx])
+                progressed = True
+                if len(out) >= cap:
+                    break
+        if not progressed:
+            break
+        idx += 1
+    return out
+
+
+def _self_kl_tol(pc: dict, name: str, default: float) -> float:
+    raw = pc.get("self_kl_tol")
+    if isinstance(raw, dict):
+        val = raw.get(name, default)
+        return float(default if val is None else val)
+    if raw is None:
+        return float(default)
+    return float(raw)
+
+
+def _reconciled_flag(cfg: dict, field: str, default: bool = True, lc_override: dict | None = None) -> bool:
+    sc = (cfg or {}).get("sanity") or {}
+    lc = lc_override if lc_override is not None else ((cfg or {}).get("learner") or {})
+    in_s = field in sc and sc[field] is not None
+    in_l = field in lc and lc[field] is not None
+    if in_s and in_l:
+        if bool(sc[field]) != bool(lc[field]):
+            raise ValueError(f"conflicting sanity.{field}={sc[field]!r} and learner.{field}={lc[field]!r}")
+        return bool(lc[field])
+    if in_s:
+        return bool(sc[field])
+    if in_l:
+        return bool(lc[field])
+    return default
+
+
 def bmod_bpw(nbytes: int, params: int) -> float:
     return nbytes * 8 / params
 
 
 def _tools(env):
-    """Return env.tools, falling back to codetasks.TOOLS."""
-    if hasattr(env, "tools"):
-        return env.tools
-    from .env.codetasks import TOOLS
-    return TOOLS
+    """Return env.tools if declared, otherwise None."""
+    return getattr(env, "tools", None)

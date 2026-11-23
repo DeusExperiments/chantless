@@ -123,11 +123,12 @@ def write_levels(src: str | os.PathLike, dst: str | os.PathLike, levels: dict[st
 
 
 def zero_rows(src: str | os.PathLike, dst: str | os.PathLike, row_indices: dict[str, np.ndarray]) -> None:
-    """Zero whole rows `row_indices[name]` of 2D GGUF tensors across ANY ggml quant type (`IQ1_S`..`BF16`).
+    """Zero whole rows `row_indices[name]` of 2D (`[cols, n_rows]`) or 3D (`[cols, n_rows, n_slice]`) GGUF tensors
+    across ANY ggml quant type (`IQ1_S`..`BF16`).
 
-    For `ffn_up.weight` and `ffn_gate.weight` (`dims = [n_embd, n_ff]`), `n_embd` is a multiple of 256 so each
-    neuron row `j` owns an integer number of unshared quantization super-blocks; writing `0x00` bytes sets the
-    fp16 block scale `d = 0.0`, which dequantizes to exact `0.0f` in every ggml kernel without adding 1 byte.
+    For `ffn_up.weight`/`ffn_gate.weight` (`dims = [n_embd, n_ff]`) and MoE `ffn_*_exps.weight` (`dims = [n_embd, rows, K]`),
+    `n_embd` is a multiple of 256 so each neuron row `j` owns an integer number of unshared quantization super-blocks; writing
+    `0x00` bytes sets the fp16 block scale `d = 0.0`, which dequantizes to exact `0.0f` in every ggml kernel without adding 1 byte.
     """
     art = Artifact(src)
     tmp = str(dst) + ".part"
@@ -139,16 +140,25 @@ def zero_rows(src: str | os.PathLike, dst: str | os.PathLike, row_indices: dict[
                 if len(idx) == 0:
                     continue
                 t = art.tensors[name]
-                if len(t["dims"]) != 2:
-                    raise ValueError(f"zero_rows expects a 2D tensor, got {name} dims={t['dims']}")
-                n_rows = int(t["dims"][1])
-                if t["n_bytes"] % n_rows != 0:
-                    raise ValueError(f"{name}: n_bytes={t['n_bytes']} not divisible by n_rows={n_rows}")
+                dims = t["dims"]
+                if len(dims) == 2:
+                    n_rows, n_slice = int(dims[1]), 1
+                elif len(dims) == 3:
+                    n_rows, n_slice = int(dims[1]), int(dims[2])
+                else:
+                    raise ValueError(f"zero_rows expects a 2D or 3D tensor, got {name} dims={dims}")
+                if t["ttype"] in gguf_ops.GGML_TYPES:
+                    bs = gguf_ops.GGML_TYPES[t["ttype"]][1]
+                    if int(dims[0]) % bs != 0:
+                        raise ValueError(f"{name}: cols={dims[0]} not divisible by {t['type']} block size {bs}")
+                total_rows = n_slice * n_rows
+                if total_rows <= 0 or t["n_bytes"] % total_rows != 0:
+                    raise ValueError(f"{name}: n_bytes={t['n_bytes']} not divisible by n_slice*n_rows={n_slice}*{n_rows}")
                 if int(idx[0]) < 0 or int(idx[-1]) >= n_rows:
                     raise ValueError(f"{name}: row index out of range [0, {n_rows})")
-                row_bytes = t["n_bytes"] // n_rows
-                buf = np.frombuffer(bytes(art.raw(name)), dtype=np.uint8).reshape(n_rows, row_bytes).copy()
-                buf[idx] = 0
+                row_bytes = t["n_bytes"] // total_rows
+                buf = np.frombuffer(bytes(art.raw(name)), dtype=np.uint8).reshape(n_slice, n_rows, row_bytes).copy()
+                buf[:, idx, :] = 0
                 f.seek(art.h.data_start + t["offset"])
                 f.write(buf.tobytes())
     finally:

@@ -117,5 +117,5 @@ def detector_bounds(rows: list[dict], alpha: float, bound: float) -> dict:
     for k in names:
         sub = [dict(r, success=bool(r["detectors"].get(k))) for r in rows]
         b = delta_and_bounds(sub, alpha, n_boot=2000)
-        out[k] = {"delta": b["delta"], "U": b["U"], "ok": not (b["U"] > bound)}
+        out[k] = {"delta": b["delta"], "U": b["U"], "ok": math.isfinite(b["U"]) and b["U"] <= bound}
     return out

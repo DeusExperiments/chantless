@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCH_FILE="$REPO_ROOT/mvp/patches/llama-cpp-a01dff9-chantless.patch"
 LLAMA_COMMIT="a01dff908b9c9311d7af316bba3c918063749bd0"
+LLAMA_DIR_NAME="llama-a01dff9"
+APPLY_PATCH=1
 
 PREFIX="${CHANTLESS_TOOLCHAIN_PREFIX:-$REPO_ROOT/.local/toolchain}"
 BACKEND="auto"
@@ -22,6 +24,9 @@ Build pinned llama.cpp ($LLAMA_COMMIT) with the Chantless patch and C++ tools (t
 
 Options:
   --prefix DIR                  Install/build root (default: \$REPO_ROOT/.local/toolchain)
+  --llama-ref REF               Git commit or ref in ggml-org/llama.cpp (default: $LLAMA_COMMIT)
+  --llama-dir-name NAME         Subdirectory under --prefix for llama.cpp checkout (default: $LLAMA_DIR_NAME)
+  --no-patch                    Skip applying mvp/patches/llama-cpp-a01dff9-chantless.patch
   --backend MODE                auto | cuda | metal | cpu (default: auto)
   --cuda-arch ARCH              CMAKE_CUDA_ARCHITECTURES when backend=cuda (default: native -> single-arch nvidia-smi)
   --cuda-host-compiler PATH     CMAKE_CUDA_HOST_COMPILER override (auto-prefers g++-12 over gcc-13 ICE when installed)
@@ -35,6 +40,9 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix) PREFIX="$2"; shift 2 ;;
+        --llama-ref) LLAMA_COMMIT="$2"; shift 2 ;;
+        --llama-dir-name) LLAMA_DIR_NAME="$2"; shift 2 ;;
+        --no-patch) APPLY_PATCH=0; shift ;;
         --backend) BACKEND="$2"; shift 2 ;;
         --cuda-arch) CUDA_ARCH="$2"; shift 2 ;;
         --cuda-host-compiler) CUDA_HOST_COMPILER="$2"; shift 2 ;;
@@ -46,7 +54,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ ! -f "$PATCH_FILE" ]]; then
+if [[ "$APPLY_PATCH" -eq 1 && ! -f "$PATCH_FILE" ]]; then
     echo "ERROR: patch not found: $PATCH_FILE" >&2
     exit 1
 fi
@@ -71,7 +79,11 @@ if [[ -z "$JOBS" ]]; then
     if [[ "$JOBS" -gt 64 ]]; then JOBS=64; fi
 fi
 
-LLAMA_DIR="$PREFIX/llama-a01dff9"
+if [[ "$PREFIX" != /* ]]; then
+    PREFIX="$PWD/$PREFIX"
+fi
+
+LLAMA_DIR="$PREFIX/$LLAMA_DIR_NAME"
 BUILD_DIR="$LLAMA_DIR/build"
 LLAMA_BIN="$BUILD_DIR/bin"
 TOOLS_BIN="$PREFIX/bin"
@@ -146,8 +158,13 @@ run_cmd() {
 
 echo "=== Chantless Toolchain Build Plan ==="
 echo "repo_root:    $REPO_ROOT"
-echo "patch:        $PATCH_FILE"
+if [[ "$APPLY_PATCH" -eq 1 ]]; then
+    echo "patch:        $PATCH_FILE"
+else
+    echo "patch:        (skipped via --no-patch)"
+fi
 echo "llama_commit: $LLAMA_COMMIT"
+echo "llama_dir:    $LLAMA_DIR"
 echo "prefix:       $PREFIX"
 echo "backend:      $BACKEND"
 echo "jobs:         $JOBS"
@@ -161,7 +178,9 @@ if [[ ! -d "$LLAMA_DIR/.git" ]]; then
     run_cmd git -C "$LLAMA_DIR" remote add origin https://github.com/ggml-org/llama.cpp.git
     run_cmd git -C "$LLAMA_DIR" fetch -q --depth 1 origin "$LLAMA_COMMIT"
     run_cmd git -C "$LLAMA_DIR" checkout -q FETCH_HEAD
-    run_cmd git -C "$LLAMA_DIR" apply "$PATCH_FILE"
+    if [[ "$APPLY_PATCH" -eq 1 ]]; then
+        run_cmd git -C "$LLAMA_DIR" apply "$PATCH_FILE"
+    fi
 else
     echo "=== Reusing existing $LLAMA_DIR ==="
 fi
