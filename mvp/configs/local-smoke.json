@@ -8,12 +8,12 @@
     "gguf": ".local/models/qwen3-0.6b-bf16.gguf"
   },
   "toolchain": {
-    "llama_bin": ".local/toolchain/llama-a01dff9/build/bin",
+    "llama_bin": ".local/toolchain/llama-afe77e18/build/bin",
     "traj_kl": ".local/toolchain/bin/traj-kl",
     "gpus": [
       ""
     ],
-    "convert_py": ".local/toolchain/llama-a01dff9/convert_hf_to_gguf.py"
+    "convert_py": ".local/toolchain/llama-afe77e18/convert_hf_to_gguf.py"
   },
   "env": {
     "module": "chantless.env.codetasks",

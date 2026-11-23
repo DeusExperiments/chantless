@@ -979,6 +979,35 @@ def build_student(art: lattice.Artifact, config_dir: str | Path | None, train: l
     for name in art.tensors:
         if name == "rope_freqs.weight":
             continue
+        p_parts = name.split(".")
+        if len(p_parts) >= 3 and p_parts[0] == "blk" and p_parts[2] in ("attn_qkv_gate", "ssm_beta_alpha"):
+            il = p_parts[1]
+            v = torch.from_numpy(floats(art, name, ggml_lib).copy())
+            if p_parts[2] == "attn_qkv_gate":
+                n_z = num_v_heads * head_v_dim
+                n_qkv = v.shape[0] - n_z
+                split_pairs = (
+                    (f"model.layers.{il}.linear_attn.in_proj_qkv.weight", v[:n_qkv]),
+                    (f"model.layers.{il}.linear_attn.in_proj_z.weight", v[n_qkv:]),
+                )
+            else:
+                split_pairs = (
+                    (f"model.layers.{il}.linear_attn.in_proj_b.weight", v[:num_v_heads]),
+                    (f"model.layers.{il}.linear_attn.in_proj_a.weight", v[num_v_heads:]),
+                )
+            for hfn_s, part in split_pairs:
+                part = part.contiguous()
+                if unreorder_gdn_v:
+                    if ".in_proj_qkv." in hfn_s:
+                        part = torch.cat([part[: 2 * qk_half], _unreorder_v(part[2 * qk_half :], 0, head_v_dim)], dim=0)
+                    elif ".in_proj_z." in hfn_s:
+                        part = _unreorder_v(part, 0, head_v_dim)
+                    elif ".in_proj_a." in hfn_s or ".in_proj_b." in hfn_s:
+                        part = _unreorder_v(part, 0, 1)
+                p = params[hfn_s]
+                assert p.shape == part.shape, (name, hfn_s, p.shape, part.shape)
+                p.data = part
+            continue
         hfn = hf_name(name, is_gemma4=is_gemma4)
         if hfn == "lm_head.weight" and hfn not in params:
             model.lm_head = nn.Linear(art.shape(name)[1], art.shape(name)[0], bias=False)

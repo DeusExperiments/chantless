@@ -27,8 +27,8 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
 # when `ffn_norm` is present (gemma4), `post_attention_norm` is attention's post-norm and belongs to `.attn`.
 QUANTIZABLE_ATTN = (
     "attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate",
-    "attn_rel", "attn_sink_proj",
-    "ssm_out", "ssm_alpha", "ssm_beta",
+    "attn_qkv_gate", "attn_rel", "attn_sink_proj",
+    "ssm_out", "ssm_alpha", "ssm_beta", "ssm_beta_alpha",
 )
 QUANTIZABLE_FFN = (
     "ffn_gate", "ffn_up", "ffn_down",

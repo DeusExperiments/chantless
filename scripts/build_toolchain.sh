@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PATCH_FILE="$REPO_ROOT/mvp/patches/llama-cpp-a01dff9-chantless.patch"
-LLAMA_COMMIT="a01dff908b9c9311d7af316bba3c918063749bd0"
-LLAMA_DIR_NAME="llama-a01dff9"
+PATCH_FILE="$REPO_ROOT/mvp/patches/llama-cpp-afe77e18-chantless.patch"
+LLAMA_COMMIT="afe77e18fadc2e673c6a6299495a443e17378ce4"
+LLAMA_DIR_NAME="llama-afe77e18"
 APPLY_PATCH=1
 
 PREFIX="${CHANTLESS_TOOLCHAIN_PREFIX:-$REPO_ROOT/.local/toolchain}"
@@ -26,7 +26,7 @@ Options:
   --prefix DIR                  Install/build root (default: \$REPO_ROOT/.local/toolchain)
   --llama-ref REF               Git commit or ref in ggml-org/llama.cpp (default: $LLAMA_COMMIT)
   --llama-dir-name NAME         Subdirectory under --prefix for llama.cpp checkout (default: $LLAMA_DIR_NAME)
-  --no-patch                    Skip applying mvp/patches/llama-cpp-a01dff9-chantless.patch
+  --no-patch                    Skip applying mvp/patches/llama-cpp-afe77e18-chantless.patch
   --backend MODE                auto | cuda | metal | cpu (default: auto)
   --cuda-arch ARCH              CMAKE_CUDA_ARCHITECTURES when backend=cuda (default: native -> single-arch nvidia-smi)
   --cuda-host-compiler PATH     CMAKE_CUDA_HOST_COMPILER override (auto-prefers g++-12 over gcc-13 ICE when installed)

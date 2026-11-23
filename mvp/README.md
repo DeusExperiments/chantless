@@ -1,10 +1,10 @@
 # Chantless Engine Reference
 
-The `chantless` package (`mvp/chantless/`) compiles stock open-weight checkpoints (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`, plus `27B` imported allocations) into standalone GGUF specialists, adapts built models from `<=25` mistakes via `+0 B` binary MLP switches, and serves and benchmarks them on unified `llama.cpp @ a01dff9` ([`patches/llama-cpp-a01dff9-chantless.patch`](patches/llama-cpp-a01dff9-chantless.patch)) or `llama.cpp @ afe77e18` for `inkling2_loop`. For full design rationale, see [`../explainer/design-notes.md`](../explainer/design-notes.md); for shipped `15` winner masks and SHA256 receipts, see [`../masks/README.md`](../masks/README.md).
+The `chantless` package (`mvp/chantless/`) compiles stock open-weight checkpoints (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`, plus `27B` imported allocations) into standalone GGUF specialists, adapts built models from `<=25` mistakes via `+0 B` binary MLP switches, and serves and benchmarks them on unified `llama.cpp @ afe77e18` ([`patches/llama-cpp-afe77e18-chantless.patch`](patches/llama-cpp-afe77e18-chantless.patch)). For full design rationale, see [`../explainer/design-notes.md`](../explainer/design-notes.md); for shipped `15` winner masks and SHA256 receipts, see [`../masks/README.md`](../masks/README.md).
 
 ## Runtime Architecture
 
-Unified on `llama.cpp @ a01dff9` + `patches/llama-cpp-a01dff9-chantless.patch` supporting `qwen3`, `qwen35`, and `gemma4` with per-layer `hparams.n_ff(il)` and `hparams.attn_dropped`:
+Unified on `llama.cpp @ afe77e18` + `patches/llama-cpp-afe77e18-chantless.patch` supporting `qwen3`, `qwen35`, `gemma4`, and `inkling2_loop` with per-layer `hparams.n_ff(il)` and `hparams.attn_dropped`:
 - Dropped FFN or mixer blocks act as identity; dropped full-attention blocks allocate no KV cache, and dropped Gated Delta Net layers allocate no recurrent state.
 - Narrowed FFN layers (`widths`) load sliced super-block weights cleanly alongside heterogeneous per-tensor `ggml` quantizations (`F32..IQ1_S`).
 - Zero-byte Apprentice switches zero contiguous `up_row_zero` rows across `ffn_up.weight` and `ffn_gate.weight`, preserving `0.0f` exact PyTorch student-to-GGUF parity.
@@ -34,7 +34,7 @@ Unified on `llama.cpp @ a01dff9` + `patches/llama-cpp-a01dff9-chantless.patch` s
 ```bash
 # 1. Validate configs and inspect environment health
 chantless validate --config mvp/configs/extract-example.yaml
-chantless doctor --llama-bin .local/toolchain/llama-a01dff9/build/bin --traj-kl .local/toolchain/bin/traj-kl --model-gb 54
+chantless doctor --llama-bin .local/toolchain/llama-afe77e18/build/bin --traj-kl .local/toolchain/bin/traj-kl --model-gb 54
 
 # 2. Local integration smoke
 chantless extract --config mvp/configs/local-smoke.json

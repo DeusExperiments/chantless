@@ -172,7 +172,7 @@ def main():
     bn = sub.add_parser("bench", help="benchmark a built GGUF or thin mask and emit JSON telemetry receipt")
     _add_serve_args(bn, default_bench=True)
 
-    dr = sub.add_parser("doctor", help="validate llama.cpp@a01dff9 binaries, C++ tools, CUDA/Metal, Python deps, and /dev/shm")
+    dr = sub.add_parser("doctor", help="validate llama.cpp@afe77e18 binaries, C++ tools, CUDA/Metal, Python deps, and /dev/shm")
     dr.add_argument("--config", help="optional extract/learn config JSON/YAML to read toolchain paths from")
     dr.add_argument("--llama-bin", help="directory containing llama-server, llama-quantize, llama-imatrix")
     dr.add_argument("--traj-kl", help="path to traj-kl binary")
@@ -182,7 +182,7 @@ def main():
     dr.add_argument("--model-gb", type=float, help="optional BF16 model size in GiB to preview scratch and tier-cache layout")
     dr.add_argument("--require-classifier", action="store_true", help="require logodds and tokdocs binaries")
     dr.add_argument("--require-cuda", action="store_true", help="require NVIDIA CUDA availability")
-    dr.add_argument("--llama-commit", default=None, help="expected llama-server --version commit substring (default: a01dff9; e.g. 2a28df0 for PR #32704)")
+    dr.add_argument("--llama-commit", default=None, help="expected llama-server --version commit substring (default: afe77e1)")
 
     a = ap.parse_args()
     if a.cmd == "doctor":

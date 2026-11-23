@@ -89,6 +89,22 @@ def _write_trj1(path: Path, seqs: list[list[int]]) -> None:
 
 
 def _resolve_inkling2_toolchain() -> runtime.Toolchain | None:
+    from conftest import resolve_toolchain
+
+    llama_dir, tools_bin = resolve_toolchain()
+    llama_bin = llama_dir / "build/bin"
+    if (
+        (llama_dir / "src/models/inkling2-loop.cpp").exists()
+        and (llama_bin / "llama-quantize").exists()
+        and (tools_bin / "traj-kl").exists()
+    ):
+        return runtime.Toolchain(
+            llama_bin=llama_bin,
+            traj_kl=tools_bin / "traj-kl",
+            gpus=[""],
+            logodds=tools_bin / "logodds",
+            tokdocs=tools_bin / "tokdocs",
+        )
     root = ROOT / ".local/toolchain-inkling2"
     llama_bin = root / "llama-inkling2/build/bin"
     tools_bin = root / "bin"

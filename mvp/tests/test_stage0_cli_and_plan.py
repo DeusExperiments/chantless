@@ -1088,13 +1088,13 @@ def test_doctor_opt_in_llama_commit(tmp_path: Path):
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         return b, tkl
 
-    b_pin, t_pin = _make_stub_bin("bin_pin", "a01dff9")
+    b_pin, t_pin = _make_stub_bin("bin_pin", "afe77e1")
     b_new, t_new = _make_stub_bin("bin_new", "2a28df0")
 
     r_pin = doctor.run_doctor(llama_bin=b_pin, traj_kl=t_pin, run_root=tmp_path)
     assert r_pin["ok"] is True
-    assert r_pin["pinned_llama_commit"] == "a01dff9"
-    assert r_pin["expected_llama_commit"] == "a01dff9"
+    assert r_pin["pinned_llama_commit"] == "afe77e1"
+    assert r_pin["expected_llama_commit"] == "afe77e1"
     assert r_pin["checks"]["llama_bin"]["pinned_commit_match"] is True
 
     r_fail = doctor.run_doctor(llama_bin=b_new, traj_kl=t_new, run_root=tmp_path)
@@ -1103,7 +1103,7 @@ def test_doctor_opt_in_llama_commit(tmp_path: Path):
 
     r_opt = doctor.run_doctor(llama_bin=b_new, traj_kl=t_new, run_root=tmp_path, llama_commit="2a28df0")
     assert r_opt["ok"] is True
-    assert r_opt["pinned_llama_commit"] == "a01dff9"
+    assert r_opt["pinned_llama_commit"] == "afe77e1"
     assert r_opt["expected_llama_commit"] == "2a28df0"
     assert r_opt["checks"]["llama_bin"]["pinned_commit_match"] is True
     assert r_opt["checks"]["llama_bin"]["expected_commit"] == "2a28df0"
@@ -1112,15 +1112,15 @@ def test_doctor_opt_in_llama_commit(tmp_path: Path):
     for blank in ("", "   "):
         r_blk_ok = doctor.run_doctor(llama_bin=b_pin, traj_kl=t_pin, run_root=tmp_path, llama_commit=blank)
         assert r_blk_ok["ok"] is True
-        assert r_blk_ok["expected_llama_commit"] == "a01dff9"
-        assert r_blk_ok["checks"]["llama_bin"]["expected_commit"] == "a01dff9"
+        assert r_blk_ok["expected_llama_commit"] == "afe77e1"
+        assert r_blk_ok["checks"]["llama_bin"]["expected_commit"] == "afe77e1"
         r_blk_fail = doctor.run_doctor(llama_bin=b_new, traj_kl=t_new, run_root=tmp_path, llama_commit=blank)
         assert r_blk_fail["ok"] is False
-        assert r_blk_fail["expected_llama_commit"] == "a01dff9"
-        assert r_blk_fail["checks"]["llama_bin"]["expected_commit"] == "a01dff9"
+        assert r_blk_fail["expected_llama_commit"] == "afe77e1"
+        assert r_blk_fail["checks"]["llama_bin"]["expected_commit"] == "afe77e1"
         chk_ws = doctor._check_llama_bin(b_new, llama_commit=blank)
         assert chk_ws["status"] == "fail"
-        assert chk_ws["expected_commit"] == "a01dff9"
+        assert chk_ws["expected_commit"] == "afe77e1"
 
     cli_env = {**os.environ, "PYTHONPATH": str(ROOT / "mvp")}
     proc = subprocess.run(
@@ -1138,12 +1138,15 @@ def test_doctor_opt_in_llama_commit(tmp_path: Path):
 
     real_tc = _resolve_inkling2_toolchain()
     if real_tc is not None:
+        cmd_real = [
+            sys.executable, "-m", "chantless.cli", "doctor",
+            "--llama-bin", str(real_tc.llama_bin), "--traj-kl", str(real_tc.traj_kl),
+            "--run-root", str(tmp_path),
+        ]
+        if "llama-inkling2" in str(real_tc.llama_bin):
+            cmd_real.extend(["--llama-commit", "2a28df0"])
         proc_real = subprocess.run(
-            [
-                sys.executable, "-m", "chantless.cli", "doctor",
-                "--llama-bin", str(real_tc.llama_bin), "--traj-kl", str(real_tc.traj_kl),
-                "--run-root", str(tmp_path), "--llama-commit", "2a28df0",
-            ],
+            cmd_real,
             env=cli_env,
             capture_output=True,
             text=True,

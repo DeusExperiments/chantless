@@ -219,7 +219,7 @@ def test_gemma4_unified_student_ple_shared_kv_softcap_and_learn_gates_seq_parity
     llama_bin = llama_dir / "build/bin"
     has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
     if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists()):
-        pytest.skip("local unified a01dff9 toolchain or ML dependencies not present")
+        pytest.skip("local unified afe77e18 toolchain or ML dependencies not present")
 
     driver = tmp_path / "g4_e2e.py"
     driver.write_text(f"""
@@ -354,7 +354,7 @@ def test_cli_extract_build_learn_generative_controls_e2e(tmp_path: Path):
     tok_dir = resolve_model_dir("qwen3-0.6b")
     has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
     if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and tok_dir.exists()):
-        pytest.skip("local unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
+        pytest.skip("local unified afe77e18 toolchain, tokenizer model, or ML dependencies not present")
 
     cli_env = {**os.environ, "PYTHONPATH": str(ROOT / "mvp")}
     for subcmd in ("extract", "build", "learn", "plan"):

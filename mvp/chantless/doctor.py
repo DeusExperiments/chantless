@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PINNED_LLAMA_COMMIT = "a01dff9"
+PINNED_LLAMA_COMMIT = "afe77e1"
 REQUIRED_PY_DEPS = ("torch", "transformers", "gguf", "pydantic", "yaml", "numpy", "scipy", "safetensors")
 LLAMA_BINARIES = ("llama-server", "llama-quantize", "llama-imatrix")
 

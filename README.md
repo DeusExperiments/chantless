@@ -13,16 +13,16 @@ From any stock Hugging Face checkpoint + thin mask, Chantless deterministically 
 ## Quickstart
 
 ```bash
-# 1. Build unified llama.cpp@a01dff9 (CUDA / Metal / CPU auto-detect) + C++ scorers & install CLI
+# 1. Build unified llama.cpp@afe77e18 (CUDA / Metal / CPU auto-detect) + C++ scorers & install CLI
 ./scripts/build_toolchain.sh --backend auto --prefix .local/toolchain
 pip install -e ".[train,dev]"
-chantless doctor --llama-bin .local/toolchain/llama-a01dff9/build/bin --traj-kl .local/toolchain/bin/traj-kl
+chantless doctor --llama-bin .local/toolchain/llama-afe77e18/build/bin --traj-kl .local/toolchain/bin/traj-kl
 
 # 2. Materialize any shipped winner mask into a standalone SHA256-exact GGUF
 chantless build \
   --source qwen3-4b-bf16.gguf \
   --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
-  --llama-bin .local/toolchain/llama-a01dff9/build/bin \
+  --llama-bin .local/toolchain/llama-afe77e18/build/bin \
   --out qwen3-4b-bfcl-apprentice.gguf
 
 # 3. Serve or benchmark directly from stock base + mask (SHA256-cached auto-build + live CUDA/Metal VRAM)
@@ -30,7 +30,7 @@ chantless bench \
   --source qwen3-4b-bf16.gguf \
   --mask masks/qwen3-4b-bfcl-apprentice-mask.json \
   --compare qwen3-4b-bf16.gguf \
-  --llama-bin .local/toolchain/llama-a01dff9/build/bin
+  --llama-bin .local/toolchain/llama-afe77e18/build/bin
 ```
 
 ---
@@ -82,8 +82,8 @@ All **`15` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 
 | Area | Command | Capabilities | Key Options |
 | :--- | :--- | :--- | :--- |
-| **Toolchain Bootstrap** | [`scripts/build_toolchain.sh`](scripts/build_toolchain.sh) | Builds pinned `llama.cpp @ a01dff9` (single unified patch for `Qwen3` / `Qwen3.5` / `Gemma 4`) + `traj-kl`, `logodds`, `tokdocs` | `--backend auto\|cuda\|metal\|cpu`, auto single-arch CUDA detection, `--with-fla`, `--dry-run` |
-| **Environment Preflight** | `chantless doctor` | JSON health check for `a01dff9` binaries, C++ scorers, CUDA/Metal + `fla`, Python deps, and `/dev/shm` + disk | `--config`, `--model-gb 54` (`27B` scratch/tier-cache layout preview), `--require-cuda`, `--require-classifier` |
+| **Toolchain Bootstrap** | [`scripts/build_toolchain.sh`](scripts/build_toolchain.sh) | Builds pinned `llama.cpp @ afe77e18` (single unified patch for `Qwen3` / `Qwen3.5` / `Gemma 4` / `Inkling-2-Mini`) + `traj-kl`, `logodds`, `tokdocs` | `--backend auto\|cuda\|metal\|cpu`, auto single-arch CUDA detection, `--with-fla`, `--dry-run` |
+| **Environment Preflight** | `chantless doctor` | JSON health check for `afe77e18` binaries, C++ scorers, CUDA/Metal + `fla`, Python deps, and `/dev/shm` + disk | `--config`, `--model-gb 54` (`27B` scratch/tier-cache layout preview), `--require-cuda`, `--require-classifier` |
 | **Declarative Configs** | `chantless validate` / `schema` | Strict Pydantic v2 validation + JSON Schema export | JSON or YAML, file-relative `extends:`, repeatable `--set key.path=val`, `22` opt-in ggml tiers |
 | **Dry-Run Planner** | `chantless plan` | Estimates moves, probes, episodes, wall-clock, and spend before compute | `--rates custom.json`, `--source local.gguf`, `--set` overrides |
 | **Specialist Extraction** | `chantless extract` | Frozen-base extraction (`prepare → proxy → sanity → search → freeze → exam → report`) with one-shot solver, Wanda widths, Rule-P vocab trim, lossless dead shared-KV drop, and `SplitGuard` | `--upto`, `--reset`, `--out-mask`, `--out`, decoupled `/dev/shm` vs NVMe (`1.5×`/`3.5×`), auto worker clamp, tier cache |

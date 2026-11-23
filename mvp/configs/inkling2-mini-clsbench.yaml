@@ -23,10 +23,10 @@ source:
   expected_gguf_sha256: 7074c9762e6769a608c7b23960a7fd2444880b1174a3910149749f6d01389aec
 
 toolchain:
-  llama_bin: .local/toolchain-inkling2/llama-inkling2/build/bin
-  traj_kl: .local/toolchain-inkling2/bin/traj-kl
-  logodds: .local/toolchain-inkling2/bin/logodds
-  tokdocs: .local/toolchain-inkling2/bin/tokdocs
+  llama_bin: .local/toolchain/llama-afe77e18/build/bin
+  traj_kl: .local/toolchain/bin/traj-kl
+  logodds: .local/toolchain/bin/logodds
+  tokdocs: .local/toolchain/bin/tokdocs
   gpus: ["0"]
 
 env:

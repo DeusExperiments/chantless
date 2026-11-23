@@ -21,7 +21,7 @@ source:
   gguf: .local/models/qwen3-4b-bf16.gguf
 
 toolchain:
-  llama_bin: .local/toolchain/llama-a01dff9/build/bin
+  llama_bin: .local/toolchain/llama-afe77e18/build/bin
   traj_kl: .local/toolchain/bin/traj-kl
   gpus: ["0"]
 
