@@ -1184,3 +1184,36 @@ def test_bfcl_gorilla_ast_matching_and_inkling2_prompt_defaults(tmp_path: Path):
     assert bfcl_cfg.decoding.temperature == 1.0 and bfcl_cfg.serving.cache_prompt is False
     assert dm_cfg.decoding.temperature == 1.0 and dm_cfg.serving.cache_prompt is False
     assert dm_cfg.env.kwargs["reasoning_effort"] == "low" and dm_cfg.env.kwargs["max_tokens"] == 4096
+
+
+def test_shipped_inkling2_masks_validate_v3_schema():
+    expected = {
+        "inkling2-mini-clsbench-mask.json": {"experts": 48, "widths": 24, "vocab_keep": 32768},
+        "inkling2-mini-bfcl-mask.json": {"experts": 0, "widths": 0, "vocab_keep": None},
+        "inkling2-mini-deepmath-mask.json": {"experts": 96, "widths": 0, "vocab_keep": None},
+    }
+    groups = {"token_embd": {"droppable": False}, "output": {"droppable": False}}
+    for il in range(24):
+        groups[f"blk.{il}.attn"] = {"droppable": False}
+        groups[f"blk.{il}.ffn"] = {"droppable": False}
+
+    for fn, spec in expected.items():
+        m = json.loads((ROOT / "masks" / fn).read_text(encoding="utf-8"))
+        assert m["schema"] == "chantless.mask/v3"
+        assert m["source"]["repo"] == "thinkingmachines/Inkling-2-Mini"
+        assert m["source"]["gguf_sha256"] == "7074c9762e6769a608c7b23960a7fd2444880b1174a3910149749f6d01389aec"
+        assert m["weights"] == {"lineage": []}
+        assert m["deployment"]["kv_type"] == "f16"
+        assert m["measured"]["file_bytes"] > 0
+        assert len(m["measured"]["built_sha256"]) == 64
+        mk.validate(m, groups, ladder=mk.ALL_TIERS)
+        if spec["experts"]:
+            kept = mk.kept_experts(m)
+            assert len(kept) == 24 and all(len(v) == spec["experts"] for v in kept.values())
+        else:
+            assert not m.get("experts")
+        assert len(m.get("widths") or {}) == spec["widths"]
+        if spec["vocab_keep"] is None:
+            assert m.get("vocab_keep") is None
+        else:
+            assert m["vocab_keep"]["count"] == spec["vocab_keep"]

@@ -4,7 +4,7 @@
 
 **Your taste. Multiplied.**
 
-Chantless eliminates **weight debt**. Instead of fine-tuning, distilling, and shipping mutated gigabyte checkpoints, Chantless keeps stock open-weight models (`Qwen3`, `Qwen3.5`, `Gemma 4`) **completely frozen** and compiles capabilities into **`6–53 KB` Apache-2.0 declarative masks** (`chantless.mask/v3`, zero trained floats).
+Chantless eliminates **weight debt**. Instead of fine-tuning, distilling, and shipping mutated gigabyte checkpoints, Chantless keeps stock open-weight models (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`) **completely frozen** and compiles capabilities into **`6–53 KB` Apache-2.0 declarative masks** (`chantless.mask/v3`, zero trained floats).
 
 From any stock Hugging Face checkpoint + thin mask, Chantless deterministically builds a SHA256-exact standalone GGUF—and adapts it from **`<= 25` real mistakes at `+0 bytes`** by flipping binary MLP neuron switches rather than rewriting float weights.
 
@@ -37,7 +37,7 @@ chantless bench \
 
 ## Verified Winners
 
-All **`12` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
+All **`15` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
 
 ### 1. Stock-Checkpoint Double Winners (`extract` + `<=25`-Mistake `+0 B` `learn`)
 
@@ -49,14 +49,22 @@ All **`12` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 | **`Qwen3-4B`** | `BFCL` | `1.97 GB` (`24.50%`) | `6.4 KB` | **`92.31%`** | **`+5.87` pts** | **`22 / 60`** (`36.7%`, `+0 B`) | `3 / 3 / 1 / 12` |
 | **`Qwen3.5-4B`** | `BFCL` | `2.19 GB` (`26.01%`) | `18.6 KB` | **`92.39%`** | `+0.00` pts | **`29 / 60`** (`48.3%`, `+0 B`) | `0 / 0 / 2 / 19` |
 
-### 2. Imported `27B` Winners (`chantless mask import`, Terminal-Bench 2.1)
+### 2. Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners
+
+| Mask | Task | Size (`%` BF16) | Mask | Held-Out `exam` (vs `BF16`) | `reasoning_effort="high"` (`0.9`) Stress Test |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| `inkling2-mini-clsbench-mask.json` | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `27.6 KB` | **`98.57%` recall** @ `5.24%` FPR (`BF16` `99.04%` @ `4.20%`) | — *(classifier log-odds)* |
+| `inkling2-mini-bfcl-mask.json` | `BFCL` | `14.22 GiB` (**`29.23%`**) | `9.0 KB` | **`115/160` (`71.88%`, `+0.63 pp`)** Gorilla (`BF16` `114/160`) | **BFCL-HIGH (`8k`):** `53/79` Gorilla tie · **DeepMath-HIGH (`16k`):** **`41/48` (`0` regressions)** |
+| `inkling2-mini-deepmath-mask.json` | `DeepMath` | `12.48 GiB` (**`25.66%`**) | `8.4 KB` | **`81/96` (`84.38%`)** `"low"` `4k` (`BF16` `84/96`, `1.45×` faster) | **DeepMath-HIGH (`16k`):** **`40/48` strict / `41/48` raw** (`25%` experts pruned) |
+
+### 3. Imported `27B` Winners (`chantless mask import`, Terminal-Bench 2.1)
 
 | Mask | Model | Size (`%` F16) | Mask | Recorded Score (`89` tasks × `4` repeats) |
 | :--- | :--- | :---: | :---: | :--- |
 | `qwen38-27b-dynquant-k34-mask.json` | `Qwen3.8-27B` | `19.60 GB` (`35.87%`) | `9.7 KB` | **`77.8%` pass@1** (`277/356` audited) · **`91.0%` pass@4** (`81/89`) |
 | `qwen38-27b-dynquant-k94-mask.json` | `Qwen3.8-27B` | `14.26 GB` (`26.09%`) | `9.6 KB` | **`74.4%` pass@1** (`265/356` audited) · **`85.4%` pass@4** (`76/89`) |
 
-### 3. Live Hardware Runtime Telemetry (NVIDIA CUDA & Apple Metal)
+### 4. Live Hardware Runtime Telemetry (NVIDIA CUDA & Apple Metal)
 
 | Measurement | Hardware | Baseline | Chantless | Delta |
 | :--- | :--- | :---: | :---: | :--- |

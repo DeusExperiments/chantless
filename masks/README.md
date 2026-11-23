@@ -1,7 +1,8 @@
 # Chantless Thin Masks (`chantless.mask/v3`)
 
-This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure Apache-2.0 JSON, zero trained floats):
+This directory tracks **`15` verified winner masks** (`6.4 KB – 52.8 KB` pure Apache-2.0 JSON, zero trained floats):
 - **`10` stock-checkpoint double winners** (`5` architecture/task cells × `{specialist, +0 B Apprentice}`) where extraction cleared its quality gate **and** zero-byte `<=25`-mistake Apprentice learning beat every matched-byte control (`base`, `empty`, `flipped`, `shuffled`).
+- **`3` looped-MoE `Inkling-2-Mini` (`24B`) specialist winners** (`clsbench`, `bfcl`, `deepmath`) verified on sealed exams plus `reasoning_effort="high"` (`0.9`, `16k` math / `8k` tool-calling) stress tests (`+0 B` Switch Apprentice code is wired and unit-tested for `inkling2_loop`; GPU Apprentice runs are pending).
 - **`2` flagship `27B` imported winners** (`Qwen3.8-27B` `K34` and `K94`), demonstrating `chantless mask import` interoperability at `27B` scale.
 
 ## Pinned Stock Source Checkpoints
@@ -11,6 +12,7 @@ This directory tracks **`12` verified winner masks** (`6.4 KB – 52.8 KB` pure 
 | **Gemma 4 E2B** | `google/gemma-4-E2B-it` | `4adf15748de9e1a0097b6274cee9c15836c41c37` | `9,311,299,104` *(BF16)* | `01ef9dcdba1a648bfb68a4bc2c1b91632f59ad37d48ae81887e51305f9bb0ba6` | `4` |
 | **Qwen3.5-4B** | `Qwen/Qwen3.5-4B` | `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` | `8,424,393,216` *(BF16)* | `afc3aaa3f844dda41af4012479d7f9eac87eda553c16bf2795e85ebc1e0e0bf7` | `4` |
 | **Qwen3-4B** | `Qwen/Qwen3-4B` | `1cfa9a7208912126459214e8b04321603b3df60c` | `8,051,284,928` *(BF16)* | `99038d3c282d8249b9804a94aea50fd3b30c6b5d56931474042ede9982602337` | `2` |
+| **Inkling-2-Mini** | `thinkingmachines/Inkling-2-Mini` | `ed40e7da625f594fc9c4990f5f66be24873c22d7` | `52,226,509,504` *(BF16)* | `7074c9762e6769a608c7b23960a7fd2444880b1174a3910149749f6d01389aec` | `3` |
 | **Qwen3.8-27B** | `Qwen/Qwen3.8-27B` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` | `54,657,734,080` *(F16)* | `05f18ee2b177c76c34a827a1bcada598a9bfd99f939ddcb8b37a9e47874f6599` | `2` *(imported)* |
 
 ---
@@ -43,7 +45,21 @@ Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` spe
 
 ---
 
-## 3. Imported `27B` Dynamic-Quantization Winners (`2 / 2`, via `chantless mask import`)
+## 3. Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners (`3 / 3`)
+
+Built against `ggml-org/Inkling-2-Mini-GGUF` (`Inkling-2-Mini-BF16.gguf`, `48.640 GiB`) and `llama.cpp @ afe77e18fadc` (`#32704` + `#32763`, `--special`, `f16` KV, `--no-cache-prompt`, `temp=1.0`).
+
+| Mask File | Mask Size | Built GGUF (`%` BF16, `bpw`) | Built GGUF SHA256 | Experts / Width / Vocab | Held-Out Sealed `exam` (vs `BF16`) | `reasoning_effort="high"` (`0.9`) Stress Test |
+| :--- | :---: | :---: | :--- | :---: | :--- | :--- |
+| `inkling2-mini-clsbench-mask.json` | `27,550 B` | `4.17 GiB` (**`8.581%`**, `1.38`) | `a7987f347cf37ec44c9847a06609a7c308d4fbe7785c9d066a6bf9fc9e99d182` *(pre-conv-pin)* | `48/128` · `w=1024` · `v=32,768` | **`98.57%` recall** @ `5.24%` FPR (`n=1,200`, `BF16` `99.04%` @ `4.20%`) | — *(classifier log-odds)* |
+| `inkling2-mini-bfcl-mask.json` | `8,990 B` | `14.22 GiB` (**`29.233%`**, `4.68`) | `8ac87bdef6be2584fd939d9d187e423f760ce2e5a5f3a3af5c392625117c7d3f` *(0 B err, 3× bit-exact)* | `128/128` · `w=1152` · full | **`115/160` (`71.88%`, `+0.63 pp`)** Gorilla `ast_checker` (`122/160` Chantless; `BF16` `114/160`) | **BFCL-HIGH (`8k`):** `53/79` Gorilla tie (`BF16` `53/79`); **DeepMath-HIGH (`16k`):** **`41/48` (`0` regressions)**, `KL=0.00990` |
+| `inkling2-mini-deepmath-mask.json` | `8,435 B` | `12.48 GiB` (**`25.663%`**, `4.11`) | `94c08b968242042a89b20b2c31bc1122fd47e6fc3b404b4012b08d32864c5eef` *(32 B err)* | `96/128` · `w=1152` · full | **`81/96` (`84.38%`, `-3.12 pp`)** at `"low"` `4k` (`BF16` `84/96`, `1.45×` faster) | **DeepMath-HIGH (`16k`):** **`40/48` strict / `41/48` raw** (`both=40, bf16_only=1`), `KL=0.01343` |
+
+*(Notes: `inkling2-mini-bfcl-mask.json` uses fixed HF `imatrix.gguf` and reproduced bit-identically across Colab G4 and two Lium pods; `inkling2-mini-deepmath-mask.json` uses task-calibrated `imatrix_dm_task.gguf` whose GPU rebuilds vary slightly in SHA256; `inkling2-mini-clsbench-mask.json` was built before `builder.py` pinned `blk.{5,11,17,23}.attn_{k,v}_conv_proj.weight` to `BF16` (`+552,960 B` on hardened rebuild). On `BFCL-HIGH`, all models hit an identical upstream `llama.cpp @ afe77e18` grammar exception HTTP 500 on `live_simple:live_simple_231-122-0`, giving `79` valid paired tasks.)*
+
+---
+
+## 4. Imported `27B` Dynamic-Quantization Winners (`2 / 2`, via `chantless mask import`)
 
 | Mask File | Mask Size | Groups / Overrides | Tier Mix | Original Artifact Size / SHA256 | Recorded Terminal-Bench 2.1 Receipt |
 | :--- | :---: | :---: | :--- | :--- | :--- |

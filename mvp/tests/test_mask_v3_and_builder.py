@@ -196,7 +196,7 @@ def test_wanda_variable_width_vocab_trim_and_exact_bytemodel(tmp_path: Path, ff_
 # ------------------------------------------------------------------ 3. Thin-mask v3 round-trip across all shipped masks
 def test_thin_mask_v3_roundtrip_and_shipped_masks():
     shipped_paths = sorted((ROOT / "masks").glob("*-mask.json"))
-    assert len(shipped_paths) == 12
+    assert len(shipped_paths) == 15
 
     for path in shipped_paths:
         m = mk.load(path)
