@@ -172,23 +172,46 @@
     "max_total_memory_bytes": null
   },
   "measured": {
-    "file_bytes": 4481727168,
-    "pct_of_bf16": 8.581,
-    "bpw": 1.3753,
-    "built_sha256": "a7987f347cf37ec44c9847a06609a7c308d4fbe7785c9d066a6bf9fc9e99d182",
-    "exam": {
-      "recall_at_fpr05": 0.9856687898089171,
-      "fpr": 0.05244755244755245,
-      "acc": 0.9675,
-      "auroc": 0.00609104271524652,
-      "cutoff": 0.8839511871337891,
-      "tp": 619,
-      "fp": 30,
-      "tn": 542,
-      "fn": 9,
-      "spearman_vs_bf16": 0.9484441378084291
+    "file_bytes": 4482280128,
+    "pct_of_bf16": 8.582,
+    "bpw": 1.3732,
+    "built_sha256": "d884cb419ae59ca5610c35c377183ba66e12f049397648ee80e817cef34c9861",
+    "cli_rebuild_sha256_equal": true,
+    "select": {
+      "recall_at_fpr05": 0.986,
+      "fpr": 0.042,
+      "acc": 0.972,
+      "auroc": 0.995628,
+      "cutoff": 0.49242210388183594,
+      "tp": 493,
+      "fp": 21,
+      "tn": 479,
+      "fn": 7
     },
-    "provenance_note": "Produced in Issue 06 before builder.py pinned >=2D fixed tensors (blk.{5,11,17,23}.attn_{k,v}_conv_proj.weight) to BF16; hardened rebuild adds +552,960 B."
+    "exam": {
+      "recall_at_fpr05": 0.983333,
+      "fpr": 0.053333,
+      "acc": 0.965,
+      "auroc": 0.996478,
+      "cutoff": 0.49242210388183594,
+      "tp": 590,
+      "fp": 32,
+      "tn": 568,
+      "fn": 10,
+      "spearman_vs_bf16": 0.939857
+    },
+    "bf16_exam": {
+      "recall_at_fpr05": 0.991667,
+      "fpr": 0.05,
+      "acc": 0.970833,
+      "auroc": 0.998133,
+      "cutoff": 7.671344757080078,
+      "tp": 595,
+      "fp": 30,
+      "tn": 570,
+      "fn": 5
+    },
+    "builder_hardened_conv_proj_bf16": true
   },
   "dead_tensors": [],
   "widths": {

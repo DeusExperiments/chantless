@@ -1,6 +1,6 @@
 # Chantless Engine Reference
 
-The `chantless` package (`mvp/chantless/`) compiles stock open-weight checkpoints (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`, plus `27B` imported allocations) into standalone GGUF specialists, adapts built models from `<=25` mistakes via `+0 B` binary MLP switches, and serves and benchmarks them on unified `llama.cpp @ afe77e18` ([`patches/llama-cpp-afe77e18-chantless.patch`](patches/llama-cpp-afe77e18-chantless.patch)). For full design rationale, see [`../explainer/design-notes.md`](../explainer/design-notes.md); for shipped `15` winner masks and SHA256 receipts, see [`../masks/README.md`](../masks/README.md).
+The `chantless` package (`mvp/chantless/`) compiles stock open-weight checkpoints (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`, plus `27B` imported allocations) into standalone GGUF specialists, adapts built models from `<=25` mistakes via `+0 B` binary MLP switches, and serves and benchmarks them on unified `llama.cpp @ afe77e18` ([`patches/llama-cpp-afe77e18-chantless.patch`](patches/llama-cpp-afe77e18-chantless.patch)). For full design rationale, see [`../explainer/design-notes.md`](../explainer/design-notes.md); for shipped `16` winner masks and SHA256 receipts, see [`../masks/README.md`](../masks/README.md).
 
 ## Runtime Architecture
 

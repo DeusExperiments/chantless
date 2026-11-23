@@ -62,7 +62,7 @@ def _load_ggml_libs(ggml_lib: str | None) -> list[ctypes.CDLL]:
     p = Path(key)
     lib_dir = p if p.is_dir() else p.parent
     cands: list[Path] = ([] if p.is_dir() else [p])
-    for stem in ("libggml-base", "libggml-cpu", "libggml", "libllama"):
+    for stem in ("libggml-base", "libggml-cpu", "libggml-cuda", "libggml-metal", "libggml", "libllama"):
         for ext in (".so", ".dylib"):
             cand = lib_dir / f"{stem}{ext}"
             if cand.exists() and cand not in cands:
@@ -1563,6 +1563,8 @@ def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
     if torch.cuda.is_available() and torch.cuda.get_device_properties(torch.device(device)).total_memory < (55 << 30):
         return True
     mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if mtype == "inkling2_loop":
+        return True
     if mtype.startswith("qwen3_5"):
         try:
             import fla  # noqa: F401
@@ -1586,7 +1588,10 @@ def _should_stream_prefix(art: lattice.Artifact, cfg: dict, device: str, frozen_
 
 
 def _default_seq_batch(model, device: str) -> int:
-    if device.startswith("cuda") and str(getattr(getattr(model, "config", None), "model_type", "")).lower().startswith("qwen3_5"):
+    mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if device.startswith("cuda") and mtype == "inkling2_loop":
+        return 2
+    if device.startswith("cuda") and mtype.startswith("qwen3_5"):
         try:
             import fla  # noqa: F401
         except ImportError:

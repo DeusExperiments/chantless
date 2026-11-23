@@ -1204,9 +1204,10 @@ def test_bfcl_gorilla_ast_matching_and_inkling2_prompt_defaults(tmp_path: Path):
 
 def test_shipped_inkling2_masks_validate_v3_schema():
     expected = {
-        "inkling2-mini-clsbench-mask.json": {"experts": 48, "widths": 24, "vocab_keep": 32768},
-        "inkling2-mini-bfcl-mask.json": {"experts": 0, "widths": 0, "vocab_keep": None},
-        "inkling2-mini-deepmath-mask.json": {"experts": 96, "widths": 0, "vocab_keep": None},
+        "inkling2-mini-clsbench-mask.json": {"experts": 48, "widths": 24, "vocab_keep": 32768, "switches": 0},
+        "inkling2-mini-clsbench-apprentice-mask.json": {"experts": 48, "widths": 24, "vocab_keep": 32768, "switches": 424},
+        "inkling2-mini-bfcl-mask.json": {"experts": 0, "widths": 0, "vocab_keep": None, "switches": 0},
+        "inkling2-mini-deepmath-mask.json": {"experts": 96, "widths": 0, "vocab_keep": None, "switches": 0},
     }
     groups = {"token_embd": {"droppable": False}, "output": {"droppable": False}}
     for il in range(24):
@@ -1233,6 +1234,13 @@ def test_shipped_inkling2_masks_validate_v3_schema():
             assert m.get("vocab_keep") is None
         else:
             assert m["vocab_keep"]["count"] == spec["vocab_keep"]
+        sw = (m.get("apprentice") or {}).get("switches") or {}
+        total_sw = sum(len(mk.unpack_bitmap(s)) for s in sw.values())
+        assert total_sw == spec["switches"]
+        if spec["switches"]:
+            assert m["apprentice"]["switch_mode"] == "up_row_zero"
+            assert m["measured"]["cli_rebuild_sha256_equal"] is True
+            assert m["measured"]["apprentice_eval"]["beats_all_controls"] is True
 
 
 # ------------------------------------------------------------------ 10. Optional `/v1/chat/completions` BFCL wiring

@@ -37,9 +37,9 @@ chantless bench \
 
 ## Verified Winners
 
-All **`15` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
+All **`16` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 receipts live in [`masks/README.md`](masks/README.md).
 
-### 1. Stock-Checkpoint Double Winners (`extract` + `<=25`-Mistake `+0 B` `learn`)
+### 1. Stock-Checkpoint Double Winners (`extract` + `<=25`-Mistake `+0 B` `learn`, `4` Architectures)
 
 | Model | Task | Size (`%` BF16) | Mask | Held-Out `exam` | Gain vs Uniform | Apprentice (`<=25` ex → Unseen Fixed) | Controls (`base/empty/flip/shuf`) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -48,12 +48,13 @@ All **`15` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 | **`Gemma 4 E2B`** | `BFCL` | `1.95 GB` (`20.92%`) | `47.1 KB` | **`97.13%`** | **`+44.02` pts** | **`26 / 60`** (`43.3%`, `+0 B`) | `0 / 0 / 0 / 7` |
 | **`Qwen3-4B`** | `BFCL` | `1.97 GB` (`24.50%`) | `6.4 KB` | **`92.31%`** | **`+5.87` pts** | **`22 / 60`** (`36.7%`, `+0 B`) | `3 / 3 / 1 / 12` |
 | **`Qwen3.5-4B`** | `BFCL` | `2.19 GB` (`26.01%`) | `18.6 KB` | **`92.39%`** | `+0.00` pts | **`29 / 60`** (`48.3%`, `+0 B`) | `0 / 0 / 2 / 19` |
+| **`Inkling-2-Mini`** (`24B` MoE) | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `33.9 KB` | **`98.67%` @ `5.00%` FPR** | `11.65×` smaller (`BF16` `99.17%`) | **`10 / 60`** (`+0 B`, exam `+0.34 pp`) | `4 / 4 / 3 / 8` |
 
-### 2. Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners
+### 2. Additional Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners
 
 | Mask | Task | Size (`%` BF16) | Mask | Held-Out `exam` (vs `BF16`) | `reasoning_effort="high"` (`0.9`) Stress Test |
 | :--- | :--- | :---: | :---: | :--- | :--- |
-| `inkling2-mini-clsbench-mask.json` | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `27.6 KB` | **`98.57%` recall** @ `5.24%` FPR (`BF16` `99.04%` @ `4.20%`) | — *(classifier log-odds)* |
+| `inkling2-mini-clsbench-mask.json` | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `27.9 KB` | **`98.33%` recall** @ `5.33%` FPR, `AUROC=0.9965` (`BF16` `99.17%` @ `5.00%`) | Upgraded by `+0 B` Apprentice above (`98.67%` @ `5.00%` FPR) |
 | `inkling2-mini-bfcl-mask.json` | `BFCL` | `14.22 GiB` (**`29.23%`**) | `9.0 KB` | **`115/160` (`71.88%`, `+0.63 pp`)** Gorilla (`BF16` `114/160`) | **BFCL-HIGH (`8k`):** `53/79` Gorilla tie · **DeepMath-HIGH (`16k`):** **`41/48` (`0` regressions)** |
 | `inkling2-mini-deepmath-mask.json` | `DeepMath` | `12.48 GiB` (**`25.66%`**) | `8.4 KB` | **`81/96` (`84.38%`)** `"low"` `4k` (`BF16` `84/96`, `1.45×` faster) | **DeepMath-HIGH (`16k`):** **`40/48` strict / `41/48` raw** (`25%` experts pruned) |
 
