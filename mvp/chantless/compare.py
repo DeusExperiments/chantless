@@ -7,25 +7,44 @@ every model, so two models' intervals are directly comparable.
 """
 from __future__ import annotations
 
+import math
+import numbers
+
 import numpy as np
 
 
 def cutoff(cal, rate: float = 0.01) -> float:
     """Flag strictly below this: the lowest `rate` of the calibration negatives."""
-    cal = np.sort(np.asarray(cal, dtype=float))
-    if not len(cal):
+    if isinstance(rate, bool) or not isinstance(rate, (int, float, np.number)):
+        raise ValueError(f"invalid rate {rate!r}")
+    frate = float(rate)
+    if not math.isfinite(frate) or not (0.0 <= frate <= 1.0):
+        raise ValueError(f"rate must be finite in [0, 1], got {rate!r}")
+    if (isinstance(cal, np.ndarray) and cal.dtype == bool) or (
+        not isinstance(cal, np.ndarray) and any(isinstance(x, bool) for x in cal)
+    ):
+        raise ValueError("calibration scores must be numeric, not bool")
+    cal = np.asarray(cal, dtype=float)
+    if cal.ndim != 1 or not len(cal):
         raise ValueError("empty calibration set")
     if not np.isfinite(cal).all():
         raise ValueError(f"{int((~np.isfinite(cal)).sum())} non-finite calibration scores")
-    return float(cal[int(rate * len(cal))])
+    cal = np.sort(cal)
+    idx = min(len(cal) - 1, max(0, int(frate * len(cal))))
+    return float(cal[idx])
 
 
 def _rate(flag, sel, boot):
     if not sel.any():   # nothing to measure: NaN, never a measured zero
         return {"caught": float("nan"), "ci": [float("nan"), float("nan")], "n": 0}
+    point = float(flag[sel].mean())
     fb, sb = flag[boot], sel[boot]
-    dist = (fb & sb).sum(1) / np.maximum(sb.sum(1), 1)
-    return {"caught": float(flag[sel].mean()), "ci": [float(np.percentile(dist, 2.5)), float(np.percentile(dist, 97.5))],
+    denom = sb.sum(1)
+    valid = denom > 0
+    if not valid.any():
+        return {"caught": point, "ci": [point, point], "n": int(sel.sum())}
+    dist = (fb & sb)[valid].sum(1) / denom[valid]
+    return {"caught": point, "ci": [float(np.percentile(dist, 2.5)), float(np.percentile(dist, 97.5))],
             "n": int(sel.sum())}
 
 
@@ -43,8 +62,9 @@ def compare(models: dict, labels: dict, kinds: dict, groups_of=None, boot: int =
     names = list(models)
     if not names:
         raise ValueError("no models")
-    if boot < 1:
-        raise ValueError(f"boot must be at least 1, got {boot}")
+    if isinstance(boot, bool) or not isinstance(boot, numbers.Integral) or int(boot) < 1:
+        raise ValueError(f"boot must be an integer >= 1, got {boot!r}")
+    boot = int(boot)
     rng = np.random.default_rng(seed)
     cuts = {}
     for m in names:

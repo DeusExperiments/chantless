@@ -12,9 +12,11 @@ def resolve_toolchain() -> tuple[Path, Path]:
     candidates: list[tuple[Path, Path]] = []
     if env_prefix := os.environ.get("CHANTLESS_TOOLCHAIN_PREFIX"):
         p = Path(env_prefix).expanduser().resolve()
+        candidates.append((p / "llama-afe77e18", p / "bin"))
         candidates.append((p / "llama-a01dff9", p / "bin"))
         candidates.append((p / "llama-a01dff9", p / "bin-a01dff9"))
     candidates.extend([
+        (ROOT / ".local/toolchain/llama-afe77e18", ROOT / ".local/toolchain/bin"),
         (ROOT / ".local/toolchain/llama-a01dff9", ROOT / ".local/toolchain/bin"),
         (ROOT / ".local/mvp/llama-a01dff9", ROOT / ".local/mvp/bin-a01dff9"),
     ])

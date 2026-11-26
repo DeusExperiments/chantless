@@ -1,0 +1,434 @@
+{
+  "schema": "chantless.mask/v3",
+  "source": {
+    "repo": "thinkingmachines/Inkling-2-Mini",
+    "revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+    "gguf_repo": "ggml-org/Inkling-2-Mini-GGUF",
+    "gguf_sha256": "7074c9762e6769a608c7b23960a7fd2444880b1174a3910149749f6d01389aec",
+    "gguf_file": "Inkling-2-Mini-BF16.gguf"
+  },
+  "objective_mode": "preserve",
+  "groups": {
+    "blk.1.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.2.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.11.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.12.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.13.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.14.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.15.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.16.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.17.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.18.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.19.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.20.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.3.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.21.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.22.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.23.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.4.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.5.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.6.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.7.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.8.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.9.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.10.attn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.0.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.1.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.10.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.11.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.12.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.13.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.14.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.15.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.16.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.17.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.18.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.19.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.2.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.20.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.21.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.22.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.23.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.3.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.4.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.5.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.6.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.7.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.8.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "blk.9.ffn": {
+      "tier": "IQ4_NL"
+    },
+    "token_embd": {
+      "tier": "Q8_0"
+    },
+    "blk.0.attn": {
+      "tier": "IQ4_NL"
+    },
+    "output": {
+      "tier": "Q8_0"
+    }
+  },
+  "tensors": {},
+  "floors": {},
+  "weights": {
+    "lineage": []
+  },
+  "deployment": {
+    "context": 8192,
+    "concurrency": 1,
+    "kv_type": "f16",
+    "max_total_memory_bytes": null
+  },
+  "measured": {
+    "benchmark": "bfcl_v3_single",
+    "candidate": "iq4nl_k128_uniform",
+    "build": {
+      "bytes": 15267354528,
+      "gib": 14.219,
+      "pct_bf16": 29.233,
+      "pred_bytes": 15267354528,
+      "bytemodel_err_bytes": 0,
+      "sha256": "8ac87bdef6be2584fd939d9d187e423f760ce2e5a5f3a3af5c392625117c7d3f",
+      "build_s": 59.6
+    },
+    "kl": {
+      "kl": 0.03617197,
+      "top1": 0.98623,
+      "n_tgt": 3849,
+      "nll_src": 1.0327635,
+      "nll_cand": 1.0092065
+    },
+    "select": {
+      "n": 80,
+      "valid": 80,
+      "infra_errors": 0,
+      "pass": 53,
+      "acc": 0.6625,
+      "non_live_ast": "36/46 (78.26%)",
+      "non_sql": "48/69 (69.57%)",
+      "no_call": 9,
+      "length_trunc": 1,
+      "garbage": 0,
+      "wall_s": 118.7,
+      "by_category": {
+        "simple": {
+          "n": 12,
+          "pass": 12,
+          "no_call": 0
+        },
+        "multiple": {
+          "n": 12,
+          "pass": 11,
+          "no_call": 0
+        },
+        "live_simple": {
+          "n": 12,
+          "pass": 5,
+          "no_call": 2
+        },
+        "live_multiple": {
+          "n": 11,
+          "pass": 7,
+          "no_call": 2
+        },
+        "java": {
+          "n": 11,
+          "pass": 7,
+          "no_call": 3
+        },
+        "javascript": {
+          "n": 11,
+          "pass": 6,
+          "no_call": 2
+        },
+        "sql": {
+          "n": 11,
+          "pass": 5,
+          "no_call": 0
+        }
+      }
+    },
+    "exam": {
+      "n": 160,
+      "valid": 160,
+      "infra_errors": 0,
+      "pass": 122,
+      "acc": 0.7625,
+      "non_live_ast": "83/102 (81.37%)",
+      "non_sql": "122/160 (76.25%)",
+      "no_call": 11,
+      "length_trunc": 8,
+      "garbage": 0,
+      "wall_s": 266.7,
+      "by_category": {
+        "simple": {
+          "n": 30,
+          "pass": 27,
+          "no_call": 1
+        },
+        "multiple": {
+          "n": 30,
+          "pass": 28,
+          "no_call": 0
+        },
+        "live_simple": {
+          "n": 29,
+          "pass": 21,
+          "no_call": 2
+        },
+        "live_multiple": {
+          "n": 29,
+          "pass": 18,
+          "no_call": 2
+        },
+        "java": {
+          "n": 19,
+          "pass": 12,
+          "no_call": 3
+        },
+        "javascript": {
+          "n": 23,
+          "pass": 16,
+          "no_call": 3
+        }
+      }
+    },
+    "bf16_select": {
+      "n": 80,
+      "valid": 80,
+      "infra_errors": 0,
+      "pass": 55,
+      "acc": 0.6875,
+      "non_live_ast": "37/46 (80.43%)",
+      "non_sql": "49/69 (71.01%)",
+      "no_call": 7,
+      "length_trunc": 1,
+      "garbage": 0,
+      "wall_s": 164.0,
+      "by_category": {
+        "simple": {
+          "n": 12,
+          "pass": 12,
+          "no_call": 0
+        },
+        "multiple": {
+          "n": 12,
+          "pass": 10,
+          "no_call": 0
+        },
+        "live_simple": {
+          "n": 12,
+          "pass": 5,
+          "no_call": 2
+        },
+        "live_multiple": {
+          "n": 11,
+          "pass": 7,
+          "no_call": 3
+        },
+        "java": {
+          "n": 11,
+          "pass": 8,
+          "no_call": 1
+        },
+        "javascript": {
+          "n": 11,
+          "pass": 7,
+          "no_call": 1
+        },
+        "sql": {
+          "n": 11,
+          "pass": 6,
+          "no_call": 0
+        }
+      }
+    },
+    "bf16_exam": {
+      "n": 160,
+      "valid": 160,
+      "infra_errors": 0,
+      "pass": 120,
+      "acc": 0.75,
+      "non_live_ast": "80/102 (78.43%)",
+      "non_sql": "120/160 (75.00%)",
+      "no_call": 10,
+      "length_trunc": 5,
+      "garbage": 0,
+      "wall_s": 367.8,
+      "by_category": {
+        "simple": {
+          "n": 30,
+          "pass": 27,
+          "no_call": 0
+        },
+        "multiple": {
+          "n": 30,
+          "pass": 28,
+          "no_call": 0
+        },
+        "live_simple": {
+          "n": 29,
+          "pass": 19,
+          "no_call": 2
+        },
+        "live_multiple": {
+          "n": 29,
+          "pass": 21,
+          "no_call": 0
+        },
+        "java": {
+          "n": 19,
+          "pass": 10,
+          "no_call": 4
+        },
+        "javascript": {
+          "n": 23,
+          "pass": 15,
+          "no_call": 4
+        }
+      }
+    },
+    "file_bytes": 15267354528,
+    "pct_of_bf16": 29.233,
+    "bpw": 4.6773,
+    "built_sha256": "8ac87bdef6be2584fd939d9d187e423f760ce2e5a5f3a3af5c392625117c7d3f",
+    "gorilla_replay": {
+      "select80_pass": 51,
+      "select80_n": 80,
+      "select80_acc": 0.6375,
+      "bf16_select80_pass": 53,
+      "bf16_select80_n": 80,
+      "bf16_select80_acc": 0.6625,
+      "exam160_pass": 115,
+      "exam160_n": 160,
+      "exam160_acc": 0.7188,
+      "exam160_non_live_ast": "81/102 (79.41%)",
+      "bf16_exam160_pass": 114,
+      "bf16_exam160_n": 160,
+      "bf16_exam160_acc": 0.7125,
+      "bf16_exam160_non_live_ast": "79/102 (77.45%)",
+      "paired_exam160_gorilla": {
+        "both": 107,
+        "bf16_only": 7,
+        "cand_only": 8,
+        "both_fail": 38
+      }
+    },
+    "high_effort_stress": {
+      "reasoning_effort": "high",
+      "bfcl_select80_gorilla_valid79": "53/79 (67.09%) vs BF16 53/79 (67.09%)",
+      "bfcl_select80_chantless_valid79": "55/79 (69.62%) vs BF16 55/79 (69.62%)",
+      "bfcl_select80_non_live_ast_gorilla": "35/46 (76.09%) vs BF16 34/46 (73.91%)",
+      "bfcl_shared_llama_grammar_500": "live_simple:live_simple_231-122-0",
+      "deepmath_select48_high_16k": "41/48 (85.42%) vs BF16 41/48 (85.42%)",
+      "deepmath_select48_high_paired": {
+        "both": 41,
+        "bf16_only": 0,
+        "cand_only": 0,
+        "both_fail": 7
+      },
+      "deepmath_high_kl": 0.0099,
+      "deepmath_high_avg_tokens": 4588.0
+    }
+  },
+  "dead_tensors": [],
+  "widths": {},
+  "vocab_keep": null,
+  "apprentice": {
+    "switches": {},
+    "levels": {},
+    "decision": {}
+  }
+}

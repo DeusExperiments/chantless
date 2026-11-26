@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PINNED_LLAMA_COMMIT = "a01dff9"
+PINNED_LLAMA_COMMIT = "afe77e1"
 REQUIRED_PY_DEPS = ("torch", "transformers", "gguf", "pydantic", "yaml", "numpy", "scipy", "safetensors")
 LLAMA_BINARIES = ("llama-server", "llama-quantize", "llama-imatrix")
 
@@ -34,7 +34,8 @@ def _run_probe(cmd: list[str], env: dict[str, str] | None = None, timeout: int =
         return -1, str(e)
 
 
-def _check_llama_bin(llama_bin: str | Path | None) -> dict[str, Any]:
+def _check_llama_bin(llama_bin: str | Path | None, llama_commit: str = PINNED_LLAMA_COMMIT) -> dict[str, Any]:
+    target_commit = (llama_commit.strip() if llama_commit else "") or PINNED_LLAMA_COMMIT
     if not llama_bin:
         return {"status": "fail", "required": True, "detail": "llama_bin not provided"}
     bdir = Path(llama_bin)
@@ -53,14 +54,14 @@ def _check_llama_bin(llama_bin: str | Path | None) -> dict[str, Any]:
         return {"status": "fail", "required": True, "path": str(bdir), "binaries": bins, "detail": f"missing executable(s): {missing}"}
 
     rc_v, out_v = _run_probe([str(bdir / "llama-server"), "--version"], env=env)
-    commit_ok = rc_v == 0 and PINNED_LLAMA_COMMIT in out_v
+    commit_ok = rc_v == 0 and target_commit in out_v
     rc_h, out_h = _run_probe([str(bdir / "llama-quantize"), "--help"], env=env)
     ttf_ok = "--tensor-type-file" in out_h
 
     status = "pass" if (commit_ok and ttf_ok) else "fail"
     details: list[str] = []
     if not commit_ok:
-        details.append(f"llama-server --version missing {PINNED_LLAMA_COMMIT} (rc={rc_v})")
+        details.append(f"llama-server --version missing {target_commit} (rc={rc_v})")
     if not ttf_ok:
         details.append("llama-quantize --help missing --tensor-type-file")
     return {
@@ -70,6 +71,7 @@ def _check_llama_bin(llama_bin: str | Path | None) -> dict[str, Any]:
         "binaries": bins,
         "version_line": out_v.splitlines()[0] if out_v else "",
         "pinned_commit_match": commit_ok,
+        "expected_commit": target_commit,
         "tensor_type_file_support": ttf_ok,
         "detail": "; ".join(details) if details else "ok",
     }
@@ -262,12 +264,14 @@ def run_doctor(
     model_gb: float | None = None,
     require_classifier: bool = False,
     require_cuda: bool = False,
+    llama_commit: str = PINNED_LLAMA_COMMIT,
 ) -> dict[str, Any]:
+    target_commit = (llama_commit.strip() if llama_commit else "") or PINNED_LLAMA_COMMIT
     lbin = Path(llama_bin) if llama_bin else None
     accel = _check_accelerator(require_cuda=require_cuda)
     n_gpus = max(1, accel["torch_cuda_count"] or len(accel["nvidia_smi_gpus"]) or 1)
     checks: dict[str, Any] = {
-        "llama_bin": _check_llama_bin(lbin),
+        "llama_bin": _check_llama_bin(lbin, llama_commit=target_commit),
         "traj_kl": _check_tool("traj-kl", traj_kl, required=True, llama_bin=lbin),
         "logodds": _check_tool("logodds", logodds, required=require_classifier or bool(logodds), llama_bin=lbin),
         "tokdocs": _check_tool("tokdocs", tokdocs, required=require_classifier or bool(tokdocs), llama_bin=lbin),
@@ -279,6 +283,7 @@ def run_doctor(
     return {
         "ok": ok,
         "pinned_llama_commit": PINNED_LLAMA_COMMIT,
+        "expected_llama_commit": target_commit,
         "platform": {
             "system": platform.system(),
             "machine": platform.machine(),

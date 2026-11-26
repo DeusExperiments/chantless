@@ -1,6 +1,6 @@
 """Generative `traj-kl` one-shot search (`kind == "kl"`), universal `up_row_zero` switch Apprentice
 (`learn_gates_seq` across all ggml quant types including `IQ2_XS`/`IQ1_S` with replay KL + A-GEM), chat/tool token
-protection in `vocab.rule_p_keep_set`, and unified `llama.cpp` `a01dff9` runtime verification.
+protection in `vocab.rule_p_keep_set`, and unified `llama.cpp` `afe77e18` runtime verification.
 """
 from __future__ import annotations
 
@@ -61,8 +61,8 @@ def _write_gguf(path: Path, kvs: list[tuple[str, tuple[int, bytes]]], tensors: l
 
 
 # ------------------------------------------------------------------ 1. Unified runtime patch check
-def test_unified_a01dff9_patch_structure_and_clean_apply(tmp_path: Path):
-    patch_file = ROOT / "mvp/patches/llama-cpp-a01dff9-chantless.patch"
+def test_unified_afe77e18_patch_structure_and_clean_apply(tmp_path: Path):
+    patch_file = ROOT / "mvp/patches/llama-cpp-afe77e18-chantless.patch"
     assert patch_file.exists()
     txt = patch_file.read_text()
     # Must cover all 3 architectures + hparams KV drop tracking + offline server UI build default
@@ -79,9 +79,13 @@ def test_unified_a01dff9_patch_structure_and_clean_apply(tmp_path: Path):
         assert required in txt, f"unified patch missing {required}"
 
     lc_repo, _ = resolve_toolchain()
-    if (lc_repo / ".git").exists():
+    target_commit = "afe77e18fadc2e673c6a6299495a443e17378ce4"
+    if (lc_repo / ".git").exists() and subprocess.run(
+        ["git", "rev-parse", "--verify", f"{target_commit}^{{commit}}"],
+        cwd=lc_repo, capture_output=True,
+    ).returncode == 0:
         wt = tmp_path / "wt"
-        subprocess.run(["git", "worktree", "add", "--detach", str(wt), "a01dff908b9c9311d7af316bba3c918063749bd0"],
+        subprocess.run(["git", "worktree", "add", "--detach", str(wt), target_commit],
                        cwd=lc_repo, check=True, capture_output=True)
         try:
             subprocess.run(["git", "apply", "--check", str(patch_file)], cwd=wt, check=True, capture_output=True)
@@ -196,16 +200,16 @@ def test_generative_kl_oneshot_solver_and_general_cap_guard():
     assert sol_guarded == {"g0": "Q8_0", "g1": "drop"}
 
 
-# ------------------------------------------------------------------ 5. Live end-to-end generative smoke run on unified `a01dff9`
+# ------------------------------------------------------------------ 5. Live end-to-end generative smoke run on unified `afe77e18`
 def test_live_end_to_end_generative_oneshot_and_learn_gates_seq_smoke(tmp_path: Path):
-    """End-to-end generative smoke proof using unified `a01dff9` C++ binaries and PyTorch Student (`IQ2_XS` + drop + width + A-GEM)."""
+    """End-to-end generative smoke proof using unified `afe77e18` C++ binaries and PyTorch Student (`IQ2_XS` + drop + width + A-GEM)."""
     llama_dir, tools_bin = resolve_toolchain()
     llama_bin = llama_dir / "build/bin"
     qwen_tok_dir = resolve_model_dir("qwen3-0.6b")
 
     has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
     if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
-        pytest.skip("unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
+        pytest.skip("unified afe77e18 toolchain, tokenizer model, or ML dependencies not present")
 
     driver = tmp_path / "smoke_e2e.py"
     driver.write_text(f"""
@@ -257,7 +261,7 @@ assert src_gguf.exists()
 
 tc = runtime.Toolchain(llama_bin, tools_bin / "traj-kl", [""], logodds=tools_bin / "logodds", tokdocs=tools_bin / "tokdocs")
 
-# 2. Build generative `task` and `general` TRJ1 stores + `imatrix.gguf` on the unified `a01dff9` binaries
+# 2. Build generative `task` and `general` TRJ1 stores + `imatrix.gguf` on the unified `afe77e18` binaries
 R = kl.Renderer(str(hf_dir))
 task_convos = [
     [{{"role": "user", "content": "Return JSON status ok."}}, {{"role": "assistant", "content": '{{"status": "ok", "code": 200}}'}}],
@@ -502,7 +506,7 @@ print("E2E_GENERATIVE_OK")
     assert "E2E_GENERATIVE_OK" in proc.stdout
 
 
-# ------------------------------------------------------------------ 6. Qwen3.5 VLM config + GatedDeltaNet (num_k != num_v) parity on unified `a01dff9`
+# ------------------------------------------------------------------ 6. Qwen3.5 VLM config + GatedDeltaNet (num_k != num_v) parity on unified `afe77e18`
 def test_qwen35_vlm_config_and_gdn_v_head_unreorder_parity(tmp_path: Path):
     """Verify stock VLM `Qwen3_5Config` (`text_config`), `num_k_heads != num_v_heads` V-head un-reordering, variable width, vocab trim, and `up_row_zero`."""
     llama_dir, tools_bin = resolve_toolchain()
@@ -511,7 +515,7 @@ def test_qwen35_vlm_config_and_gdn_v_head_unreorder_parity(tmp_path: Path):
 
     has_ml_deps = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("transformers") is not None
     if not (has_ml_deps and (llama_bin / "llama-quantize").exists() and (tools_bin / "traj-kl").exists() and qwen_tok_dir.exists()):
-        pytest.skip("unified a01dff9 toolchain, tokenizer model, or ML dependencies not present")
+        pytest.skip("unified afe77e18 toolchain, tokenizer model, or ML dependencies not present")
 
     driver = tmp_path / "q35_parity.py"
     driver.write_text(f"""

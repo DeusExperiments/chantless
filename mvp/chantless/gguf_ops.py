@@ -25,11 +25,25 @@ GGML_TYPES: dict[int, tuple[str, int, int]] = {
 # The "attn" group is the token-mixer sub-block: full attention (qwen3, qwen35, gemma4) or gated delta net (qwen35).
 # When a block has no separate `ffn_norm` (qwen35), `post_attention_norm` is the FFN's pre-norm and belongs to `.ffn`;
 # when `ffn_norm` is present (gemma4), `post_attention_norm` is attention's post-norm and belongs to `.attn`.
-QUANTIZABLE_ATTN = ("attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta")
-QUANTIZABLE_FFN = ("ffn_gate", "ffn_up", "ffn_down")
+QUANTIZABLE_ATTN = (
+    "attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate",
+    "attn_qkv_gate", "attn_rel", "attn_sink_proj",
+    "ssm_out", "ssm_alpha", "ssm_beta", "ssm_beta_alpha",
+)
+QUANTIZABLE_FFN = (
+    "ffn_gate", "ffn_up", "ffn_down",
+    "ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_up_exps",
+    "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+)
 QUANTIZABLE_PLE = ("inp_gate", "proj")
-ATTN_FIXED = ("attn_norm", "attn_q_norm", "attn_k_norm", "ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm")
-FFN_FIXED = ("ffn_norm", "post_ffw_norm")
+ATTN_FIXED = (
+    "attn_norm", "attn_q_norm", "attn_k_norm",
+    "attn_q_inp_norm", "attn_k_inp_norm", "attn_v_inp_norm",
+    "attn_k_conv", "attn_v_conv", "attn_k_conv_proj", "attn_v_conv_proj",
+    "attn_post_conv", "attn_q_clip", "attn_rel_bias", "attn_rel_clip", "attn_res_query",
+    "ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm",
+)
+FFN_FIXED = ("ffn_norm", "post_ffw_norm", "ffn_gate_inp", "exp_probs_b", "ffn_post_conv", "ffn_res_query")
 PLE_FIXED = ("post_norm",)
 BLK = re.compile(r"^blk\.(\d+)\.([a-z0-9_]+?)(?:\.(weight|bias))?$")
 
@@ -59,7 +73,7 @@ def arch_info(path: str | os.PathLike) -> dict:
         n_head = int(g("attention.head_count"))
         n_head_kv = int(g("attention.head_count_kv", 1))
         head_dim = int(g("attention.key_length", n_embd // max(1, n_head)))
-        return {
+        out = {
             "arch": arch,
             "n_layer": int(g("block_count")),
             "n_embd": n_embd,
@@ -68,6 +82,50 @@ def arch_info(path: str | os.PathLike) -> dict:
             "head_dim": head_dim,
             "ff_is_array": isinstance(meta.get(f"{arch}.feed_forward_length"), list),
         }
+        if f"{arch}.expert_count" in meta:
+            out["n_expert"] = int(g("expert_count", 0) or 0)
+            out["n_expert_used"] = int(g("expert_used_count", 0) or 0)
+            out["n_ff_exp"] = int(g("expert_feed_forward_length", 0) or 0)
+        n_layer = out["n_layer"]
+        if f"{arch}.attention.value_length" in meta:
+            out["value_length"] = int(g("attention.value_length", head_dim))
+        if f"{arch}.attention.key_length_swa" in meta:
+            out["key_length_swa"] = int(g("attention.key_length_swa", head_dim))
+        if f"{arch}.attention.value_length_swa" in meta:
+            out["value_length_swa"] = int(g("attention.value_length_swa", out.get("value_length", head_dim)))
+        raw_sw = meta.get(f"{arch}.attention.sliding_window")
+        if isinstance(raw_sw, list):
+            pos_sw = [int(w) for w in raw_sw if int(w) > 0]
+            if pos_sw:
+                out["n_swa"] = max(pos_sw)
+            if f"{arch}.attention.sliding_window_pattern" not in meta and raw_sw:
+                out["swa_pattern"] = [int(w) > 0 for w in raw_sw]
+        elif raw_sw is not None and int(raw_sw) > 0:
+            out["n_swa"] = int(raw_sw)
+        raw_pat = meta.get(f"{arch}.attention.sliding_window_pattern")
+        if isinstance(raw_pat, list):
+            out["swa_pattern"] = [bool(x) for x in raw_pat]
+        elif raw_pat is not None and not isinstance(raw_pat, bool) and int(raw_pat) > 0:
+            pat_n = int(raw_pat)
+            out["swa_pattern"] = [((il + 1) % pat_n != 0) for il in range(n_layer)]
+        if f"{arch}.loop.start" in meta:
+            out["loop_start"] = int(g("loop.start", 0) or 0)
+        if f"{arch}.loop.end" in meta:
+            out["loop_end"] = int(g("loop.end", 0) or 0)
+        if f"{arch}.loop.count" in meta:
+            out["loop_count"] = int(g("loop.count", 1) or 1)
+        return out
+    finally:
+        h.close()
+
+
+def needs_special_tokens(path: str | os.PathLike) -> bool:
+    """Return True when the GGUF architecture/tokenizer requires `llama-server --special` (e.g. Inkling-2)."""
+    h = _Hdr(path)
+    try:
+        kvs = h.parsed_kvs(skip_large_arrays=True)
+        arch = h.arch or str(kvs.get("general.architecture", ""))
+        return arch in ("inkling2", "inkling2_loop") or kvs.get("tokenizer.ggml.pre") == "inkling2"
     finally:
         h.close()
 
@@ -130,6 +188,13 @@ def _build_groups_and_dead(
     block_ids = {int(m.group(1)) for t in inv if (m := BLK.match(t["name"])) and t["name"].split(".")[1] not in mtp_blocks}
     n_layer = (max(block_ids) + 1) if block_ids else 0
     first_shared, kv_sources = _shared_kv_spec(n_layer, kvs, hf_config)
+    arch = str((kvs or {}).get("general.architecture", "") or "")
+    has_loop = (
+        arch in ("inkling2", "inkling2_loop")
+        or int((kvs or {}).get(f"{arch}.loop.count", 0) or 0) > 1
+        or int((kvs or {}).get(f"{arch}.num_loops", 0) or 0) > 1
+        or int((kvs or {}).get(f"{arch}.attn_res.block_size", 0) or 0) > 0
+    )
 
     names_present = {t["name"] for t in inv}
     dead: list[str] = []
@@ -160,16 +225,17 @@ def _build_groups_and_dead(
             i, kind = int(m.group(1)), m.group(2)
             if kind == "post_attention_norm":
                 target = "attn" if i in ffn_norms else "ffn"
-                g = groups.setdefault(f"blk.{i}.{target}", {"quantizable": [], "fixed": [], "droppable": (i not in kv_sources) if target == "attn" else True})
+                drop_ok = False if has_loop else ((i not in kv_sources) if target == "attn" else True)
+                g = groups.setdefault(f"blk.{i}.{target}", {"quantizable": [], "fixed": [], "droppable": drop_ok})
                 g["fixed"].append(name)
             elif kind in QUANTIZABLE_ATTN or kind in ATTN_FIXED:
-                g = groups.setdefault(f"blk.{i}.attn", {"quantizable": [], "fixed": [], "droppable": i not in kv_sources})
+                g = groups.setdefault(f"blk.{i}.attn", {"quantizable": [], "fixed": [], "droppable": (False if has_loop else (i not in kv_sources))})
                 (g["quantizable"] if kind in QUANTIZABLE_ATTN else g["fixed"]).append(name)
             elif kind in QUANTIZABLE_FFN or kind in FFN_FIXED:
-                g = groups.setdefault(f"blk.{i}.ffn", {"quantizable": [], "fixed": [], "droppable": True, "kv": False, "imatrix_ok": True})
+                g = groups.setdefault(f"blk.{i}.ffn", {"quantizable": [], "fixed": [], "droppable": (not has_loop), "kv": False, "imatrix_ok": True})
                 (g["quantizable"] if kind in QUANTIZABLE_FFN else g["fixed"]).append(name)
             elif kind in QUANTIZABLE_PLE or kind in PLE_FIXED:
-                g = groups.setdefault(f"blk.{i}.ple", {"quantizable": [], "fixed": [], "droppable": True, "kv": False, "imatrix_ok": True})
+                g = groups.setdefault(f"blk.{i}.ple", {"quantizable": [], "fixed": [], "droppable": (not has_loop), "kv": False, "imatrix_ok": True})
                 (g["quantizable"] if kind in QUANTIZABLE_PLE else g["fixed"]).append(name)
             else:
                 fixed.append(name)
@@ -181,8 +247,10 @@ def _build_groups_and_dead(
             il = int(g.split(".")[1])
             has_full_out = any(n.endswith(".attn_output.weight") for n in e["quantizable"])
             e["kv"] = bool(has_full_out and il < first_shared)
-            e["droppable"] = il not in kv_sources
+            e["droppable"] = False if has_loop else (il not in kv_sources)
             e.setdefault("imatrix_ok", True)
+        elif has_loop and not g.startswith("_"):
+            e["droppable"] = False
 
     groups["_fixed"] = {"quantizable": [], "fixed": fixed, "droppable": False}
     seen = [n for g in groups.values() for n in g["quantizable"] + g["fixed"]] + dead
@@ -432,12 +500,16 @@ def copy_without_fast(src, dst, drop: set[str]) -> dict:
         h.close()
 
 
-# ---------------------------------------------------------------- Wanda neuron ordering & variable-width slicing
+# ---------------------------------------------------------------- Wanda neuron ordering & variable-width / MoE slicing
 def ffn_widths(path: str | os.PathLike) -> dict[int, int]:
-    """Return `{layer_idx: n_ff}` for every present `blk.<il>.ffn_down.weight` tensor."""
+    """Return `{layer_idx: n_ff}` for every present `blk.<il>.ffn_down.weight` or `ffn_down_exps.weight` tensor."""
     h = _Hdr(path)
     try:
-        return {int(t["name"].split(".")[1]): int(t["dims"][0]) for t in h.tensors if t["name"].endswith("ffn_down.weight")}
+        out: dict[int, int] = {}
+        for t in h.tensors:
+            if t["name"].endswith(("ffn_down.weight", "ffn_down_exps.weight")):
+                out[int(t["name"].split(".")[1])] = int(t["dims"][0])
+        return out
     finally:
         h.close()
 
@@ -450,75 +522,173 @@ def _decode_unquantized_f32(buf: mmap.mmap, offset: int, n_elements: int, tname:
         return np.frombuffer(buf, dtype=np.float16, count=n_elements, offset=offset).astype(np.float32)
     if tname == "F32":
         return np.frombuffer(buf, dtype=np.float32, count=n_elements, offset=offset).copy()
-    raise ValueError(f"wanda_order expects unquantized BF16/F16/F32 source tensor, got {tname}")
+    raise ValueError(f"expects unquantized BF16/F16/F32 source tensor, got {tname}")
 
 
-def wanda_order(src_gguf: str | os.PathLike, imatrix_gguf: str | os.PathLike) -> dict[int, np.ndarray]:
-    """Per-layer neuron importance order (descending): `||W_down[:, j]||_2 * sqrt(in_sum2_j)`."""
-    hi = _Hdr(imatrix_gguf)
-    try:
-        im: dict[int, np.ndarray] = {}
-        for t in hi.tensors:
-            if t["name"].endswith("ffn_down.weight.in_sum2"):
-                il = int(t["name"].split(".")[1])
-                arr = np.frombuffer(hi.m, dtype=np.float32, count=t["n_elements"], offset=hi.data_start + t["offset"]).reshape(-1, t["dims"][0]).sum(axis=0).astype(np.float64)
-                im[il] = arr
-    finally:
-        hi.close()
+def wanda_order(
+    src_gguf: str | os.PathLike,
+    imatrix_gguf: str | os.PathLike | None = None,
+    kept_experts: dict[int, Sequence[int] | np.ndarray] | None = None,
+) -> dict[int, np.ndarray]:
+    """Per-layer neuron importance order (descending): `||W_down[:, j]||_2 * sqrt(in_sum2_j)` (supports MoE `ffn_down_exps`)."""
+    im: dict[int, np.ndarray] = {}
+    im_exp: dict[int, np.ndarray] = {}
+    if imatrix_gguf is not None:
+        hi = _Hdr(imatrix_gguf)
+        try:
+            for t in hi.tensors:
+                nm = t["name"]
+                if nm.endswith("ffn_down.weight.in_sum2"):
+                    il = int(nm.split(".")[1])
+                    arr = np.frombuffer(hi.m, dtype=np.float32, count=t["n_elements"], offset=hi.data_start + t["offset"]).reshape(-1, t["dims"][0]).sum(axis=0).astype(np.float64)
+                    im[il] = arr
+                elif nm.endswith("ffn_down_exps.weight.in_sum2"):
+                    il = int(nm.split(".")[1])
+                    rows = int(t["dims"][1]) if len(t["dims"]) > 1 else 1
+                    arr = np.frombuffer(hi.m, dtype=np.float32, count=t["n_elements"], offset=hi.data_start + t["offset"]).reshape(rows, t["dims"][0]).astype(np.float64)
+                    im_exp[il] = arr
+        finally:
+            hi.close()
 
     hs = _Hdr(src_gguf)
     try:
         out: dict[int, np.ndarray] = {}
         for t in hs.tensors:
-            if t["name"].endswith("ffn_down.weight"):
-                il = int(t["name"].split(".")[1])
+            nm = t["name"]
+            if nm.endswith("ffn_down.weight"):
+                il = int(nm.split(".")[1])
                 if il not in im:
                     continue
                 w = _decode_unquantized_f32(hs.m, hs.data_start + t["offset"], t["n_elements"], t["type"]).reshape(t["dims"][1], t["dims"][0])
                 col_norm = np.sqrt((w.astype(np.float64) ** 2).sum(axis=0))
                 score = col_norm * np.sqrt(np.maximum(im[il], 0.0))
                 out[il] = np.argsort(-score, kind="stable").astype(np.int64)
+            elif nm.endswith("ffn_down_exps.weight"):
+                il = int(nm.split(".")[1])
+                n_ff_exp, n_embd, n_exp = int(t["dims"][0]), int(t["dims"][1]), int(t["dims"][2])
+                w = _decode_unquantized_f32(hs.m, hs.data_start + t["offset"], t["n_elements"], t["type"]).reshape(n_exp, n_embd, n_ff_exp)
+                e_idx = None
+                if kept_experts is not None and il in kept_experts:
+                    e_idx = np.asarray(kept_experts[il], dtype=np.int64)
+                    w = w[e_idx]
+                col_sq = (w.astype(np.float64) ** 2).sum(axis=1)  # (K, n_ff_exp)
+                if il in im_exp:
+                    ex_im = np.maximum(im_exp[il], 0.0)
+                    if e_idx is not None and ex_im.shape[0] == n_exp:
+                        ex_im = ex_im[e_idx]
+                    score = np.sqrt((col_sq * ex_im).sum(axis=0))
+                else:
+                    score = np.sqrt(col_sq.sum(axis=0))
+                out[il] = np.argsort(-score, kind="stable").astype(np.int64)
         return out
     finally:
         hs.close()
 
 
-def _splice_ff_kv(h: _Hdr, widths_per_layer: Sequence[int]) -> bytes:
-    """Rewrite `{arch}.feed_forward_length` (scalar u32 OR existing u32 array) as a u32 array."""
-    key_ff = f"{h.arch}.feed_forward_length"
+def expert_importance_from_imatrix(
+    src_gguf: str | os.PathLike,
+    imatrix_gguf: str | os.PathLike | None = None,
+) -> dict[int, np.ndarray]:
+    """Per-layer routed expert importance order (descending): activation-weighted Frobenius energy with weight-norm fallback."""
+    im_exp: dict[int, np.ndarray] = {}
+    if imatrix_gguf is not None:
+        hi = _Hdr(imatrix_gguf)
+        try:
+            for t in hi.tensors:
+                if t["name"].endswith("ffn_down_exps.weight.in_sum2"):
+                    il = int(t["name"].split(".")[1])
+                    rows = int(t["dims"][1]) if len(t["dims"]) > 1 else 1
+                    arr = np.frombuffer(hi.m, dtype=np.float32, count=t["n_elements"], offset=hi.data_start + t["offset"]).reshape(rows, t["dims"][0]).astype(np.float64)
+                    im_exp[il] = arr
+        finally:
+            hi.close()
+
+    hs = _Hdr(src_gguf)
+    try:
+        out: dict[int, np.ndarray] = {}
+        for t in hs.tensors:
+            if t["name"].endswith("ffn_down_exps.weight"):
+                il = int(t["name"].split(".")[1])
+                n_ff_exp, n_embd, n_exp = int(t["dims"][0]), int(t["dims"][1]), int(t["dims"][2])
+                w = _decode_unquantized_f32(hs.m, hs.data_start + t["offset"], t["n_elements"], t["type"]).reshape(n_exp, n_embd, n_ff_exp)
+                col_sq = (w.astype(np.float64) ** 2).sum(axis=1)  # (n_exp, n_ff_exp)
+                if il in im_exp and im_exp[il].shape == col_sq.shape:
+                    score = (col_sq * np.maximum(im_exp[il], 0.0)).sum(axis=1) + 1e-12 * col_sq.sum(axis=1)
+                else:
+                    score = col_sq.sum(axis=1)
+                out[il] = np.argsort(-score, kind="stable").astype(np.int64)
+        return out
+    finally:
+        hs.close()
+
+
+def _splice_u32_kvs(h: _Hdr, updates: dict[str, int | Sequence[int]]) -> bytes:
+    """Rewrite u32 scalar or u32 array KV entries in-place within `h.m[h.kv_start:h.kv_end]`."""
+    if not updates:
+        return bytes(h.m[h.kv_start : h.kv_end])
     m, p = h.m, h.kv_start
+    out = bytearray()
+    seen: set[str] = set()
     for _ in range(h.n_kv):
         p0 = p
         (kl,) = struct.unpack_from("<Q", m, p); p += 8
         k = m[p : p + kl].decode(); p += kl
         (vt,) = struct.unpack_from("<I", m, p); p += 4
         e = h._skip(p, vt)
-        if k == key_ff:
-            arr_val = struct.pack("<I", _ARR) + struct.pack("<IQ", 4, len(widths_per_layer)) + struct.pack(f"<{len(widths_per_layer)}I", *widths_per_layer)
-            return bytes(m[h.kv_start:p0]) + bytes(m[p0 : p - 4]) + arr_val + bytes(m[e : h.kv_end])
+        if k in updates:
+            val = updates[k]
+            out += bytes(m[p0 : p - 4])
+            if isinstance(val, int):
+                out += struct.pack("<II", 4, int(val))
+            else:
+                arr = [int(x) for x in val]
+                out += struct.pack("<IIQ", _ARR, 4, len(arr)) + struct.pack(f"<{len(arr)}I", *arr)
+            seen.add(k)
+        else:
+            out += bytes(m[p0:e])
         p = e
-    raise KeyError(f"missing GGUF KV key {key_ff!r}")
+    missing = set(updates) - seen
+    if missing:
+        raise KeyError(f"missing GGUF KV key(s): {sorted(missing)}")
+    return bytes(out)
+
+
+def _splice_ff_kv(h: _Hdr, widths_per_layer: Sequence[int]) -> bytes:
+    """Rewrite `{arch}.feed_forward_length` (scalar u32 OR existing u32 array) as a u32 array."""
+    return _splice_u32_kvs(h, {f"{h.arch}.feed_forward_length": list(widths_per_layer)})
 
 
 def subset_imatrix(
     imatrix_src: str | os.PathLike,
     imatrix_dst: str | os.PathLike,
     kept_neurons: dict[int, Sequence[int] | np.ndarray],
+    kept_experts: dict[int, Sequence[int] | np.ndarray] | None = None,
 ) -> None:
-    """Subset `ffn_down.weight.in_sum2` (and `in_sum` when present) to each layer's kept neurons."""
-    keep = {int(il): np.asarray(idx, dtype=np.int64) for il, idx in kept_neurons.items()}
+    """Subset imatrix stats (`in_sum2`, `in_sum`, `counts`) for kept MLP neurons and/or kept MoE experts."""
+    keep = {int(il): np.asarray(idx, dtype=np.int64) for il, idx in (kept_neurons or {}).items()}
+    exp_keep = {int(il): np.asarray(idx, dtype=np.int64) for il, idx in (kept_experts or {}).items()}
     hi = _Hdr(imatrix_src)
     try:
         items = []
         for t in hi.tensors:
             p = t["name"].split(".")
-            il = int(p[1]) if p[0] == "blk" else -1
-            if il in keep and len(keep[il]) == 0 and p[2] in ("ffn_down", "ffn_gate", "ffn_up"):
+            il = int(p[1]) if len(p) > 1 and p[0] == "blk" and p[1].isdigit() else -1
+            if il in keep and len(keep[il]) == 0 and len(p) > 2 and p[2] in ("ffn_down", "ffn_gate", "ffn_up"):
                 continue
             s0 = hi.data_start + t["offset"]
             raw = bytes(hi.m[s0 : s0 + t["n_bytes"]])
             dims = list(t["dims"])
-            if il in keep and p[2] == "ffn_down" and p[-1] in ("in_sum2", "in_sum"):
+            if len(p) > 3 and p[2].endswith("_exps") and p[-1] in ("in_sum2", "in_sum", "counts"):
+                rows = int(dims[1]) if len(dims) > 1 else 1
+                arr = np.frombuffer(raw, dtype=np.float32).reshape(rows, int(dims[0]))
+                if il in exp_keep:
+                    arr = arr[exp_keep[il], :]
+                    dims = [int(dims[0]), int(arr.shape[0])]
+                if il in keep and p[2] == "ffn_down_exps" and p[-1] in ("in_sum2", "in_sum"):
+                    arr = arr[:, keep[il]]
+                    dims = [int(arr.shape[1])] + dims[1:]
+                raw = np.ascontiguousarray(arr).tobytes()
+            elif il in keep and len(p) > 3 and p[2] == "ffn_down" and p[-1] in ("in_sum2", "in_sum"):
                 arr = np.frombuffer(raw, dtype=np.float32).reshape(-1, dims[0])[:, keep[il]]
                 raw = np.ascontiguousarray(arr).tobytes()
                 dims = [int(arr.shape[1])] + dims[1:]
@@ -528,6 +698,21 @@ def subset_imatrix(
         hi.close()
 
 
+def _write_mv(f, mv: memoryview, start: int, nbytes: int, chunk: int = 16 << 20) -> None:
+    end = start + nbytes
+    p = start
+    while p < end:
+        q = min(p + chunk, end)
+        f.write(mv[p:q])
+        p = q
+
+
+def _write_arr(f, arr: np.ndarray) -> None:
+    c = np.ascontiguousarray(arr)
+    with memoryview(c.ravel().view(np.uint8)) as amv:
+        _write_mv(f, amv, 0, c.nbytes)
+
+
 def write_variable_width(
     src_gguf: str | os.PathLike,
     dst_gguf: str | os.PathLike,
@@ -535,62 +720,206 @@ def write_variable_width(
     drop_tensors: set[str] | None = None,
     imatrix_src: str | os.PathLike | None = None,
     imatrix_dst: str | os.PathLike | None = None,
+    kept_experts: dict[int, Sequence[int] | np.ndarray] | None = None,
 ) -> dict:
-    """Write `dst_gguf` from unquantized `src_gguf` with dropped tensors removed and MLP widths sliced."""
+    """Write `dst_gguf` from unquantized `src_gguf` with dropped tensors removed and MLP widths / MoE experts sliced."""
     drop = set(drop_tensors or ())
-    keep = {int(il): np.sort(np.asarray(idx, dtype=np.int64)) for il, idx in kept_neurons.items()}
+    keep = {int(il): np.sort(np.asarray(idx, dtype=np.int64)) for il, idx in (kept_neurons or {}).items()}
+    exp_keep = {int(il): np.sort(np.asarray(idx, dtype=np.int64)) for il, idx in (kept_experts or {}).items()}
     h = _Hdr(src_gguf)
     try:
         kvs = h.parsed_kvs()
-        n_layer = int(kvs[f"{h.arch}.block_count"])
-        raw_ff = kvs[f"{h.arch}.feed_forward_length"]
-        n0 = list(raw_ff) if isinstance(raw_ff, list) else [int(raw_ff)] * n_layer
+        arch = h.arch or ""
+        n_layer = int(kvs[f"{arch}.block_count"])
+        raw_ff_exp = kvs.get(f"{arch}.expert_feed_forward_length")
+        raw_ff = kvs.get(f"{arch}.feed_forward_length", raw_ff_exp)
+        is_moe_ff = raw_ff_exp is not None or any(t["name"].endswith("ffn_down_exps.weight") for t in h.tensors)
+        base_ff = raw_ff_exp if (is_moe_ff and raw_ff_exp is not None) else raw_ff
+        n0 = list(base_ff) if isinstance(base_ff, list) else [int(base_ff)] * n_layer
+        e0: dict[int, int] = {}
         for t in h.tensors:
             if t["name"].endswith("ffn_down.weight"):
                 n0[int(t["name"].split(".")[1])] = int(t["dims"][0])
+            elif t["name"].endswith("ffn_down_exps.weight"):
+                il = int(t["name"].split(".")[1])
+                n0[il] = int(t["dims"][0])
+                e0[il] = int(t["dims"][2])
+            elif t["name"].endswith("ffn_gate_inp.weight"):
+                e0.setdefault(int(t["name"].split(".")[1]), int(t["dims"][1]))
+
         active_keep = {il: idx for il, idx in keep.items() if len(idx) < n0[il]}
-        widths_arr = [int(len(active_keep[il])) if il in active_keep else int(n0[il]) for il in range(n_layer)]
-        kv_bytes = _splice_ff_kv(h, widths_arr) if active_keep else bytes(h.m[h.kv_start : h.kv_end])
+        active_exp = {il: idx for il, idx in exp_keep.items() if il in e0 and len(idx) < e0[il]}
+
+        kv_updates: dict[str, int | list[int]] = {}
+        if active_keep:
+            widths_arr = [int(len(active_keep[il])) if il in active_keep else int(n0[il]) for il in range(n_layer)]
+            if is_moe_ff:
+                if len(set(widths_arr)) == 1 and not isinstance(raw_ff_exp, list):
+                    kv_updates[f"{arch}.expert_feed_forward_length"] = widths_arr[0]
+                    if f"{arch}.feed_forward_length" in kvs and not isinstance(kvs[f"{arch}.feed_forward_length"], list):
+                        kv_updates[f"{arch}.feed_forward_length"] = widths_arr[0]
+                else:
+                    kv_updates[f"{arch}.expert_feed_forward_length"] = widths_arr
+                    if f"{arch}.feed_forward_length" in kvs:
+                        kv_updates[f"{arch}.feed_forward_length"] = widths_arr
+            else:
+                kv_updates[f"{arch}.feed_forward_length"] = widths_arr
+
+        if active_exp:
+            kept_exp_counts = {len(active_exp[il]) if il in active_exp else e0[il] for il in e0}
+            if len(kept_exp_counts) != 1:
+                raise ValueError(f"MoE expert_count must remain uniform across layers, got counts {sorted(kept_exp_counts)}")
+            k_exp = next(iter(kept_exp_counts))
+            n_used = kvs.get(f"{arch}.expert_used_count")
+            n_used_max = max(n_used) if isinstance(n_used, list) else int(n_used or 1)
+            if k_exp < n_used_max:
+                raise ValueError(f"kept expert_count={k_exp} < expert_used_count={n_used_max}")
+            kv_updates[f"{arch}.expert_count"] = int(k_exp)
+
+        kv_bytes = _splice_u32_kvs(h, kv_updates) if kv_updates else bytes(h.m[h.kv_start : h.kv_end])
 
         elem_dtype = {"BF16": np.uint16, "F16": np.uint16, "F32": np.uint32}
-        out_tensors = []
+        elem_size = {"BF16": 2, "F16": 2, "F32": 4}
+        A = h.alignment
+        ti = bytearray()
+        off = 0
+        plan: list[tuple[dict, int, str, list[int], int, int, bool, bool]] = []
         for t in h.tensors:
             name = t["name"]
             if name in drop:
                 continue
             p = name.split(".")
-            il = int(p[1]) if p[0] == "blk" and p[1].isdigit() else -1
+            il = int(p[1]) if len(p) > 1 and p[0] == "blk" and p[1].isdigit() else -1
             kind = p[2] if il >= 0 and len(p) > 2 else ""
             if il in active_keep and len(active_keep[il]) == 0 and kind in ("ffn_gate", "ffn_up", "ffn_down", "ffn_norm", "post_ffw_norm"):
                 continue
-            s0 = h.data_start + t["offset"]
-            if il in active_keep and kind in ("ffn_gate", "ffn_up", "ffn_down"):
-                dt = elem_dtype.get(t["type"])
-                if dt is None:
+            need_w = il in active_keep and kind in ("ffn_gate", "ffn_up", "ffn_down", "ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_up_exps")
+            need_e = il in active_exp and kind in ("ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_up_exps", "ffn_gate_inp", "exp_probs_b")
+            dims = list(t["dims"])
+            if need_w or need_e:
+                es = elem_size.get(t["type"])
+                if es is None:
                     raise ValueError(f"write_variable_width requires BF16/F16/F32 source tensor, got {name} ({t['type']})")
-                v = np.frombuffer(h.m, dtype=dt, count=t["n_elements"], offset=s0).reshape(t["dims"][1], t["dims"][0])
-                idx = active_keep[il]
-                if kind == "ffn_down":
-                    raw_blob = np.ascontiguousarray(v[:, idx]).tobytes()
-                    dims = [int(len(idx)), int(t["dims"][1])]
+                if kind in ("ffn_gate", "ffn_up", "ffn_down"):
+                    if kind == "ffn_down":
+                        new_dims = [int(len(active_keep[il])), int(dims[1])]
+                    else:
+                        new_dims = [int(dims[0]), int(len(active_keep[il]))]
+                elif kind in ("ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_up_exps"):
+                    d0, d1, d2 = int(dims[0]), int(dims[1]), int(dims[2])
+                    if need_e:
+                        d2 = int(len(active_exp[il]))
+                    if need_w:
+                        wn = int(len(active_keep[il]))
+                        if kind == "ffn_down_exps":
+                            d0 = wn
+                        elif kind == "ffn_gate_up_exps":
+                            d1 = 2 * wn
+                        else:
+                            d1 = wn
+                    new_dims = [d0, d1, d2]
+                elif kind == "ffn_gate_inp":
+                    new_dims = [int(dims[0]), int(len(active_exp[il]))]
                 else:
-                    raw_blob = np.ascontiguousarray(v[idx, :]).tobytes()
-                    dims = [int(t["dims"][0]), int(len(idx))]
-                del v
-                out_tensors.append((name, dims, t["ttype"], raw_blob))
+                    new_dims = [int(len(active_exp[il]))]
+                n_el = 1
+                for d in new_dims:
+                    n_el *= d
+                new_n_bytes = n_el * es
             else:
-                out_tensors.append((name, list(t["dims"]), t["ttype"], bytes(h.m[s0 : s0 + t["n_bytes"]])))
+                new_dims = dims
+                new_n_bytes = int(t["n_bytes"])
+            nb = name.encode()
+            ti += struct.pack("<Q", len(nb)) + nb + struct.pack("<I", len(new_dims)) + struct.pack(f"<{len(new_dims)}Q", *new_dims)
+            ti += struct.pack("<IQ", t["ttype"], off)
+            plan.append((t, il, kind, new_dims, new_n_bytes, off, need_w, need_e))
+            off = (off + new_n_bytes + A - 1) // A * A
 
-        _write_gguf_raw(h.version, h.alignment, h.n_kv, kv_bytes, out_tensors, dst_gguf)
+        def _stream_write() -> None:
+            tmp = str(dst_gguf) + ".part"
+            try:
+                with memoryview(h.m) as mv, open(tmp, "wb") as f:
+                    f.write(b"GGUF" + struct.pack("<IQQ", h.version, len(plan), h.n_kv))
+                    f.write(kv_bytes)
+                    f.write(ti)
+                    pos = f.tell()
+                    f.write(b"\0" * ((pos + A - 1) // A * A - pos))
+                    base = f.tell()
+                    for t, il, kind, _new_dims, new_n_bytes, new_off, need_w, need_e in plan:
+                        pad = new_off - (f.tell() - base)
+                        if pad:
+                            f.write(b"\0" * pad)
+                        s0 = h.data_start + t["offset"]
+                        if not (need_w or need_e):
+                            _write_mv(f, mv, s0, t["n_bytes"])
+                        else:
+                            dt = elem_dtype[t["type"]]
+                            es = elem_size[t["type"]]
+                            dims = t["dims"]
+                            if kind in ("ffn_gate", "ffn_up", "ffn_down"):
+                                v = np.frombuffer(h.m, dtype=dt, count=t["n_elements"], offset=s0).reshape(dims[1], dims[0])
+                                idx = active_keep[il]
+                                sub = v[:, idx] if kind == "ffn_down" else v[idx, :]
+                                del v
+                                _write_arr(f, sub)
+                                del sub
+                            elif kind in ("ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_up_exps"):
+                                d0, d1, d2 = int(dims[0]), int(dims[1]), int(dims[2])
+                                exp_elems = d1 * d0
+                                exp_bytes = exp_elems * es
+                                e_indices = active_exp[il].tolist() if need_e else range(d2)
+                                if not need_w:
+                                    for e in e_indices:
+                                        _write_mv(f, mv, s0 + e * exp_bytes, exp_bytes)
+                                else:
+                                    w_idx = active_keep[il]
+                                    idx_gu = np.concatenate([w_idx, (d1 // 2) + w_idx]) if kind == "ffn_gate_up_exps" else None
+                                    for e in e_indices:
+                                        v = np.frombuffer(h.m, dtype=dt, count=exp_elems, offset=s0 + e * exp_bytes).reshape(d1, d0)
+                                        if kind == "ffn_down_exps":
+                                            sub = v[:, w_idx]
+                                        elif kind == "ffn_gate_up_exps":
+                                            sub = v[idx_gu, :]
+                                        else:
+                                            sub = v[w_idx, :]
+                                        del v
+                                        _write_arr(f, sub)
+                                        del sub
+                            elif kind == "ffn_gate_inp":
+                                d0, d1 = int(dims[0]), int(dims[1])
+                                v = np.frombuffer(h.m, dtype=dt, count=t["n_elements"], offset=s0).reshape(d1, d0)
+                                sub = v[active_exp[il], :]
+                                del v
+                                _write_arr(f, sub)
+                                del sub
+                            else:
+                                v = np.frombuffer(h.m, dtype=dt, count=t["n_elements"], offset=s0)
+                                sub = v[active_exp[il]]
+                                del v
+                                _write_arr(f, sub)
+                                del sub
+                        if (f.tell() - base) != new_off + new_n_bytes:
+                            raise RuntimeError(f"{t['name']}: wrote {(f.tell() - base) - new_off} B != planned {new_n_bytes} B")
+                    end_pos = f.tell()
+                    f.write(b"\0" * ((end_pos + A - 1) // A * A - end_pos))
+                os.replace(tmp, dst_gguf)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+
+        _stream_write()
     finally:
         h.close()
 
     if imatrix_src and imatrix_dst:
-        if active_keep:
-            subset_imatrix(imatrix_src, imatrix_dst, active_keep)
+        if active_keep or active_exp:
+            subset_imatrix(imatrix_src, imatrix_dst, active_keep, kept_experts=active_exp)
         elif Path(imatrix_src).resolve() != Path(imatrix_dst).resolve():
             __import__("shutil").copyfile(imatrix_src, imatrix_dst)
-    return {"widths": {il: int(len(idx)) for il, idx in active_keep.items()}, "file_bytes": os.path.getsize(dst_gguf)}
+    res = {"widths": {il: int(len(idx)) for il, idx in active_keep.items()}, "file_bytes": os.path.getsize(dst_gguf)}
+    if active_exp:
+        res["experts"] = {il: int(len(idx)) for il, idx in active_exp.items()}
+    return res
 
 
 def arch_info_fast(path) -> dict:

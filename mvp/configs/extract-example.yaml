@@ -21,13 +21,36 @@ source:
   gguf: .local/models/qwen3-4b-bf16.gguf
 
 toolchain:
-  llama_bin: .local/toolchain/llama-a01dff9/build/bin
+  llama_bin: .local/toolchain/llama-afe77e18/build/bin
   traj_kl: .local/toolchain/bin/traj-kl
   gpus: ["0"]
 
 env:
   module: chantless.env.bfcl
-  kwargs: {}
+  kwargs:
+    hf_dir: .local/models/qwen3-4b
+    max_tokens: 1024
+    context: 8192
+
+serving:
+  slots_per_gpu: 4
+  ctx_per_slot: 8192
+  cache_prompt: false
+  flash_attn: "on"
+
+decoding:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  min_p: 0.0
+  max_tokens: 1024
+  enable_thinking: false
+
+pool:
+  tasks_per_split:
+    search: 80
+    select: 80
+    exam: 160
 
 probe:
   clamp_workers: true

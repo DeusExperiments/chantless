@@ -202,6 +202,7 @@ def has_v3_cuts(mask: dict) -> bool:
     return bool(
         mask.get("dead_tensors")
         or mask.get("widths")
+        or mask.get("experts")
         or mask.get("vocab_keep") is not None
         or app.get("switches")
         or app.get("levels")
@@ -249,10 +250,42 @@ def validate(mask: dict, groups: dict[str, dict], ladder: list[str] | None = Non
         if t != DROP:
             if len(idx) == 0:
                 raise MaskError(f"{fg}: width 0 requires tier='drop'")
-            down_tier = mask.get("tensors", {}).get(f"blk.{il}.ffn_down.weight", t).upper()
+            tensors_m = mask.get("tensors", {})
+            down_tier = (tensors_m.get(f"blk.{il}.ffn_down_exps.weight") or tensors_m.get(f"blk.{il}.ffn_down.weight") or t).upper()
             bs = BLOCK_SIZES.get(down_tier, 1)
             if len(idx) % bs != 0:
                 raise MaskError(f"{fg}: kept width {len(idx)} is not divisible by {down_tier} block size {bs}")
+
+    if mask.get("experts"):
+        exp_counts: set[int] = set()
+        shrunk = False
+        exp_layers: set[int] = set()
+        for k, spec in (mask.get("experts") or {}).items():
+            il = int(k)
+            fg = f"blk.{il}.ffn"
+            if fg not in mask["groups"]:
+                raise MaskError(f"experts specified for unknown FFN group {fg}")
+            idx = unpack_bitmap(spec)
+            if mask["groups"][fg]["tier"] != DROP:
+                if len(idx) == 0:
+                    raise MaskError(f"{fg}: kept expert count cannot be 0")
+                exp_counts.add(len(idx))
+                exp_layers.add(il)
+                if isinstance(spec, dict) and "n" in spec and len(idx) < int(spec["n"]):
+                    shrunk = True
+        if len(exp_counts) > 1:
+            raise MaskError(f"MoE experts must keep a uniform expert count across layers, got {sorted(exp_counts)}")
+        if shrunk:
+            moe_layers = {
+                int(g.split(".")[1])
+                for g, info in groups.items()
+                if g.endswith(".ffn")
+                and mask["groups"].get(g, {}).get("tier") != DROP
+                and any(n.endswith("ffn_down_exps.weight") for n in info.get("quantizable", ()))
+            }
+            missing_layers = sorted(moe_layers - exp_layers)
+            if missing_layers:
+                raise MaskError(f"uniform MoE expert pruning requires all MoE layers in `experts`; missing layers {missing_layers[:5]}")
 
     if mask.get("vocab_keep") is not None:
         vk = unpack_bitmap(mask["vocab_keep"])
@@ -285,6 +318,16 @@ def kept_widths(mask: dict) -> dict[int, np.ndarray]:
     """Return `{layer_idx: sorted_kept_neuron_indices}` for layers with width cuts (excluding dropped FFNs)."""
     out: dict[int, np.ndarray] = {}
     for k, spec in (mask.get("widths") or {}).items():
+        il = int(k)
+        if mask["groups"].get(f"blk.{il}.ffn", {}).get("tier") != DROP:
+            out[il] = unpack_bitmap(spec)
+    return out
+
+
+def kept_experts(mask: dict) -> dict[int, np.ndarray]:
+    """Return `{layer_idx: sorted_kept_expert_indices}` for layers with MoE expert pruning."""
+    out: dict[int, np.ndarray] = {}
+    for k, spec in (mask.get("experts") or {}).items():
         il = int(k)
         if mask["groups"].get(f"blk.{il}.ffn", {}).get("tier") != DROP:
             out[il] = unpack_bitmap(spec)
@@ -376,6 +419,23 @@ def inspect_mask(path_or_mask: str | Path | dict) -> dict:
         width_kept_total += len(idx)
         width_orig_total += int(spec["n"]) if isinstance(spec, dict) and "n" in spec else len(idx)
 
+    experts = m.get("experts") or {}
+    exp_layers = 0
+    exp_kept_total = 0
+    exp_orig_total = 0
+    exp_kept_per_layer: set[int] = set()
+    exp_orig_per_layer: set[int] = set()
+    for k, spec in experts.items():
+        if (m.get("groups") or {}).get(f"blk.{int(k)}.ffn", {}).get("tier") == DROP:
+            continue
+        idx = unpack_bitmap(spec)
+        n_orig = int(spec["n"]) if isinstance(spec, dict) and "n" in spec else len(idx)
+        exp_layers += 1
+        exp_kept_total += len(idx)
+        exp_orig_total += n_orig
+        exp_kept_per_layer.add(len(idx))
+        exp_orig_per_layer.add(n_orig)
+
     vk = m.get("vocab_keep")
     vocab_info = None
     if vk is not None:
@@ -409,6 +469,14 @@ def inspect_mask(path_or_mask: str | Path | dict) -> dict:
             "kept_neurons": width_kept_total,
             "orig_neurons": width_orig_total,
             "pct_kept": round(100.0 * width_kept_total / max(1, width_orig_total), 2) if width_orig_total else 100.0,
+        },
+        "experts": {
+            "pruned_layers": exp_layers,
+            "kept_experts": exp_kept_total,
+            "orig_experts": exp_orig_total,
+            "kept_per_layer": next(iter(exp_kept_per_layer)) if len(exp_kept_per_layer) == 1 else (sorted(exp_kept_per_layer) if exp_kept_per_layer else None),
+            "orig_per_layer": next(iter(exp_orig_per_layer)) if len(exp_orig_per_layer) == 1 else (sorted(exp_orig_per_layer) if exp_orig_per_layer else None),
+            "pct_kept": round(100.0 * exp_kept_total / max(1, exp_orig_total), 2) if exp_orig_total else 100.0,
         },
         "vocab_keep": vocab_info,
         "apprentice": {
@@ -456,6 +524,19 @@ def diff_masks(a_in: str | Path | dict, b_in: str | Path | dict) -> dict:
                 "only_b": int(len(np.setdiff1d(ib, ia))) if (ia is not None and ib is not None) else None,
             }
 
+    ea, eb = a.get("experts") or {}, b.get("experts") or {}
+    expert_diffs = {}
+    for k in sorted(set(ea) | set(eb), key=lambda x: int(x)):
+        ia = unpack_bitmap(ea[k]) if k in ea else None
+        ib = unpack_bitmap(eb[k]) if k in eb else None
+        if ia is None or ib is None or not np.array_equal(ia, ib):
+            expert_diffs[k] = {
+                "a_kept": int(len(ia)) if ia is not None else None,
+                "b_kept": int(len(ib)) if ib is not None else None,
+                "only_a": int(len(np.setdiff1d(ia, ib))) if (ia is not None and ib is not None) else None,
+                "only_b": int(len(np.setdiff1d(ib, ia))) if (ia is not None and ib is not None) else None,
+            }
+
     vka, vkb = a.get("vocab_keep"), b.get("vocab_keep")
     vocab_diff = None
     if (vka is None) != (vkb is None):
@@ -497,11 +578,12 @@ def diff_masks(a_in: str | Path | dict, b_in: str | Path | dict) -> dict:
         "dead_tensors_only_a": sorted(da - db),
         "dead_tensors_only_b": sorted(db - da),
         "width_diffs": width_diffs,
+        "expert_diffs": expert_diffs,
         "vocab_diff": vocab_diff,
         "switch_diffs": switch_diffs,
         "switches_only_a_total": total_sw_only_a,
         "switches_only_b_total": total_sw_only_b,
-        "identical_structure": not (group_diffs or tensor_diffs or (da ^ db) or width_diffs or vocab_diff or switch_diffs),
+        "identical_structure": not (group_diffs or tensor_diffs or (da ^ db) or width_diffs or expert_diffs or vocab_diff or switch_diffs),
     }
 
 
@@ -548,11 +630,11 @@ def merge_masks(
 
     if mode == "apprentice":
         d = diff_masks(a, b)
-        if d["group_diffs"] or d["tensor_diffs"] or d["dead_tensors_only_a"] or d["dead_tensors_only_b"] or d["width_diffs"] or d["vocab_diff"]:
+        if d["group_diffs"] or d["tensor_diffs"] or d["dead_tensors_only_a"] or d["dead_tensors_only_b"] or d["width_diffs"] or d["expert_diffs"] or d["vocab_diff"]:
             raise MaskError(
                 "apprentice merge requires identical specialist skeletons "
                 f"(group_diffs={len(d['group_diffs'])}, tensor_diffs={len(d['tensor_diffs'])}, "
-                f"width_diffs={len(d['width_diffs'])}, vocab_diff={d['vocab_diff'] is not None})"
+                f"width_diffs={len(d['width_diffs'])}, expert_diffs={len(d['expert_diffs'])}, vocab_diff={d['vocab_diff'] is not None})"
             )
         app_a, app_b = a.get("apprentice") or {}, b.get("apprentice") or {}
         sm_a, sm_b = app_a.get("switch_mode"), app_b.get("switch_mode")
@@ -626,6 +708,27 @@ def merge_masks(
                 widths_reset_full += 1
         merged["widths"] = new_widths
 
+        ea, eb = a.get("experts") or {}, b.get("experts") or {}
+        experts_preserved = False
+        experts_reset_full = False
+        if ea or eb:
+            active_exp_keys = [
+                k for k in sorted(set(ea) | set(eb), key=lambda x: int(x))
+                if merged["groups"].get(f"blk.{int(k)}.ffn", {}).get("tier") != DROP
+            ]
+            all_match = bool(ea) and bool(eb) and bool(active_exp_keys) and all(
+                (k in ea and k in eb and np.array_equal(unpack_bitmap(ea[k]), unpack_bitmap(eb[k])))
+                for k in active_exp_keys
+            )
+            if all_match:
+                merged["experts"] = {k: copy.deepcopy(ea[k]) for k in active_exp_keys}
+                experts_preserved = True
+            else:
+                merged.pop("experts", None)
+                experts_reset_full = True
+        else:
+            merged.pop("experts", None)
+
         vka, vkb = a.get("vocab_keep"), b.get("vocab_keep")
         if vka is None or vkb is None:
             merged["vocab_keep"] = None
@@ -653,6 +756,8 @@ def merge_masks(
             "mode": mode,
             "widths_kept_identical": widths_kept_identical,
             "widths_reset_full": widths_reset_full,
+            "experts_preserved": experts_preserved,
+            "experts_reset_full": experts_reset_full,
             "vocab_kept": vocab_kept_n,
             "dead_tensors": len(merged["dead_tensors"]),
         }

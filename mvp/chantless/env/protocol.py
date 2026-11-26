@@ -7,6 +7,7 @@ counted as task failures.
 from __future__ import annotations
 
 import importlib
+import numbers
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -34,6 +35,7 @@ class Episode:
     completion_tokens: int
     wall_s: float
     infra_error: str | None = None
+    reasoning_content: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -100,14 +102,50 @@ def validate_environment(env: Any) -> None:
     for fn in ("tasks", "run", "verify"):
         if not callable(getattr(env, fn, None)):
             raise ValueError(f"environment lacks callable {fn}()")
-    if getattr(env, "classifier", False):
-        for fn in ("score", "calibrate", "decide"):
-            if not callable(getattr(env, fn, None)):
-                raise ValueError(f"classifier environment lacks callable {fn}()")
+    if not isinstance(env.budget, dict):
+        raise ValueError("environment budget must be a dict")
+    for k in ("max_turns", "max_tokens_per_turn", "max_tokens", "max_doc_tokens"):
+        if k in env.budget:
+            v = env.budget[k]
+            if isinstance(v, bool) or not isinstance(v, numbers.Integral) or int(v) <= 0:
+                raise ValueError(f"environment budget[{k!r}] must be a positive int, got {v!r}")
+    if not isinstance(env.deployment, dict):
+        raise ValueError("environment deployment must be a dict")
     for k in ("context", "concurrency", "kv_type"):
         if k not in env.deployment:
             raise ValueError(f"environment deployment block lacks {k!r}")
-    tasks = env.tasks()
+    for k in ("context", "concurrency"):
+        v = env.deployment[k]
+        if isinstance(v, bool) or not isinstance(v, numbers.Integral) or int(v) <= 0:
+            raise ValueError(f"environment deployment[{k!r}] must be a positive int, got {v!r}")
+    if not isinstance(env.deployment["kv_type"], str) or not env.deployment["kv_type"].strip():
+        raise ValueError(f"environment deployment['kv_type'] must be a non-empty str, got {env.deployment['kv_type']!r}")
+    if "max_total_memory_bytes" in env.deployment and env.deployment["max_total_memory_bytes"] is not None:
+        v = env.deployment["max_total_memory_bytes"]
+        if isinstance(v, bool) or not isinstance(v, numbers.Integral) or int(v) <= 0:
+            raise ValueError(
+                f"environment deployment['max_total_memory_bytes'] must be a positive int or None, got {v!r}"
+            )
+    is_classifier = bool(getattr(env, "classifier", False))
+    if is_classifier:
+        for fn in ("score", "calibrate", "decide"):
+            if not callable(getattr(env, fn, None)):
+                raise ValueError(f"classifier environment lacks callable {fn}()")
+        pair = getattr(env, "pair", None)
+        if (
+            not isinstance(pair, (tuple, list))
+            or len(pair) != 2
+            or any(isinstance(x, bool) or not isinstance(x, numbers.Integral) or int(x) < 0 for x in pair)
+            or int(pair[0]) == int(pair[1])
+        ):
+            raise ValueError(f"classifier environment lacks valid 2-int pair attribute, got {pair!r}")
+    raw_tasks = env.tasks()
+    if raw_tasks is None:
+        raise ValueError("environment declares no tasks")
+    try:
+        tasks = list(raw_tasks)
+    except TypeError as exc:
+        raise ValueError(f"environment tasks() must return an iterable, got {type(raw_tasks).__name__}") from exc
     if not tasks:
         raise ValueError("environment declares no tasks")
     seen, fam_split = set(), {}
@@ -119,6 +157,7 @@ def validate_environment(env: Any) -> None:
         seen.add(t.id)
         if fam_split.setdefault(t.family, t.split) != t.split:
             raise ValueError(f"family {t.family} spans splits {fam_split[t.family]} and {t.split}")
-    for s in ("search", "select", "exam"):
+    req_splits = ("search", "select", "exam", "calibration") if is_classifier else ("search", "select", "exam")
+    for s in req_splits:
         if not any(t.split == s for t in tasks):
             raise ValueError(f"no tasks in required split {s!r}")

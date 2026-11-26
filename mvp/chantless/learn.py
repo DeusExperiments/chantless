@@ -10,16 +10,23 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import logging
+import math
 import random
 import re
 import struct
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from torch import nn
 
 from . import lattice, mask as maskmod
+
+_LOG = logging.getLogger(__name__)
 
 LAYER_NAMES = {
     "attn_norm": "input_layernorm.weight", "post_attention_norm": "post_attention_layernorm.weight",
@@ -55,7 +62,7 @@ def _load_ggml_libs(ggml_lib: str | None) -> list[ctypes.CDLL]:
     p = Path(key)
     lib_dir = p if p.is_dir() else p.parent
     cands: list[Path] = ([] if p.is_dir() else [p])
-    for stem in ("libggml-base", "libggml-cpu", "libggml", "libllama"):
+    for stem in ("libggml-base", "libggml-cpu", "libggml-cuda", "libggml-metal", "libggml", "libllama"):
         for ext in (".so", ".dylib"):
             cand = lib_dir / f"{stem}{ext}"
             if cand.exists() and cand not in cands:
@@ -138,18 +145,779 @@ def train_names(art: lattice.Artifact, cfg: dict) -> list[str]:
     grid = [n for n, t in art.tensors.items() if t["type"] in lattice.TOP and n.startswith("blk.")]
     if cfg.get("train_regex"):
         return [n for n in grid if re.search(cfg["train_regex"], n)]
-    kept = sorted({int(n.split(".")[1]) for n in grid})[-cfg.get("last_blocks", 2):]
+    lb = cfg.get("last_blocks")
+    lb = 2 if lb is None else int(lb)
+    kept = sorted({int(n.split(".")[1]) for n in grid})[-lb:] if lb > 0 else []
     return [n for n in grid if int(n.split(".")[1]) in kept]
 
 
-def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml_lib: str | None, device: str = "cpu",
+def _inkling2_rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    if weight is not None:
+        y = y * weight.float()
+    return y.to(x.dtype)
+
+
+def _inkling2_clip(x: torch.Tensor, scale: torch.Tensor | None, threshold: float) -> torch.Tensor:
+    dt = x.dtype
+    xf = x.float()
+    if scale is not None:
+        xf = xf * scale.float()
+    norm = torch.sqrt(xf.pow(2).sum(dim=-1, keepdim=True)) + 1e-6
+    return (xf * torch.clamp(threshold / norm, min=0.0, max=1.0)).to(dt)
+
+
+def _inkling2_mix(blocks: list[torch.Tensor], cur: torch.Tensor, query: torch.Tensor, n_embd: int) -> torch.Tensor:
+    states = torch.stack([*blocks, cur], dim=2)  # [B, L, S, D]
+    states_n = _inkling2_rms_norm(states, None, 1e-6).float()
+    scores = torch.matmul(states_n, query.float().t()) * (1.0 / math.sqrt(n_embd))
+    probs = torch.softmax(scores, dim=2)
+    return torch.einsum("blsc,blsd->blcd", probs, states_n).to(cur.dtype)
+
+
+def _inkling2_convolve(
+    cur: torch.Tensor,
+    weight: torch.Tensor,
+    dynamic: torch.Tensor | None,
+    n_conv: int,
+    attn_bool: torch.Tensor | None = None,
+) -> torch.Tensor:
+    dt = cur.dtype
+    cf = cur.float()
+    if attn_bool is not None:
+        cf = cf.masked_fill(~attn_bool.unsqueeze(-1), 0.0)
+    x = F.pad(cf, (0, 0, n_conv - 1, 0))  # [B, n_conv - 1 + L, C]
+    out = F.conv1d(x.transpose(1, 2), weight.float().unsqueeze(1), groups=cf.shape[-1]).transpose(1, 2)
+    if dynamic is not None:
+        B, L, C = cf.shape
+        n_h = dynamic.shape[-1] // n_conv
+        dyn = dynamic.float().view(B, L, n_h, n_conv)
+        for lag in range(n_conv):
+            s = n_conv - 1 - lag
+            win = x[:, s : s + L, :].view(B, L, n_h, C // n_h)
+            out = out + (win * dyn[..., lag : lag + 1]).reshape(B, L, C)
+    denom = math.sqrt((2 if dynamic is not None else 1) * n_conv + 1)
+    return ((cf + out) / denom).to(dt)
+
+
+class Inkling2RMSNorm(nn.Module):
+    def __init__(self, n_embd: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(n_embd, dtype=torch.float32))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _inkling2_rms_norm(x, self.weight, self.eps)
+
+
+class Inkling2MoE(nn.Module):
+    def __init__(
+        self,
+        n_embd: int,
+        n_ff_exp: int,
+        n_expert: int,
+        n_expert_used: int,
+        situ_beta: float,
+        situ_linear_beta: float,
+        expert_weights_scale: float,
+        has_exp_probs_b: bool,
+    ):
+        super().__init__()
+        self.n_embd = n_embd
+        self.n_ff_exp = n_ff_exp
+        self.n_expert = n_expert
+        self.n_expert_used = n_expert_used
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
+        self.expert_weights_scale = expert_weights_scale
+        self.gate_inp = nn.Parameter(torch.empty(n_expert, n_embd, dtype=torch.float32))
+        self.exp_probs_b = nn.Parameter(torch.zeros(n_expert, dtype=torch.float32)) if has_exp_probs_b else None
+        self.gate_up_exps = nn.Parameter(torch.empty(n_expert, 2 * n_ff_exp, n_embd, dtype=torch.float32))
+        self.down_exps = nn.Parameter(torch.empty(n_expert, n_embd, n_ff_exp, dtype=torch.float32))
+        self.switch_hook = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, self.n_embd)
+        T = x_flat.shape[0]
+        if T == 0:
+            return torch.zeros_like(x)
+
+        logits = F.linear(x_flat.float(), self.gate_inp.float())
+        probs = torch.sigmoid(logits)
+        sel_probs = probs + self.exp_probs_b.float() if self.exp_probs_b is not None else probs
+        _, topk_idx = torch.topk(sel_probs, self.n_expert_used, dim=-1)
+        weights = torch.gather(probs, dim=-1, index=topk_idx)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if self.expert_weights_scale != 0.0 and self.expert_weights_scale != 1.0:
+            weights = weights * self.expert_weights_scale
+
+        flat_exp = topk_idx.reshape(-1)
+        flat_tok = torch.arange(T, device=x.device).unsqueeze(1).expand(T, self.n_expert_used).reshape(-1)
+        flat_w = weights.reshape(-1)
+        order = torch.argsort(flat_exp, stable=True)
+        exp_s = flat_exp[order]
+        tok_s = flat_tok[order]
+        w_s = flat_w[order]
+        counts = torch.bincount(exp_s, minlength=self.n_expert).tolist()
+
+        act_parts: list[torch.Tensor] = []
+        slices: list[tuple[int, int, int]] = []
+        off = 0
+        W = self.n_ff_exp
+        beta = self.situ_beta
+        lb = self.situ_linear_beta
+        for e, cnt in enumerate(counts):
+            if cnt == 0:
+                continue
+            x_e = x_flat[tok_s[off : off + cnt]]
+            gu = F.linear(x_e.to(self.gate_up_exps.dtype), self.gate_up_exps[e])
+            gate, up = gu[:, :W].float(), gu[:, W:].float()
+            act = (beta * torch.tanh(gate / beta) * torch.sigmoid(gate)) * (lb * torch.tanh(up / lb) if lb > 0.0 else up)
+            act_parts.append(act.to(x.dtype))
+            slices.append((e, off, cnt))
+            off += cnt
+
+        act_all = self.switch_hook(torch.cat(act_parts, dim=0))
+        out = torch.zeros((T, self.n_embd), device=x.device, dtype=torch.float32)
+        for e, s_off, cnt in slices:
+            act_e = act_all[s_off : s_off + cnt]
+            down_e = F.linear(act_e.to(self.down_exps.dtype), self.down_exps[e]).float()
+            out.index_add_(0, tok_s[s_off : s_off + cnt], down_e * w_s[s_off : s_off + cnt, None])
+        return out.reshape(orig_shape).to(x.dtype)
+
+
+class Inkling2LoopController(nn.Module):
+    def __init__(self, n_embd: int, gate_rank: int):
+        super().__init__()
+        self.msg_query = nn.Parameter(torch.empty(4, n_embd, dtype=torch.float32))
+        self.ctrl_down = nn.ParameterList([nn.Parameter(torch.empty(gate_rank, 2 * n_embd, dtype=torch.float32)) for _ in range(4)])
+        self.ctrl_gain = nn.ParameterList([nn.Parameter(torch.empty(n_embd, gate_rank, dtype=torch.float32)) for _ in range(4)])
+        self.ctrl_forget = nn.ParameterList([nn.Parameter(torch.empty(n_embd, gate_rank, dtype=torch.float32)) for _ in range(4)])
+
+    def control(self, cur: torch.Tensor, message: torch.Tensor, ctrl: int) -> torch.Tensor:
+        gate_in = torch.cat([_inkling2_rms_norm(cur, None, 1e-6), _inkling2_rms_norm(message, None, 1e-6)], dim=-1)
+        gate = F.linear(gate_in.to(self.ctrl_down[ctrl].dtype), self.ctrl_down[ctrl])
+        gain = torch.tanh(F.linear(gate.to(self.ctrl_gain[ctrl].dtype), self.ctrl_gain[ctrl]).float())
+        forget = torch.tanh(F.linear(gate.to(self.ctrl_forget[ctrl].dtype), self.ctrl_forget[ctrl]).float())
+        return (cur.float() - forget * cur.float() + gain * message.float()).to(cur.dtype)
+
+
+class Inkling2Attention(nn.Module):
+    def __init__(
+        self,
+        il: int,
+        n_embd: int,
+        n_head: int,
+        n_head_kv: int,
+        head_dim: int,
+        n_rel: int,
+        n_rel_ext: int,
+        n_swa: int,
+        n_conv: int,
+        is_swa: bool,
+        rms_eps: float,
+        f_qk_clip: float,
+        f_rel_clip: float,
+    ):
+        super().__init__()
+        self.il = il
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_head_kv = n_head_kv
+        self.head_dim = head_dim
+        self.n_rel = n_rel
+        self.n_extent = n_swa if is_swa else n_rel_ext
+        self.n_swa = n_swa
+        self.n_conv = n_conv
+        self.is_swa = is_swa
+        self.rms_eps = rms_eps
+        self.f_qk_clip = f_qk_clip
+        self.f_rel_clip = f_rel_clip
+
+        self.wq = nn.Parameter(torch.empty(n_head * head_dim, n_embd, dtype=torch.float32))
+        self.wk = nn.Parameter(torch.empty(n_head_kv * head_dim, n_embd, dtype=torch.float32))
+        self.wv = nn.Parameter(torch.empty(n_head_kv * head_dim, n_embd, dtype=torch.float32))
+        self.wo = nn.Parameter(torch.empty(n_embd, n_head * head_dim, dtype=torch.float32))
+        self.wqkv_gate = nn.Parameter(torch.empty(n_head * head_dim, n_embd, dtype=torch.float32))
+
+        self.attn_q_clip = nn.Parameter(torch.empty(n_head, head_dim, dtype=torch.float32))
+        self.attn_sink_proj = nn.Parameter(torch.empty(n_head, n_embd, dtype=torch.float32))
+        self.attn_rel = nn.Parameter(torch.empty(n_rel * n_head, n_embd, dtype=torch.float32))
+        self.attn_rel_bias = nn.Parameter(torch.empty(self.n_extent, n_rel, dtype=torch.float32))
+        self.attn_rel_clip = nn.Parameter(torch.empty(n_head, n_rel, dtype=torch.float32))
+
+        self.attn_k_conv = nn.Parameter(torch.empty(n_head_kv * head_dim, n_conv, dtype=torch.float32))
+        self.attn_v_conv = nn.Parameter(torch.empty(n_head_kv * head_dim, n_conv, dtype=torch.float32))
+        self.attn_post_conv = nn.Parameter(torch.empty(n_embd, n_conv, dtype=torch.float32))
+
+        if is_swa:
+            self.attn_norm = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+            self.attn_q_inp_norm = None
+            self.attn_k_inp_norm = None
+            self.attn_v_inp_norm = None
+            self.attn_k_conv_proj = None
+            self.attn_v_conv_proj = None
+        else:
+            self.attn_norm = None
+            self.attn_q_inp_norm = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+            self.attn_k_inp_norm = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+            self.attn_v_inp_norm = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+            self.attn_k_conv_proj = nn.Parameter(torch.empty(n_conv * n_head_kv, n_embd, dtype=torch.float32))
+            self.attn_v_conv_proj = nn.Parameter(torch.empty(n_conv * n_head_kv, n_embd, dtype=torch.float32))
+
+        self.attn_res_query = nn.Parameter(torch.empty(1 if is_swa else 3, n_embd, dtype=torch.float32)) if il > 0 else None
+
+    def forward(
+        self,
+        cur: torch.Tensor,
+        blocks: list[torch.Tensor],
+        pos: torch.Tensor,
+        tau: torch.Tensor,
+        attn_bool: torch.Tensor,
+        messages: torch.Tensor | None = None,
+        loop: Inkling2LoopController | None = None,
+    ) -> torch.Tensor:
+        B, L, _ = cur.shape
+        if self.attn_res_query is not None:
+            mixed = _inkling2_mix(blocks, cur, self.attn_res_query, self.n_embd)
+            if self.is_swa:
+                x0 = mixed[:, :, 0, :]
+                inputs = [x0, x0, x0]
+            else:
+                inputs = [mixed[:, :, 0, :], mixed[:, :, 1, :], mixed[:, :, 2, :]]
+        else:
+            inputs = [cur, cur, cur]
+
+        if messages is not None and loop is not None:
+            inputs = [loop.control(inputs[j], messages[:, :, j, :], j) for j in range(3)]
+
+        if self.is_swa and messages is not None:
+            inputs = [_inkling2_rms_norm(inputs[j], self.attn_norm, self.rms_eps) for j in range(3)]
+        elif self.is_swa:
+            n0 = _inkling2_rms_norm(inputs[0], self.attn_norm, self.rms_eps)
+            inputs = [n0, n0, n0]
+        else:
+            inputs = [
+                _inkling2_rms_norm(inputs[0], self.attn_q_inp_norm, self.rms_eps),
+                _inkling2_rms_norm(inputs[1], self.attn_k_inp_norm, self.rms_eps),
+                _inkling2_rms_norm(inputs[2], self.attn_v_inp_norm, self.rms_eps),
+            ]
+
+        q = F.linear(inputs[0].to(self.wq.dtype), self.wq)
+        k_proj = F.linear(inputs[1].to(self.wk.dtype), self.wk)
+        k_dyn = None if self.is_swa else F.linear(inputs[1].to(self.attn_k_conv_proj.dtype), self.attn_k_conv_proj)
+        k = _inkling2_convolve(k_proj, self.attn_k_conv, k_dyn, self.n_conv, attn_bool)
+        v_proj = F.linear(inputs[2].to(self.wv.dtype), self.wv)
+        v_dyn = None if self.is_swa else F.linear(inputs[2].to(self.attn_v_conv_proj.dtype), self.attn_v_conv_proj)
+        v = _inkling2_convolve(v_proj, self.attn_v_conv, v_dyn, self.n_conv, attn_bool)
+        r = F.linear(inputs[0].to(self.attn_rel.dtype), self.attn_rel)
+
+        q = _inkling2_clip(q.view(B, L, self.n_head, self.head_dim), self.attn_q_clip, self.f_qk_clip)
+        k = _inkling2_clip(k.view(B, L, self.n_head_kv, self.head_dim), None, self.f_qk_clip)
+        v = _inkling2_rms_norm(v.view(B, L, self.n_head_kv, self.head_dim), None, self.rms_eps)
+        r = _inkling2_clip(r.view(B, L, self.n_head, self.n_rel), self.attn_rel_clip, self.f_rel_clip)
+
+        if not self.is_swa:
+            tau_b = tau[:, :, None, None]
+            q = (q.float() * tau_b).to(q.dtype)
+            r = (r.float() * tau_b).to(r.dtype)
+
+        sinks = F.linear(inputs[0].to(self.attn_sink_proj.dtype), self.attn_sink_proj)
+        bias_pad = F.pad(self.attn_rel_bias.float(), (0, 0, 0, 1))  # [n_extent + 1, n_rel]
+        table = torch.matmul(r.float(), bias_pad.t()) - sinks.float().unsqueeze(-1)  # [B, L, H, n_extent + 1]
+
+        dist = pos[:, :, None] - pos[:, None, :]
+        rel_pos = torch.where((dist >= 0) & (dist < self.n_extent), dist, self.n_extent)
+        kq_b = torch.gather(table, dim=3, index=rel_pos.unsqueeze(2).expand(B, L, self.n_head, L)).permute(0, 2, 1, 3)
+
+        if self.n_head != self.n_head_kv:
+            rep = self.n_head // self.n_head_kv
+            k_exp = k.unsqueeze(3).expand(B, L, self.n_head_kv, rep, self.head_dim).reshape(B, L, self.n_head, self.head_dim)
+            v_exp = v.unsqueeze(3).expand(B, L, self.n_head_kv, rep, self.head_dim).reshape(B, L, self.n_head, self.head_dim)
+        else:
+            k_exp, v_exp = k, v
+
+        scores = torch.matmul(q.permute(0, 2, 1, 3).float(), k_exp.permute(0, 2, 3, 1).float()) * (1.0 / math.sqrt(self.head_dim)) + kq_b
+
+        idx = torch.arange(L, device=cur.device)
+        allowed = (idx[None, :] <= idx[:, None]).unsqueeze(0).unsqueeze(0) & attn_bool[:, None, None, :]
+        if self.is_swa:
+            allowed = allowed & ((pos[:, :, None] - pos[:, None, :]) < self.n_swa).unsqueeze(1)
+        scores = scores.masked_fill(~allowed, float("-inf"))
+
+        m = torch.clamp(scores.max(dim=-1, keepdim=True).values, min=0.0)
+        ex = torch.exp(scores - m)
+        probs = ex / (ex.sum(dim=-1, keepdim=True) + torch.exp(-m))
+
+        attn_v = torch.matmul(probs, v_exp.permute(0, 2, 1, 3).float()).permute(0, 2, 1, 3).reshape(B, L, self.n_head * self.head_dim).to(inputs[0].dtype)
+        gate = torch.sigmoid(F.linear(inputs[0].to(self.wqkv_gate.dtype), self.wqkv_gate).float()).to(attn_v.dtype)
+        wo_out = F.linear((attn_v * gate).to(self.wo.dtype), self.wo)
+        return _inkling2_convolve(wo_out, self.attn_post_conv, None, self.n_conv, attn_bool)
+
+
+class Inkling2Layer(nn.Module):
+    def __init__(
+        self,
+        il: int,
+        n_embd: int,
+        n_head: int,
+        n_head_kv: int,
+        head_dim: int,
+        n_ff_exp: int,
+        n_expert: int,
+        n_expert_used: int,
+        n_rel: int,
+        n_rel_ext: int,
+        n_swa: int,
+        n_conv: int,
+        is_swa: bool,
+        rms_eps: float,
+        f_qk_clip: float,
+        f_rel_clip: float,
+        situ_beta: float,
+        situ_linear_beta: float,
+        expert_weights_scale: float,
+        block_size: int,
+        has_exp_probs_b: bool,
+    ):
+        super().__init__()
+        self.il = il
+        self.n_embd = n_embd
+        self.n_conv = n_conv
+        self.rms_eps = rms_eps
+        self.block_size = block_size
+        self.self_attn = Inkling2Attention(
+            il, n_embd, n_head, n_head_kv, head_dim, n_rel, n_rel_ext, n_swa, n_conv, is_swa, rms_eps, f_qk_clip, f_rel_clip
+        )
+        self.mlp = Inkling2MoE(
+            n_embd, n_ff_exp, n_expert, n_expert_used, situ_beta, situ_linear_beta, expert_weights_scale, has_exp_probs_b
+        )
+        self.ffn_res_query = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+        self.ffn_norm = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+        self.ffn_post_conv = nn.Parameter(torch.empty(n_embd, n_conv, dtype=torch.float32))
+
+    def forward(
+        self,
+        ip: int,
+        cur: torch.Tensor,
+        blocks: list[torch.Tensor],
+        pos: torch.Tensor,
+        tau: torch.Tensor,
+        attn_bool: torch.Tensor,
+        messages: torch.Tensor | None = None,
+        loop: Inkling2LoopController | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        inp_sa = cur
+        attn_out = self.self_attn(cur, blocks, pos, tau, attn_bool, messages=messages, loop=loop)
+        if ip % self.block_size == 0:
+            new_block = inp_sa
+            ffn_inp = attn_out
+            blocks_for_ffn = [*blocks, new_block]
+        else:
+            new_block = None
+            ffn_inp = inp_sa + attn_out
+            blocks_for_ffn = blocks
+
+        ffn_mix = _inkling2_mix(blocks_for_ffn, ffn_inp, self.ffn_res_query.unsqueeze(0), self.n_embd)[:, :, 0, :]
+        if messages is not None and loop is not None:
+            ffn_mix = loop.control(ffn_mix, messages[:, :, 3, :], 3)
+        ffn_in = _inkling2_rms_norm(ffn_mix, self.ffn_norm, self.rms_eps)
+        moe_out = self.mlp(ffn_in)
+        ffn_out = _inkling2_convolve(moe_out, self.ffn_post_conv, None, self.n_conv, attn_bool)
+        return ffn_inp + ffn_out, new_block
+
+
+class Inkling2LoopBackbone(nn.Module):
+    def __init__(
+        self,
+        config: SimpleNamespace,
+        n_vocab_padded: int,
+        n_embd: int,
+        rms_eps: float,
+        log_scale_floor: int,
+        log_scale_alpha: float,
+        layers: nn.ModuleList,
+        loop_layers: nn.ModuleList,
+    ):
+        super().__init__()
+        self.config = config
+        self.n_embd = n_embd
+        self.log_scale_floor = log_scale_floor
+        self.log_scale_alpha = log_scale_alpha
+        self.loop_start = int(getattr(config, "loop_start", 0) or 0)
+        self.loop_end = int(getattr(config, "loop_end", 0) or 0)
+        self.loop_count = int(getattr(config, "loop_count", 1) or 1)
+        self._grad_ckpt = False
+        self._gc_kwargs: dict | None = None
+
+        self.embed_tokens = nn.Embedding(n_vocab_padded, n_embd, dtype=torch.float32)
+        self.tok_norm = Inkling2RMSNorm(n_embd, rms_eps)
+        self.layers = layers
+        self.loop_layers = loop_layers
+        self.output_res_query = nn.Parameter(torch.empty(n_embd, dtype=torch.float32))
+        self.norm = Inkling2RMSNorm(n_embd, rms_eps)
+
+    def _pos_and_tau(self, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_bool = attention_mask > 0
+        pos = torch.clamp(attn_bool.long().cumsum(dim=-1) - 1, min=0)
+        tau = 1.0 + self.log_scale_alpha * torch.log(torch.clamp((pos.float() + 1.0) / float(self.log_scale_floor), min=1.0))
+        return pos, attn_bool, tau
+
+    def _run_layer_ckpt(
+        self,
+        layer: Inkling2Layer,
+        ip: int,
+        h: torch.Tensor,
+        blocks: list[torch.Tensor],
+        pos: torch.Tensor,
+        tau: torch.Tensor,
+        attn_bool: torch.Tensor,
+        messages: torch.Tensor | None = None,
+        loop: Inkling2LoopController | None = None,
+        grad_ckpt: bool = False,
+        gc_kwargs: dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if grad_ckpt and self.training and torch.is_grad_enabled():
+            n_b = len(blocks)
+
+            def _fn(cur_in: torch.Tensor, *blk_args: torch.Tensor):
+                res_h, res_b = layer(ip, cur_in, list(blk_args[:n_b]), pos, tau, attn_bool, messages=messages, loop=loop)
+                if res_b is None:
+                    return (res_h,)
+                return (res_h, res_b)
+
+            kw = dict(gc_kwargs or {})
+            kw.setdefault("use_reentrant", False)
+            out = torch.utils.checkpoint.checkpoint(_fn, h, *blocks, **kw)
+            return (out[0], out[1]) if len(out) == 2 else (out[0], None)
+        return layer(ip, h, blocks, pos, tau, attn_bool, messages=messages, loop=loop)
+
+    def forward_prefix(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        start_layer: int,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        pos, attn_bool, tau = self._pos_and_tau(attention_mask)
+        h = self.tok_norm(self.embed_tokens(input_ids))
+        blocks: list[torch.Tensor] = []
+        has_loop = self.loop_end > self.loop_start and self.loop_layers is not None and len(self.loop_layers) > 0 and start_layer >= self.loop_end
+        pre_end = self.loop_start if has_loop else start_layer
+        for ip in range(pre_end):
+            h, new_b = self.layers[ip](ip, h, blocks, pos, tau, attn_bool)
+            if new_b is not None:
+                blocks.append(new_b)
+        if has_loop:
+            prelude = h
+            prelude_blocks = list(blocks)
+            for pass_idx in range(self.loop_count):
+                if pass_idx > 0:
+                    bank = blocks[len(prelude_blocks) + 1 :]
+                    bank_out = h
+                    h = prelude
+                    blocks = list(prelude_blocks)
+                for ip in range(self.loop_start, self.loop_end):
+                    if pass_idx == 0:
+                        h, new_b = self.layers[ip](ip, h, blocks, pos, tau, attn_bool)
+                    else:
+                        loop_mod = self.loop_layers[ip - self.loop_start]
+                        msgs = _inkling2_mix(bank, bank_out, loop_mod.msg_query, self.n_embd)
+                        h, new_b = self.layers[ip](ip, h, blocks, pos, tau, attn_bool, messages=msgs, loop=loop_mod)
+                    if new_b is not None:
+                        blocks.append(new_b)
+            for ip in range(self.loop_end, start_layer):
+                h, new_b = self.layers[ip](ip, h, blocks, pos, tau, attn_bool)
+                if new_b is not None:
+                    blocks.append(new_b)
+        return h, blocks
+
+    def forward_tail(
+        self,
+        h: torch.Tensor,
+        blocks: list[torch.Tensor],
+        attention_mask: torch.Tensor,
+        start_layer: int,
+        grad_ckpt: bool = False,
+        gc_kwargs: dict | None = None,
+    ) -> torch.Tensor:
+        pos, attn_bool, tau = self._pos_and_tau(attention_mask)
+        for ip in range(start_layer, len(self.layers)):
+            h, new_b = self._run_layer_ckpt(
+                self.layers[ip], ip, h, blocks, pos, tau, attn_bool,
+                grad_ckpt=grad_ckpt, gc_kwargs=gc_kwargs,
+            )
+            if new_b is not None:
+                blocks.append(new_b)
+        return _inkling2_mix(blocks, h, self.output_res_query.unsqueeze(0), self.n_embd)[:, :, 0, :]
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, use_cache: bool = False, **_):
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        pos, attn_bool, tau = self._pos_and_tau(attention_mask)
+        h = self.tok_norm(self.embed_tokens(input_ids))
+        blocks: list[torch.Tensor] = []
+        has_loop = self.loop_end > self.loop_start and self.loop_layers is not None and len(self.loop_layers) > 0
+        n_phys = len(self.layers)
+        pre_end = self.loop_start if has_loop else n_phys
+        for ip in range(pre_end):
+            h, new_b = self._run_layer_ckpt(
+                self.layers[ip], ip, h, blocks, pos, tau, attn_bool,
+                grad_ckpt=self._grad_ckpt, gc_kwargs=self._gc_kwargs,
+            )
+            if new_b is not None:
+                blocks.append(new_b)
+        if has_loop:
+            prelude = h
+            prelude_blocks = list(blocks)
+            for pass_idx in range(self.loop_count):
+                if pass_idx > 0:
+                    bank = blocks[len(prelude_blocks) + 1 :]
+                    bank_out = h
+                    h = prelude
+                    blocks = list(prelude_blocks)
+                for ip in range(self.loop_start, self.loop_end):
+                    if pass_idx == 0:
+                        h, new_b = self._run_layer_ckpt(
+                            self.layers[ip], ip, h, blocks, pos, tau, attn_bool,
+                            grad_ckpt=self._grad_ckpt, gc_kwargs=self._gc_kwargs,
+                        )
+                    else:
+                        loop_mod = self.loop_layers[ip - self.loop_start]
+                        msgs = _inkling2_mix(bank, bank_out, loop_mod.msg_query, self.n_embd)
+                        h, new_b = self._run_layer_ckpt(
+                            self.layers[ip], ip, h, blocks, pos, tau, attn_bool,
+                            messages=msgs, loop=loop_mod,
+                            grad_ckpt=self._grad_ckpt, gc_kwargs=self._gc_kwargs,
+                        )
+                    if new_b is not None:
+                        blocks.append(new_b)
+            for ip in range(self.loop_end, n_phys):
+                h, new_b = self._run_layer_ckpt(
+                    self.layers[ip], ip, h, blocks, pos, tau, attn_bool,
+                    grad_ckpt=self._grad_ckpt, gc_kwargs=self._gc_kwargs,
+                )
+                if new_b is not None:
+                    blocks.append(new_b)
+        h = _inkling2_mix(blocks, h, self.output_res_query.unsqueeze(0), self.n_embd)[:, :, 0, :]
+        h = self.norm(h)
+        return SimpleNamespace(last_hidden_state=h)
+
+
+class Inkling2LoopStudent(nn.Module):
+    def __init__(self, config: SimpleNamespace, model: Inkling2LoopBackbone, n_embd: int, n_vocab_unpadded: int):
+        super().__init__()
+        self.config = config
+        self.model = model
+        self.lm_head = nn.Linear(n_embd, n_vocab_unpadded, bias=False, dtype=torch.float32)
+        self.is_gradient_checkpointing = False
+        self._gc_kwargs: dict | None = None
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict | None = None) -> None:
+        self.is_gradient_checkpointing = True
+        self._gc_kwargs = dict(gradient_checkpointing_kwargs) if gradient_checkpointing_kwargs else None
+        self.model._grad_ckpt = True
+        self.model._gc_kwargs = self._gc_kwargs
+
+
+def _build_inkling2_student(
+    art: lattice.Artifact,
+    kvs: dict,
+    arch: str,
+    ggml_lib: str | None,
+    device: str = "cpu",
+    frozen_bf16: bool = False,
+) -> Inkling2LoopStudent:
+    p = f"{arch}."
+    n_phys = int(kvs[f"{p}block_count"])
+    n_embd = int(kvs[f"{p}embedding_length"])
+    n_vocab_padded = int(kvs[f"{p}vocab_size"])
+    n_vocab_unpadded = int(kvs[f"{p}vocab_size_unpadded"])
+    n_expert = int(kvs[f"{p}expert_count"])
+    rms_eps = float(kvs[f"{p}attention.layer_norm_rms_epsilon"])
+    f_qk_clip = float(kvs[f"{p}attention.qk_clip"])
+    block_size = int(kvs[f"{p}attn_res.block_size"])
+    n_conv = int(kvs[f"{p}shortconv.l_cache"])
+    n_rel = int(kvs[f"{p}attention.relative_length"])
+    n_rel_ext = int(kvs[f"{p}attention.relative_extent"])
+    f_rel_clip = float(kvs[f"{p}attention.relative_clip"])
+    log_scale_floor = int(kvs[f"{p}attention.log_scale_floor"])
+    log_scale_alpha = float(kvs[f"{p}attention.log_scale_alpha"])
+    situ_beta = float(kvs[f"{p}activation.situ_beta"])
+    situ_linear_beta = float(kvs[f"{p}activation.situ_linear_beta"])
+    n_swa = int(kvs[f"{p}attention.sliding_window"])
+    swa_pattern = [bool(x) for x in kvs[f"{p}attention.sliding_window_pattern"]]
+    expert_weights_scale = float(kvs.get(f"{p}expert_weights_scale", 0.0) or 0.0)
+    softcap = float(kvs.get(f"{p}final_logit_softcapping", 0.0) or 0.0)
+
+    def _per_layer(key: str, default=None) -> list[int]:
+        v = kvs.get(key, default)
+        if isinstance(v, (list, tuple)):
+            return [int(v[i]) for i in range(n_phys)]
+        return [int(v)] * n_phys
+
+    n_head_arr = _per_layer(f"{p}attention.head_count")
+    n_head_kv_arr = _per_layer(f"{p}attention.head_count_kv", kvs[f"{p}attention.head_count"])
+    n_expert_used_arr = _per_layer(f"{p}expert_used_count")
+    n_ff_exp_arr = _per_layer(f"{p}expert_feed_forward_length")
+    head_dim_full = int(kvs.get(f"{p}attention.key_length") or (n_embd // n_head_arr[0]))
+    head_dim_swa = int(kvs.get(f"{p}attention.key_length_swa") or head_dim_full)
+
+    if arch == "inkling2_loop":
+        loop_start = int(kvs[f"{p}loop.start"])
+        loop_end = int(kvs[f"{p}loop.end"])
+        loop_count = int(kvs[f"{p}loop.count"])
+        gate_rank = int(kvs[f"{p}loop.gate_rank"])
+    else:
+        loop_start = 0
+        loop_end = 0
+        loop_count = 1
+        gate_rank = 0
+
+    cfg = SimpleNamespace(
+        model_type=arch,
+        num_hidden_layers=n_phys,
+        hidden_size=n_embd,
+        final_logit_softcapping=softcap,
+        loop_start=loop_start,
+        loop_end=loop_end,
+        loop_count=loop_count,
+        attn_res_block_size=block_size,
+    )
+
+    layers = nn.ModuleList()
+    for il in range(n_phys):
+        is_swa = swa_pattern[il]
+        hd = head_dim_swa if is_swa else head_dim_full
+        layers.append(
+            Inkling2Layer(
+                il=il,
+                n_embd=n_embd,
+                n_head=n_head_arr[il],
+                n_head_kv=n_head_kv_arr[il],
+                head_dim=hd,
+                n_ff_exp=n_ff_exp_arr[il],
+                n_expert=n_expert,
+                n_expert_used=n_expert_used_arr[il],
+                n_rel=n_rel,
+                n_rel_ext=n_rel_ext,
+                n_swa=n_swa,
+                n_conv=n_conv,
+                is_swa=is_swa,
+                rms_eps=rms_eps,
+                f_qk_clip=f_qk_clip,
+                f_rel_clip=f_rel_clip,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                expert_weights_scale=expert_weights_scale,
+                block_size=block_size,
+                has_exp_probs_b=(f"blk.{il}.exp_probs_b.bias" in art.tensors),
+            )
+        )
+
+    loop_layers = nn.ModuleList(
+        [Inkling2LoopController(n_embd, gate_rank) for _ in range(loop_start, loop_end)]
+        if arch == "inkling2_loop" and loop_end > loop_start
+        else []
+    )
+
+    backbone = Inkling2LoopBackbone(cfg, n_vocab_padded, n_embd, rms_eps, log_scale_floor, log_scale_alpha, layers, loop_layers)
+    student = Inkling2LoopStudent(cfg, backbone, n_embd, n_vocab_unpadded)
+
+    f32_params: set[int] = set()
+
+    def _load(param: torch.Tensor, gg_name: str, sl: slice | None = None) -> None:
+        if art.tensors[gg_name]["type"] == "F32":
+            f32_params.add(id(param))
+        arr = floats(art, gg_name, ggml_lib).copy()
+        if sl is not None:
+            arr = arr[sl]
+        t = torch.from_numpy(arr)
+        if t.shape != param.shape and tuple(d for d in param.shape if d != 1) == tuple(d for d in t.shape if d != 1):
+            t = t.reshape(param.shape)
+        assert param.shape == t.shape, (gg_name, param.shape, t.shape)
+        param.data.copy_(t)
+
+    _load(backbone.embed_tokens.weight, "token_embd.weight")
+    _load(backbone.tok_norm.weight, "token_embd_norm.weight")
+    _load(student.lm_head.weight, "output.weight", slice(0, n_vocab_unpadded))
+    _load(backbone.norm.weight, "output_norm.weight")
+    _load(backbone.output_res_query, "output_res_query.weight")
+
+    for il, layer in enumerate(layers):
+        bp = f"blk.{il}."
+        sa = layer.self_attn
+        _load(sa.wq, bp + "attn_q.weight")
+        _load(sa.wk, bp + "attn_k.weight")
+        _load(sa.wv, bp + "attn_v.weight")
+        _load(sa.wo, bp + "attn_output.weight")
+        _load(sa.wqkv_gate, bp + "attn_gate.weight")
+        _load(sa.attn_q_clip, bp + "attn_q_clip.weight")
+        _load(sa.attn_sink_proj, bp + "attn_sink_proj.weight")
+        _load(sa.attn_rel, bp + "attn_rel.weight")
+        _load(sa.attn_rel_bias, bp + "attn_rel_bias.weight")
+        _load(sa.attn_rel_clip, bp + "attn_rel_clip.weight")
+        _load(sa.attn_k_conv, bp + "attn_k_conv.weight")
+        _load(sa.attn_v_conv, bp + "attn_v_conv.weight")
+        _load(sa.attn_post_conv, bp + "attn_post_conv.weight")
+        _load(layer.ffn_post_conv, bp + "ffn_post_conv.weight")
+        if sa.is_swa:
+            _load(sa.attn_norm, bp + "attn_norm.weight")
+        else:
+            _load(sa.attn_q_inp_norm, bp + "attn_q_inp_norm.weight")
+            _load(sa.attn_k_inp_norm, bp + "attn_k_inp_norm.weight")
+            _load(sa.attn_v_inp_norm, bp + "attn_v_inp_norm.weight")
+            _load(sa.attn_k_conv_proj, bp + "attn_k_conv_proj.weight")
+            _load(sa.attn_v_conv_proj, bp + "attn_v_conv_proj.weight")
+        if sa.attn_res_query is not None:
+            _load(sa.attn_res_query, bp + "attn_res_query.weight")
+        _load(layer.ffn_res_query, bp + "ffn_res_query.weight")
+        _load(layer.ffn_norm, bp + "ffn_norm.weight")
+        _load(layer.mlp.gate_inp, bp + "ffn_gate_inp.weight")
+        if layer.mlp.exp_probs_b is not None:
+            _load(layer.mlp.exp_probs_b, bp + "exp_probs_b.bias")
+        _load(layer.mlp.gate_up_exps, bp + "ffn_gate_up_exps.weight")
+        _load(layer.mlp.down_exps, bp + "ffn_down_exps.weight")
+
+    if arch == "inkling2_loop":
+        for idx_l, lc in enumerate(loop_layers):
+            ip = loop_start + idx_l
+            bp = f"blk.{ip}."
+            _load(lc.msg_query, bp + "loop_msg_query.weight")
+            for c_idx, cname in enumerate(("q", "k", "v", "ffn")):
+                _load(lc.ctrl_down[c_idx], bp + f"loop_{cname}_ctrl_down.weight")
+                _load(lc.ctrl_gain[c_idx], bp + f"loop_{cname}_ctrl_gain.weight")
+                _load(lc.ctrl_forget[c_idx], bp + f"loop_{cname}_ctrl_forget.weight")
+
+    for param in student.parameters():
+        param.requires_grad_(False)
+    if frozen_bf16:
+        for param in student.parameters():
+            if param.ndim >= 2 and param.dtype == torch.float32 and id(param) not in f32_params:
+                param.data = param.data.to(torch.bfloat16)
+    student.to(device)
+    student.eval()
+    return student
+
+
+def build_student(art: lattice.Artifact, config_dir: str | Path | None, train: list[str], ggml_lib: str | None, device: str = "cpu",
                   latents: dict[str, np.ndarray] | None = None, frozen_bf16: bool = False):
     """The file as a PyTorch model. `latents` holds float32 arrays in torch shape, one per `train` tensor, the floats this file
     was built from: they sit behind its grids in place of the grid centres, so what training learned below one level survives
     a rebuild. The rounded student must still equal the file, level for level."""
-    import torch
     from torch.nn.utils import parametrize
     from transformers import AutoConfig, AutoModelForCausalLM
+
+    kvs = art.h.parsed_kvs(skip_large_arrays=True)
+    arch = str(getattr(art.h, "arch", None) or kvs.get("general.architecture", "") or "")
+    if arch in ("inkling2", "inkling2_loop"):
+        if train or latents:
+            raise NotImplementedError("grid-level learning is not supported for inkling2/inkling2_loop; use learn_gates_seq")
+        return _build_inkling2_student(art, kvs, arch, ggml_lib, device=device, frozen_bf16=frozen_bf16), {}
+    if not config_dir:
+        raise ValueError(f"config_dir is required to build student for architecture {arch!r}")
+    config_dir = str(config_dir)
 
     class Zero(nn.Module):
         def __init__(self, pair: bool):
@@ -210,6 +978,35 @@ def build_student(art: lattice.Artifact, config_dir: str, train: list[str], ggml
     buffers = dict(model.named_buffers())
     for name in art.tensors:
         if name == "rope_freqs.weight":
+            continue
+        p_parts = name.split(".")
+        if len(p_parts) >= 3 and p_parts[0] == "blk" and p_parts[2] in ("attn_qkv_gate", "ssm_beta_alpha"):
+            il = p_parts[1]
+            v = torch.from_numpy(floats(art, name, ggml_lib).copy())
+            if p_parts[2] == "attn_qkv_gate":
+                n_z = num_v_heads * head_v_dim
+                n_qkv = v.shape[0] - n_z
+                split_pairs = (
+                    (f"model.layers.{il}.linear_attn.in_proj_qkv.weight", v[:n_qkv]),
+                    (f"model.layers.{il}.linear_attn.in_proj_z.weight", v[n_qkv:]),
+                )
+            else:
+                split_pairs = (
+                    (f"model.layers.{il}.linear_attn.in_proj_b.weight", v[:num_v_heads]),
+                    (f"model.layers.{il}.linear_attn.in_proj_a.weight", v[num_v_heads:]),
+                )
+            for hfn_s, part in split_pairs:
+                part = part.contiguous()
+                if unreorder_gdn_v:
+                    if ".in_proj_qkv." in hfn_s:
+                        part = torch.cat([part[: 2 * qk_half], _unreorder_v(part[2 * qk_half :], 0, head_v_dim)], dim=0)
+                    elif ".in_proj_z." in hfn_s:
+                        part = _unreorder_v(part, 0, head_v_dim)
+                    elif ".in_proj_a." in hfn_s or ".in_proj_b." in hfn_s:
+                        part = _unreorder_v(part, 0, 1)
+                p = params[hfn_s]
+                assert p.shape == part.shape, (name, hfn_s, p.shape, part.shape)
+                p.data = part
             continue
         hfn = hf_name(name, is_gemma4=is_gemma4)
         if hfn == "lm_head.weight" and hfn not in params:
@@ -384,10 +1181,13 @@ def margin_loss(s, y, cutoff, margin):
 def kl_vector(model, h, target_h, temp):
     """KL between whole output distributions, softened by `temp` so the mass beyond the two answer tokens counts."""
     import torch
-    dt = model.lm_head.weight.dtype
-    logq = torch.log_softmax(model.lm_head(h.to(dt)).float() / temp, -1)
-    t = torch.softmax(model.lm_head(target_h.to(dt)).float() / temp, -1)
-    return (t * (t.clamp_min(1e-12).log() - logq)).sum(-1).mean() * temp * temp
+    t_val = float(temp)
+    if not math.isfinite(t_val) or t_val <= 0:
+        raise ValueError(f"kl_vector requires finite temp > 0, got {temp!r}")
+    logq = torch.log_softmax(_head_logits(model, h) / t_val, dim=-1)
+    logt = torch.log_softmax(_head_logits(model, target_h) / t_val, dim=-1)
+    t = logt.exp()
+    return (t * (logt - logq)).sum(dim=-1).mean() * (t_val * t_val)
 
 
 def kl_hold(s, s0, y, cutoff, temp):
@@ -426,22 +1226,29 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
     documents together under that many padded tokens. `on_step(step, opt, losses)` runs after each update, gradients in place."""
     import torch
 
-    budget = cfg.get("score_budget", 40000)
+    budget = 40000 if cfg.get("score_budget") is None else int(cfg["score_budget"])
     if anchor is None:
         base = torch.from_numpy(score_all(model, replay, pair, device, amp, budget, prefix_cache=prefix_cache)).float().to(device)
     else:
         base = torch.from_numpy(np.asarray(anchor["base"], dtype=np.float32)).to(device)
         assert len(base) == len(replay)
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0, eps=float(cfg.get("adam_eps", 1e-8)))
+    adam_eps = 1e-8 if cfg.get("adam_eps") is None else float(cfg["adam_eps"])
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0, eps=adam_eps)
     flat = [w for g in params for w in g["params"]] if isinstance(params[0], dict) else params
-    rng = random.Random(cfg.get("seed", 20261031))
-    steps, nf, nr = cfg.get("steps", 200), cfg.get("feedback_batch", 8), cfg.get("replay_batch", 16)
+    rng = random.Random(20261031 if cfg.get("seed") is None else cfg["seed"])
+    steps = 200 if cfg.get("steps") is None else int(cfg["steps"])
+    nf = 8 if cfg.get("feedback_batch") is None else int(cfg["feedback_batch"])
+    nr = 16 if cfg.get("replay_batch") is None else int(cfg["replay_batch"])
+    if nf < 0 or nr < 0:
+        raise ValueError(f"feedback_batch and replay_batch must be >= 0, got {nf!r}, {nr!r}")
     zu = cfg.get("z_units")
     unit = (lambda s, c=zu: (s - c["cut"]) / (c["med"] - c["cut"]) / zu["tau"]) if zu else (lambda s: s)
     if zu:
         base, cutoff = unit(base, anchor or zu), 0.0
-    margin, hold = cfg.get("margin", 0.0 if zu else 1.0), cfg.get("replay_weight", 1.0)
-    pair_margin, pair_weight = cfg.get("pair_margin", 0.0 if zu else 2.0), cfg.get("pair_weight", 1.0)
+    margin = (0.0 if zu else 1.0) if cfg.get("margin") is None else float(cfg["margin"])
+    hold = 1.0 if cfg.get("replay_weight") is None else float(cfg["replay_weight"])
+    pair_margin = (0.0 if zu else 2.0) if cfg.get("pair_margin") is None else float(cfg["pair_margin"])
+    pair_weight = 1.0 if cfg.get("pair_weight") is None else float(cfg["pair_weight"])
     by_pair, shares = {}, {}
     for r in feedback:
         if r.get("pair") is not None:
@@ -449,16 +1256,20 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         if r.get("share"):
             shares.setdefault(r["share"], []).append(r)
     pairs = [(v["human"], v["ai"]) for v in by_pair.values() if len(v) == 2]
+    strata_eff = list(strata) if strata is not None else ["all"] * len(replay)
     pools = {}
-    for i, g in enumerate(strata or ["all"] * len(replay)):
+    for i, g in enumerate(strata_eff):
         pools.setdefault(g, []).append(i)
     names_s, names_f = sorted(pools), sorted(shares)
-    guard = cfg.get("guard_weight", 0.0)
+    guard = 0.0 if cfg.get("guard_weight") is None else float(cfg["guard_weight"])
     log(f"learn: {sum(w.numel() for w in flat):,} parameters, {len(feedback)} feedback, {len(pairs)} pairs, {len(replay)} replay")
-    kind, cap = cfg.get("hold_kind"), cfg.get("train_budget", 3072 if amp else None)
+    kind = cfg.get("hold_kind")
+    cap = (3072 if amp else None) if cfg.get("train_budget") is None else cfg["train_budget"]
     vec = kind == "klvec"
     if vec:
-        if anchor is not None and "h0" in anchor:
+        if not replay:
+            h0 = torch.empty((0, 0), device=device)
+        elif anchor is not None and "h0" in anchor:
             h0 = torch.from_numpy(np.asarray(anchor["h0"], dtype=np.float32)).to(device)
         else:
             hs = []
@@ -468,52 +1279,88 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
             h0 = torch.zeros(len(replay), hs[0][1].shape[1], device=device)
             for b, h in hs:
                 h0[b] = h
-        y0 = torch.tensor([1.0 if g.startswith("human") else -1.0 for g in strata], device=device)
+        y0 = torch.tensor([1.0 if g.startswith("human") else -1.0 for g in strata_eff], device=device)
         right = ((base > cutoff).float() * 2 - 1) == y0
+        fallback_h = h0.mean(0) if len(h0) > 0 else None
         centre = {}
         for v, cls in ((1.0, y0 > 0), (-1.0, y0 < 0)):
             good = right & cls
-            centre[v] = h0[good if good.any() else cls].mean(0)
+            if good.any():
+                centre[v] = h0[good].mean(0)
+            elif cls.any():
+                centre[v] = h0[cls].mean(0)
+            elif fallback_h is not None:
+                centre[v] = fallback_h
         log(f"learn: vector KL, {int(right.sum())} of {len(replay)} replay documents start right")
-    tau, recent = zu["tau"] if zu else cfg.get("keep_tau", 0.5), {g: deque(maxlen=cfg.get("keep_window", 64)) for g in names_s}
+    keep_tau = 0.5 if cfg.get("keep_tau") is None else float(cfg["keep_tau"])
+    keep_window = 64 if cfg.get("keep_window") is None else int(cfg["keep_window"])
+    tau, recent = zu["tau"] if zu else keep_tau, {g: deque(maxlen=keep_window) for g in names_s}
+    kl_temp_vec = 4.0 if cfg.get("kl_temp") is None else float(cfg["kl_temp"])
+    kl_temp_hold = 1.0 if cfg.get("kl_temp") is None else float(cfg["kl_temp"])
+    sep_humans = "human" if cfg.get("sep_humans") is None else str(cfg["sep_humans"])
     hist, conflicts = [], 0
     for step in range(steps):
-        fb = [r for g in names_f for r in rng.sample(shares[g], min(nf // len(names_f), len(shares[g])))] if shares else rng.sample(feedback, min(nf, len(feedback)))
-        ps = rng.sample(pairs, min(nf // 2, len(pairs))) if pairs else []
+        if nf <= 0 or not feedback:
+            fb = []
+        elif shares:
+            if nf >= len(names_f):
+                per_g = nf // len(names_f)
+                fb = [r for g in names_f for r in rng.sample(shares[g], min(per_g, len(shares[g])))]
+            else:
+                fb = [rng.choice(shares[g]) for g in rng.sample(names_f, nf)]
+        else:
+            fb = rng.sample(feedback, min(nf, len(feedback)))
+        ps = rng.sample(pairs, min(nf // 2, len(pairs))) if (pairs and nf >= 2) else []
         idx = []
-        for k in range(nr):
-            idx.append(rng.choice(pools[names_s[(step + k) % len(names_s)]]))
+        if names_s:
+            for k in range(nr):
+                idx.append(rng.choice(pools[names_s[(step + k) % len(names_s)]]))
         fd, hd, ad, rd = [r["tokens"] for r in fb], [h["tokens"] for h, _ in ps], [a["tokens"] for _, a in ps], [replay[i] for i in idx]
-        if cap:
+        docs_all = fd + hd + ad + rd
+        if cap and docs_all:
             # pack all sub-batches into one length-sorted pass to minimize padding
             sizes = [len(fd), len(hd), len(ad), len(rd)]
-            out = capped(vec_scores if vec else scores, model, fd + hd + ad + rd, pair, device, amp, cap, prefix_cache=prefix_cache)
+            out = capped(vec_scores if vec else scores, model, docs_all, pair, device, amp, cap, prefix_cache=prefix_cache)
             s, sh, sa, sr = (out[0] if vec else out).split(sizes)
             hf, _, _, hr = out[1].split(sizes) if vec else (None,) * 4
+        elif cap:
+            s = sh = sa = sr = torch.empty(0, device=device)
+            hf = hr = None
         else:
-            s, hf = vec_scores(model, fd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, fd, pair, device, amp, prefix_cache=prefix_cache), None)
+            if fd:
+                s, hf = vec_scores(model, fd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, fd, pair, device, amp, prefix_cache=prefix_cache), None)
+            else:
+                s, hf = torch.empty(0, device=device), None
             if ps:
                 sh, sa = scores(model, hd, pair, device, amp, prefix_cache=prefix_cache), scores(model, ad, pair, device, amp, prefix_cache=prefix_cache)
-            sr, hr = vec_scores(model, rd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, rd, pair, device, amp, prefix_cache=prefix_cache), None)
+            if rd:
+                sr, hr = vec_scores(model, rd, pair, device, amp, prefix_cache=prefix_cache) if vec else (scores(model, rd, pair, device, amp, prefix_cache=prefix_cache), None)
+            else:
+                sr, hr = torch.empty(0, device=device), None
         s, sr = unit(s), unit(sr)
-        y = torch.tensor([1.0 if r["label"] == "human" else -1.0 for r in fb], device=device)
-        loss_fb = margin_loss(s, y, cutoff, margin)
-        if vec:
-            loss_fb = loss_fb + kl_vector(model, hf, torch.stack([centre[float(v)] for v in y]), cfg.get("kl_temp", 4.0))
+        if fb:
+            y = torch.tensor([1.0 if r["label"] == "human" else -1.0 for r in fb], device=device)
+            loss_fb = margin_loss(s, y, cutoff, margin)
+            if vec and all(float(v) in centre for v in y):
+                loss_fb = loss_fb + kl_vector(model, hf, torch.stack([centre[float(v)] for v in y]), kl_temp_vec)
+        else:
+            loss_fb = torch.zeros((), device=device)
         loss_pair = torch.zeros((), device=device)
         if ps:
             loss_pair = pair_loss(unit(sh), unit(sa), pair_margin)
-        yr = torch.tensor([1.0 if strata[i].startswith("human") else -1.0 for i in idx], device=device) if kind in ("kl", "oneside") else None
-        if vec:
+        yr = torch.tensor([1.0 if strata_eff[i].startswith("human") else -1.0 for i in idx], device=device) if (idx and kind in ("kl", "oneside")) else None
+        if not idx:
+            loss_hold = torch.zeros((), device=device)
+        elif vec:
             tg = torch.stack([h0[i] if right[i] else centre[float(y0[i])] for i in idx])
-            loss_hold = kl_vector(model, hr, tg, cfg.get("kl_temp", 4.0))
+            loss_hold = kl_vector(model, hr, tg, kl_temp_vec)
         elif kind == "kl":
-            loss_hold = kl_hold(sr, base[idx], yr, cutoff, cfg.get("kl_temp", 1.0))
+            loss_hold = kl_hold(sr, base[idx], yr, cutoff, kl_temp_hold)
         elif kind == "oneside":
             drift = (sr - base[idx]) * (tau if zu else 1.0)
             for i, d in zip(idx, drift.tolist()):
-                recent[strata[i]].append(d)
-            c = torch.tensor([0.0 if cfg.get("keep_abs") else float(np.median(recent[strata[i]])) for i in idx], device=device)
+                recent[strata_eff[i]].append(d)
+            c = torch.tensor([0.0 if cfg.get("keep_abs") else float(np.median(recent[strata_eff[i]])) for i in idx], device=device)
             loss_hold = keep_loss(drift - c, yr, tau)
         else:
             loss_hold = ((sr - base[idx]) ** 2).mean()
@@ -521,7 +1368,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         loss = new + hold * loss_hold
         if cfg.get("batch_pairs") and strata:
             # all-pairs human vs AI margin loss within the replay batch
-            hs = [k for k, i in enumerate(idx) if strata[i].startswith(cfg.get("sep_humans", "human"))]
+            hs = [k for k, i in enumerate(idx) if strata[i].startswith(sep_humans)]
             ai = [k for k, i in enumerate(idx) if strata[i].startswith("ai")]
             if hs and ai:
                 gap = sr[hs][:, None] - sr[ai][None, :]
@@ -533,9 +1380,11 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
         if not torch.isfinite(loss):
             raise FloatingPointError(f"loss is not finite at step {step}")
         opt.zero_grad()
-        if cfg.get("project"):
+        has_new = bool(new.requires_grad)
+        old = loss - new
+        has_old = bool(old.requires_grad)
+        if cfg.get("project") and has_new and has_old:
             # A-GEM gradient projection against replay-hold gradients
-            old = loss - new
             g_new = torch.autograd.grad(new, flat, retain_graph=True, allow_unused=True)
             g_old = torch.autograd.grad(old, flat, allow_unused=True)
             g_new = [torch.zeros_like(p) if g is None else g for g, p in zip(g_new, flat)]
@@ -547,9 +1396,12 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
                 conflicts += 1
             for p, a, b in zip(flat, g_new, g_old):
                 p.grad = a + b
-        else:
+            opt.step()
+        elif loss.requires_grad:
             loss.backward()
-        opt.step()
+            opt.step()
+        else:
+            opt.zero_grad(set_to_none=True)
         hist.append((loss_fb.item(), loss_pair.item(), loss_hold.item()))
         if step % 10 == 0:
             r = hist[-10:]
@@ -561,7 +1413,7 @@ def _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp,
     return hist
 
 
-def learn(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int],
+def learn(art_path: str, config_dir: str | Path | None, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int],
           cutoff: float, out: str, cfg: dict, log=print, device: str | None = None, strata: list[str] | None = None) -> dict:
     """Train on `feedback` rows {"tokens", "label": "human"|"ai", "pair": group or None}, write `out`, return the lineage.
     `replay` is ordinary documents held near their starting scores. With `strata`, one name per replay document,
@@ -570,15 +1422,18 @@ def learn(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    amp = device.startswith("cuda")
+    amp = device.startswith("cuda") and (True if cfg.get("amp") is None else bool(cfg["amp"]))
     art = lattice.Artifact(art_path)
     names = train_names(art, cfg)
     model, grids = build_student(art, config_dir, names, cfg.get("ggml_lib"), device)
-    if cfg.get("checkpointing", True) and amp:
+    ckpt = True if cfg.get("checkpointing") is None else bool(cfg["checkpointing"])
+    if ckpt and amp:
         model.gradient_checkpointing_enable()
         model.train()    # HF checkpoints only in training mode; the model has no dropout
     params = [w for w, _, _ in grids.values()]
-    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, cfg.get("lr", 2e-5))
+    lr = 2e-5 if cfg.get("lr") is None else float(cfg["lr"])
+    steps_rec = 200 if cfg.get("steps") is None else int(cfg["steps"])
+    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, lr)
     levels, moved = {}, {}
     for name, (w, fq, start) in grids.items():
         lv = fq.levels(w.detach()).reshape(-1).to("cpu", torch.uint8).numpy()
@@ -586,12 +1441,32 @@ def learn(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.
     lattice.write_levels(art_path, out, levels)
     art.close()
     n = sum(g[0].numel() for g in grids.values())
-    rec = {"method": "grid", "steps": cfg.get("steps", 200), "lr": cfg.get("lr", 2e-5), "tensors": names, "weights": n, "levels_moved": sum(moved.values()),
+    rec = {"method": "grid", "steps": steps_rec, "lr": lr, "tensors": names, "weights": n, "levels_moved": sum(moved.values()),
            "fraction_moved": sum(moved.values()) / max(1, n), "loss_first": hist[0] if hist else None, "loss_last": hist[-1] if hist else None,
            "n_feedback": len(feedback), "n_pairs": len({r["pair"] for r in feedback if r.get("pair") is not None}), "n_replay": len(replay),
            "base_sha256": sha256(art_path), "out_sha256": sha256(out), "bytes": Path(out).stat().st_size}
     Path(str(out) + ".lineage.json").write_text(json.dumps(rec, indent=1))
     return rec
+
+
+def _layer_ffn_width(art: lattice.Artifact, il: int) -> int:
+    for suf in ("ffn_down.weight", "ffn_down_exps.weight"):
+        tname = f"blk.{il}.{suf}"
+        if tname in art.tensors:
+            return int(art.tensors[tname]["dims"][0])
+    for suf in ("ffn_up.weight", "ffn_up_exps.weight"):
+        tname = f"blk.{il}.{suf}"
+        if tname in art.tensors:
+            return int(art.tensors[tname]["dims"][1])
+    gu = f"blk.{il}.ffn_gate_up_exps.weight"
+    if gu in art.tensors:
+        return int(art.tensors[gu]["dims"][1]) // 2
+    raise KeyError(f"blk.{il}: no FFN width tensor found")
+
+
+def _switch_hook_module(layer):
+    mlp = layer.mlp
+    return mlp.switch_hook if hasattr(mlp, "switch_hook") else mlp.down_proj
 
 
 def _apply_switches_to_file_and_mask(
@@ -610,16 +1485,20 @@ def _apply_switches_to_file_and_mask(
     if switch_mode == "up_row_zero":
         row_zeros: dict[str, np.ndarray] = {}
         for il in layers:
-            w_il = int(art.shape(f"blk.{il}.ffn_up.weight")[0])
+            w_il = _layer_ffn_width(art, il)
             widths_by_layer[il] = w_il
             dead = np.flatnonzero(theta[il].detach().cpu().numpy() <= 0)
             off[il] = dead.tolist()
             bits += w_il
             if len(dead):
-                for suf in ("ffn_up.weight", "ffn_gate.weight"):
+                for suf in ("ffn_up.weight", "ffn_gate.weight", "ffn_up_exps.weight", "ffn_gate_exps.weight"):
                     tname = f"blk.{il}.{suf}"
                     if tname in art.tensors:
                         row_zeros[tname] = dead
+                gu_name = f"blk.{il}.ffn_gate_up_exps.weight"
+                if gu_name in art.tensors:
+                    half = int(art.tensors[gu_name]["dims"][1]) // 2
+                    row_zeros[gu_name] = np.concatenate([dead, half + dead])
         lattice.zero_rows(art_path, out, row_zeros)
     else:
         levels: dict[str, np.ndarray] = {}
@@ -652,10 +1531,22 @@ def _apply_switches_to_file_and_mask(
 
 def _switchable_layers(art: lattice.Artifact, n_layers: int, switch_mode: str, last_blocks: int | None = None) -> list[int]:
     if switch_mode == "up_row_zero":
-        layers = [
-            il for il in range(n_layers)
-            if f"blk.{il}.ffn_up.weight" in art.tensors and f"blk.{il}.ffn_gate.weight" in art.tensors and f"blk.{il}.ffn_down.weight" in art.tensors
-        ]
+        layers = []
+        for il in range(n_layers):
+            dense_ok = (
+                f"blk.{il}.ffn_up.weight" in art.tensors
+                and f"blk.{il}.ffn_gate.weight" in art.tensors
+                and f"blk.{il}.ffn_down.weight" in art.tensors
+            )
+            moe_ok = (
+                f"blk.{il}.ffn_down_exps.weight" in art.tensors
+                and (
+                    f"blk.{il}.ffn_gate_up_exps.weight" in art.tensors
+                    or (f"blk.{il}.ffn_up_exps.weight" in art.tensors and f"blk.{il}.ffn_gate_exps.weight" in art.tensors)
+                )
+            )
+            if dense_ok or moe_ok:
+                layers.append(il)
     else:
         layers = [il for il in range(n_layers) if art.tensors.get(f"blk.{il}.ffn_down.weight", {}).get("type") in lattice.TOP]
     if last_blocks is not None and last_blocks > 0:
@@ -664,7 +1555,7 @@ def _switchable_layers(art: lattice.Artifact, n_layers: int, switch_mode: str, l
 
 
 def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
-    if "checkpointing" in cfg:
+    if cfg.get("checkpointing") is not None:
         return bool(cfg["checkpointing"])
     if not device.startswith("cuda"):
         return False
@@ -672,6 +1563,8 @@ def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
     if torch.cuda.is_available() and torch.cuda.get_device_properties(torch.device(device)).total_memory < (55 << 30):
         return True
     mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if mtype == "inkling2_loop":
+        return True
     if mtype.startswith("qwen3_5"):
         try:
             import fla  # noqa: F401
@@ -681,7 +1574,7 @@ def _auto_checkpointing(model, cfg: dict, device: str) -> bool:
 
 
 def _should_stream_prefix(art: lattice.Artifact, cfg: dict, device: str, frozen_bf16: bool) -> bool:
-    sp = cfg.get("stream_prefix", "auto")
+    sp = "auto" if cfg.get("stream_prefix") is None else cfg["stream_prefix"]
     if sp is True:
         return True
     if sp is False or not device.startswith("cuda"):
@@ -695,7 +1588,10 @@ def _should_stream_prefix(art: lattice.Artifact, cfg: dict, device: str, frozen_
 
 
 def _default_seq_batch(model, device: str) -> int:
-    if device.startswith("cuda") and str(getattr(getattr(model, "config", None), "model_type", "")).lower().startswith("qwen3_5"):
+    mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if device.startswith("cuda") and mtype == "inkling2_loop":
+        return 2
+    if device.startswith("cuda") and mtype.startswith("qwen3_5"):
         try:
             import fla  # noqa: F401
         except ImportError:
@@ -720,7 +1616,7 @@ def make_shuffled_classifier_labels(feedback: list[dict], seed: int = 20261118) 
     return [{**r, "label": pool[i]} for i, r in enumerate(feedback)]
 
 
-def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int] | None = None,
+def learn_gates(art_path: str, config_dir: str | Path | None, feedback: list[dict], replay: list[np.ndarray], pair: tuple[int, int] | None = None,
                 cutoff: float = 0.0, out: str = "", cfg: dict | None = None, log=print, device: str | None = None,
                 strata: list[str] | None = None, mask_in: dict | str | Path | None = None, mask_out: str | Path | None = None) -> dict:
     """Weights stay fixed and only one on/off switch per kept neuron learns, by a straight-through gradient.
@@ -736,13 +1632,16 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     import torch
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    amp = device.startswith("cuda")
-    switch_mode = cfg.get("switch_mode", "up_row_zero")
+    amp = device.startswith("cuda") and (True if cfg.get("amp") is None else bool(cfg["amp"]))
+    switch_mode = "up_row_zero" if cfg.get("switch_mode") is None else cfg["switch_mode"]
     art = lattice.Artifact(art_path)
-    frozen_bf16 = bool(cfg.get("frozen_bf16", amp))
+    frozen_bf16 = amp if cfg.get("frozen_bf16") is None else bool(cfg["frozen_bf16"])
     stream_pref = _should_stream_prefix(art, cfg, device, frozen_bf16)
     model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), "cpu" if stream_pref else device, frozen_bf16=frozen_bf16)
     layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
+    if not layers:
+        art.close()
+        raise RuntimeError(f"no switchable FFN layers found in {art_path} under switch_mode={switch_mode!r}")
     all_seqs = [r["tokens"] for r in feedback] + list(replay)
     prefix_cache = PrefixCache.build(model, all_seqs, min(layers), device, amp, cfg, log=log, stream_prefix=stream_pref) if layers else None
     if stream_pref and prefix_cache is None:
@@ -750,8 +1649,8 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     if _auto_checkpointing(model, cfg, device) and amp:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
-    init_val = float(cfg.get("gate_init", 1.0))
-    theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
+    init_val = 1.0 if cfg.get("gate_init") is None else float(cfg["gate_init"])
+    theta = {il: torch.nn.Parameter(torch.full((_layer_ffn_width(art, il),), init_val, device=device)) for il in layers}
 
     def hook(il):
         def f(mod, args):
@@ -760,9 +1659,11 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
             return (args[0] * g.to(args[0].dtype),)
         return f
 
-    hooks = [model.model.layers[il].mlp.down_proj.register_forward_pre_hook(hook(il)) for il in layers]
+    hooks = [_switch_hook_module(model.model.layers[il]).register_forward_pre_hook(hook(il)) for il in layers]
     params = list(theta.values())
-    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, cfg.get("gate_lr", 0.03), prefix_cache=prefix_cache)
+    gate_lr = 0.03 if cfg.get("gate_lr") is None else float(cfg["gate_lr"])
+    steps_rec = 200 if cfg.get("steps") is None else int(cfg["steps"])
+    hist = _train(model, params, feedback, replay, pair, cutoff, cfg, log, device, amp, strata, gate_lr, prefix_cache=prefix_cache)
     for h in hooks:
         h.remove()
     off, bits, _, m_v3 = _apply_switches_to_file_and_mask(
@@ -776,7 +1677,7 @@ def learn_gates(art_path: str, config_dir: str, feedback: list[dict], replay: li
     if amp:
         torch.cuda.empty_cache()
     n = sum(map(len, off.values()))
-    rec = {"method": "gates", "switch_mode": switch_mode, "steps": cfg.get("steps", 200), "gate_lr": cfg.get("gate_lr", 0.03),
+    rec = {"method": "gates", "switch_mode": switch_mode, "steps": steps_rec, "gate_lr": gate_lr,
            "neurons": bits, "off": n, "fraction_moved": n / max(1, bits), "off_by_layer": {str(k): len(v) for k, v in off.items()},
            "loss_first": hist[0] if hist else None, "loss_last": hist[-1] if hist else None, "n_feedback": len(feedback), "n_replay": len(replay),
            "base_sha256": sha256(art_path), "out_sha256": sha256(out), "bytes": Path(out).stat().st_size}
@@ -855,13 +1756,14 @@ def collate_right(seqs: list[np.ndarray], device: str, round_to: int = 32):
 
 
 class _PrefixEntry:
-    __slots__ = ("length", "h", "ple", "skv")
+    __slots__ = ("length", "h", "ple", "skv", "blocks")
 
-    def __init__(self, length: int, h, ple=None, skv=None):
+    def __init__(self, length: int, h, ple=None, skv=None, blocks=None):
         self.length = length
         self.h = h
         self.ple = ple
         self.skv = skv
+        self.blocks = blocks
 
 
 class PrefixCache:
@@ -880,6 +1782,8 @@ class PrefixCache:
     def _arch_kind(model) -> str:
         inner = model.model
         cfg = inner.config
+        if str(getattr(cfg, "model_type", "")) in ("inkling2", "inkling2_loop"):
+            return "inkling2_loop"
         if hasattr(inner, "unique_layer_types") and hasattr(inner, "get_per_layer_inputs"):
             return "gemma4"
         if hasattr(cfg, "layer_types") and "linear_attention" in (cfg.layer_types or ()):
@@ -895,6 +1799,11 @@ class PrefixCache:
         freed.append(f"layers[0:{start_layer}]")
         if kind == "gemma4":
             for attr in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
+                if getattr(inner, attr, None) is not None:
+                    setattr(inner, attr, None)
+                    freed.append(attr)
+        elif kind == "inkling2_loop":
+            for attr in ("loop_layers", "tok_norm"):
                 if getattr(inner, attr, None) is not None:
                     setattr(inner, attr, None)
                     freed.append(attr)
@@ -923,12 +1832,20 @@ class PrefixCache:
                 model.to(device)
             return None
 
+        kind = cls._arch_kind(model)
+        if kind == "inkling2_loop":
+            loop_end = int(getattr(mcfg, "loop_end", 0) or 0)
+            if start_layer < loop_end:
+                log(f"prefix_cache: skipped (start_layer={start_layer} < loop_end={loop_end})")
+                if stream_prefix:
+                    model.to(device)
+                return None
+
         uniq: dict[bytes, np.ndarray] = {}
         for s in seqs:
             arr = np.asarray(s, dtype=np.int64)
             uniq.setdefault(arr.tobytes(), arr)
 
-        kind = cls._arch_kind(model)
         dev_type = device.split(":")[0]
         has_bf16 = any(p.dtype == torch.bfloat16 for p in model.parameters())
         use_amp = bool((amp and dev_type == "cuda") or has_bf16)
@@ -945,8 +1862,12 @@ class PrefixCache:
             hd_full = int(getattr(mcfg, "global_head_dim", getattr(mcfg, "head_dim", 0)) or 0)
             hd_slide = int(getattr(mcfg, "head_dim", 0) or 0)
             per_tok_elems += 2 * n_kv * (hd_full + hd_slide)
+        elif kind == "inkling2_loop":
+            bs = max(1, int(getattr(mcfg, "attn_res_block_size", 1) or 1))
+            n_blocks = (start_layer + bs - 1) // bs
+            per_tok_elems += n_blocks * int(mcfg.hidden_size)
         est_mb = (total_tok * per_tok_elems * elem_b) / (1024 * 1024)
-        max_mb = float(cfg.get("prefix_cache_max_mb", 4096))
+        max_mb = 4096.0 if cfg.get("prefix_cache_max_mb") is None else float(cfg["prefix_cache_max_mb"])
         if est_mb > max_mb:
             log(f"prefix_cache: skipped ({est_mb:.1f} MB > limit {max_mb:.1f} MB)")
             if stream_prefix:
@@ -969,18 +1890,21 @@ class PrefixCache:
 
         entries: dict[bytes, _PrefixEntry] = {}
         actual_bytes = 0
-        free_prefix = bool(cfg.get("free_prefix", True))
+        free_prefix = True if cfg.get("free_prefix") is None else bool(cfg["free_prefix"])
         freed: list[str] = []
 
         if stream_prefix:
             keys = list(uniq.keys())
-            inner.rotary_emb.to(device)
+            if getattr(inner, "rotary_emb", None) is not None:
+                inner.rotary_emb.to(device)
             inner.embed_tokens.to(device)
             if kind == "gemma4":
                 for attr in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
                     mod = getattr(inner, attr, None)
                     if mod is not None and hasattr(mod, "to"):
                         mod.to(device)
+            elif kind == "inkling2_loop" and getattr(inner, "tok_norm", None) is not None:
+                inner.tok_norm.to(device)
             hs_cpu: dict[bytes, torch.Tensor] = {}
             ple_pref_cpu: dict[bytes, torch.Tensor | None] = {}
             ple_tail_cpu: dict[bytes, torch.Tensor | None] = {}
@@ -991,6 +1915,8 @@ class PrefixCache:
                     ids = torch.from_numpy(arr).unsqueeze(0).to(device)
                     with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
                         emb = inner.embed_tokens(ids)
+                        if kind == "inkling2_loop" and getattr(inner, "tok_norm", None) is not None:
+                            emb = inner.tok_norm(emb)
                         hs_cpu[key] = emb[0].detach().to("cpu", store_dtype).contiguous()
                         if kind == "gemma4" and getattr(inner, "hidden_size_per_layer_input", 0):
                             pli_all = inner.project_per_layer_inputs(emb, inner.get_per_layer_inputs(ids, emb))
@@ -1005,6 +1931,9 @@ class PrefixCache:
                     if getattr(inner, attr, None) is not None:
                         setattr(inner, attr, None)
                         freed.append(attr)
+            elif kind == "inkling2_loop" and getattr(inner, "tok_norm", None) is not None:
+                inner.tok_norm = None
+                freed.append("tok_norm")
             if model.lm_head.weight.data_ptr() != inner.embed_tokens.weight.data_ptr():
                 inner.embed_tokens = None
                 freed.append("embed_tokens")
@@ -1012,62 +1941,148 @@ class PrefixCache:
                 inner.embed_tokens.to("cpu")
             _clear_dev()
 
-            with torch.no_grad():
-                for i in range(start_layer):
-                    layer_mod = inner.layers[i].to(device)
-                    for key in keys:
+            if kind == "inkling2_loop":
+                blocks_cpu: dict[bytes, list[torch.Tensor]] = {k: [] for k in keys}
+                loop_start = int(getattr(mcfg, "loop_start", 0) or 0)
+                loop_end = int(getattr(mcfg, "loop_end", 0) or 0)
+                loop_count = int(getattr(mcfg, "loop_count", 1) or 1)
+                with torch.no_grad():
+                    def _step_inkling2(layer_mod, key: bytes, ip: int, loop_mod=None, bank_h=None, bank_blocks=None):
                         h_i = hs_cpu[key].unsqueeze(0).to(device, non_blocking=pin)
                         L = h_i.shape[1]
                         attn = torch.ones((1, L), dtype=torch.long, device=device)
+                        pos, attn_bool, tau = inner._pos_and_tau(attn)
+                        b_dev = [b.unsqueeze(0).to(device, non_blocking=pin) for b in blocks_cpu[key]]
                         with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
-                            if kind == "gemma4":
-                                position_ids = torch.arange(L, device=device).unsqueeze(0)
-                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
-                                lt = mcfg.layer_types[i]
-                                cm = create_causal_mask(**mk) if lt == "full_attention" else create_sliding_window_causal_mask(**mk)
-                                pe = inner.rotary_emb(h_i, position_ids, lt)
-                                pli = ple_pref_cpu[key][:, i, :].unsqueeze(0).to(device, non_blocking=pin) if ple_pref_cpu[key] is not None else None
-                                skv = UserDict({t_lt: (kv[0].unsqueeze(0).to(device, non_blocking=pin), kv[1].unsqueeze(0).to(device, non_blocking=pin)) for t_lt, kv in skv_cpu_map[key].items()})
-                                h_out = layer_mod(h_i, pli, shared_kv_states=skv, position_embeddings=pe, attention_mask=cm, position_ids=position_ids, past_key_values=None)
-                                if getattr(getattr(layer_mod, "self_attn", None), "store_full_length_kv", False):
-                                    skv_cpu_map[key][lt] = (skv[lt][0][0].detach().to("cpu", store_dtype).contiguous(), skv[lt][1][0].detach().to("cpu", store_dtype).contiguous())
-                            elif kind == "qwen35":
-                                position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
-                                text_pos, mrope_pos = position_ids[0], position_ids[1:]
-                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
-                                lt = mcfg.layer_types[i]
-                                cm = create_causal_mask(**mk) if lt == "full_attention" else create_recurrent_attention_mask(**mk)
-                                pe = inner.rotary_emb(h_i, mrope_pos)
-                                h_out = layer_mod(h_i, position_embeddings=pe, attention_mask=cm, position_ids=text_pos, past_key_values=None, use_cache=False)
-                            else:
-                                position_ids = torch.arange(L, device=device).unsqueeze(0)
-                                mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
-                                ltypes = getattr(mcfg, "layer_types", None)
-                                lt = ltypes[i] if ltypes else "full_attention"
-                                cm = create_sliding_window_causal_mask(**mk) if lt == "sliding_attention" else create_causal_mask(**mk)
-                                pe = inner.rotary_emb(h_i, position_ids)
-                                h_out = layer_mod(h_i, attention_mask=cm, position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+                            msgs = None
+                            if loop_mod is not None:
+                                bh_dev = bank_h.unsqueeze(0).to(device, non_blocking=pin)
+                                bb_dev = [b.unsqueeze(0).to(device, non_blocking=pin) for b in bank_blocks]
+                                msgs = _inkling2_mix(bb_dev, bh_dev, loop_mod.msg_query, inner.n_embd)
+                            h_out, new_blk = layer_mod(ip, h_i, b_dev, pos, tau, attn_bool, messages=msgs, loop=loop_mod)
                         hs_cpu[key] = h_out[0].detach().to("cpu", store_dtype).contiguous()
-                    inner.layers[i] = nn.Identity()
-                    del layer_mod
-                    _clear_dev()
-            freed.append(f"layers[0:{start_layer}]")
-            for key in keys:
-                hc = _to_host(hs_cpu.pop(key))
-                actual_bytes += hc.numel() * hc.element_size()
-                skv_final = None
-                if kind == "gemma4":
-                    skv_final = {}
-                    for t_lt, (kc, vc) in skv_cpu_map[key].items():
-                        kp, vp = _to_host(kc), _to_host(vc)
-                        skv_final[t_lt] = (kp, vp)
-                        actual_bytes += (kp.numel() + vp.numel()) * kp.element_size()
-                entries[key] = _PrefixEntry(len(uniq[key]), hc, ple=ple_tail_cpu.get(key), skv=skv_final)
-            for i in range(start_layer, n_layers):
-                inner.layers[i].to(device)
-            inner.norm.to(device)
-            model.lm_head.to(device)
-            _clear_dev()
+                        if new_blk is not None:
+                            blocks_cpu[key].append(new_blk[0].detach().to("cpu", store_dtype).contiguous())
+
+                    pre_end = loop_start if loop_end > loop_start else start_layer
+                    for ip in range(pre_end):
+                        layer_mod = inner.layers[ip].to(device)
+                        for key in keys:
+                            _step_inkling2(layer_mod, key, ip)
+                        inner.layers[ip] = nn.Identity()
+                        del layer_mod
+                        _clear_dev()
+
+                    if loop_end > loop_start:
+                        prelude_h = {k: hs_cpu[k] for k in keys}
+                        prelude_blocks = {k: list(blocks_cpu[k]) for k in keys}
+                        for pass_idx in range(loop_count):
+                            bank_h_map = None
+                            bank_b_map = None
+                            if pass_idx > 0:
+                                bank_h_map = {k: hs_cpu[k] for k in keys}
+                                bank_b_map = {k: blocks_cpu[k][len(prelude_blocks[k]) + 1 :] for k in keys}
+                                hs_cpu = {k: prelude_h[k] for k in keys}
+                                blocks_cpu = {k: list(prelude_blocks[k]) for k in keys}
+                            for ip in range(loop_start, loop_end):
+                                layer_mod = inner.layers[ip].to(device)
+                                loop_mod = inner.loop_layers[ip - loop_start].to(device) if (pass_idx > 0 and inner.loop_layers is not None) else None
+                                for key in keys:
+                                    _step_inkling2(
+                                        layer_mod, key, ip, loop_mod=loop_mod,
+                                        bank_h=(bank_h_map[key] if bank_h_map is not None else None),
+                                        bank_blocks=(bank_b_map[key] if bank_b_map is not None else None),
+                                    )
+                                if pass_idx == loop_count - 1:
+                                    inner.layers[ip] = nn.Identity()
+                                else:
+                                    layer_mod.to("cpu")
+                                    if loop_mod is not None:
+                                        loop_mod.to("cpu")
+                                del layer_mod
+                                if loop_mod is not None:
+                                    del loop_mod
+                                _clear_dev()
+                        if getattr(inner, "loop_layers", None) is not None:
+                            inner.loop_layers = None
+                            freed.append("loop_layers")
+                        for ip in range(loop_end, start_layer):
+                            layer_mod = inner.layers[ip].to(device)
+                            for key in keys:
+                                _step_inkling2(layer_mod, key, ip)
+                            inner.layers[ip] = nn.Identity()
+                            del layer_mod
+                            _clear_dev()
+                freed.append(f"layers[0:{start_layer}]")
+                for key in keys:
+                    hc = _to_host(hs_cpu.pop(key))
+                    bc = _to_host(torch.stack(blocks_cpu.pop(key), dim=0))
+                    actual_bytes += hc.numel() * hc.element_size() + bc.numel() * bc.element_size()
+                    entries[key] = _PrefixEntry(len(uniq[key]), hc, blocks=bc)
+                for i in range(start_layer, n_layers):
+                    inner.layers[i].to(device)
+                if getattr(inner, "output_res_query", None) is not None:
+                    inner.output_res_query.data = inner.output_res_query.data.to(device)
+                inner.norm.to(device)
+                model.lm_head.to(device)
+                _clear_dev()
+            else:
+                with torch.no_grad():
+                    for i in range(start_layer):
+                        layer_mod = inner.layers[i].to(device)
+                        for key in keys:
+                            h_i = hs_cpu[key].unsqueeze(0).to(device, non_blocking=pin)
+                            L = h_i.shape[1]
+                            attn = torch.ones((1, L), dtype=torch.long, device=device)
+                            with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
+                                if kind == "gemma4":
+                                    position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                    mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                    lt = mcfg.layer_types[i]
+                                    cm = create_causal_mask(**mk) if lt == "full_attention" else create_sliding_window_causal_mask(**mk)
+                                    pe = inner.rotary_emb(h_i, position_ids, lt)
+                                    pli = ple_pref_cpu[key][:, i, :].unsqueeze(0).to(device, non_blocking=pin) if ple_pref_cpu[key] is not None else None
+                                    skv = UserDict({t_lt: (kv[0].unsqueeze(0).to(device, non_blocking=pin), kv[1].unsqueeze(0).to(device, non_blocking=pin)) for t_lt, kv in skv_cpu_map[key].items()})
+                                    h_out = layer_mod(h_i, pli, shared_kv_states=skv, position_embeddings=pe, attention_mask=cm, position_ids=position_ids, past_key_values=None)
+                                    if getattr(getattr(layer_mod, "self_attn", None), "store_full_length_kv", False):
+                                        skv_cpu_map[key][lt] = (skv[lt][0][0].detach().to("cpu", store_dtype).contiguous(), skv[lt][1][0].detach().to("cpu", store_dtype).contiguous())
+                                elif kind == "qwen35":
+                                    position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
+                                    text_pos, mrope_pos = position_ids[0], position_ids[1:]
+                                    mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
+                                    lt = mcfg.layer_types[i]
+                                    cm = create_causal_mask(**mk) if lt == "full_attention" else create_recurrent_attention_mask(**mk)
+                                    pe = inner.rotary_emb(h_i, mrope_pos)
+                                    h_out = layer_mod(h_i, position_embeddings=pe, attention_mask=cm, position_ids=text_pos, past_key_values=None, use_cache=False)
+                                else:
+                                    position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                    mk = {"config": mcfg, "inputs_embeds": h_i, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                    ltypes = getattr(mcfg, "layer_types", None)
+                                    lt = ltypes[i] if ltypes else "full_attention"
+                                    cm = create_sliding_window_causal_mask(**mk) if lt == "sliding_attention" else create_causal_mask(**mk)
+                                    pe = inner.rotary_emb(h_i, position_ids)
+                                    h_out = layer_mod(h_i, attention_mask=cm, position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+                            hs_cpu[key] = h_out[0].detach().to("cpu", store_dtype).contiguous()
+                        inner.layers[i] = nn.Identity()
+                        del layer_mod
+                        _clear_dev()
+                freed.append(f"layers[0:{start_layer}]")
+                for key in keys:
+                    hc = _to_host(hs_cpu.pop(key))
+                    actual_bytes += hc.numel() * hc.element_size()
+                    skv_final = None
+                    if kind == "gemma4":
+                        skv_final = {}
+                        for t_lt, (kc, vc) in skv_cpu_map[key].items():
+                            kp, vp = _to_host(kc), _to_host(vc)
+                            skv_final[t_lt] = (kp, vp)
+                            actual_bytes += (kp.numel() + vp.numel()) * kp.element_size()
+                    entries[key] = _PrefixEntry(len(uniq[key]), hc, ple=ple_tail_cpu.get(key), skv=skv_final)
+                for i in range(start_layer, n_layers):
+                    inner.layers[i].to(device)
+                inner.norm.to(device)
+                model.lm_head.to(device)
+                _clear_dev()
         else:
             with torch.no_grad():
                 for key, arr in uniq.items():
@@ -1075,55 +2090,61 @@ class PrefixCache:
                     ids = torch.from_numpy(arr).unsqueeze(0).to(device)
                     attn = torch.ones((1, L), dtype=torch.long, device=device)
                     with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
-                        inputs_embeds = inner.embed_tokens(ids)
-                        h = inputs_embeds
                         ple_tail = None
                         skv_cpu = None
-                        if kind == "gemma4":
-                            per_layer_inputs = None
-                            if getattr(inner, "hidden_size_per_layer_input", 0):
-                                per_layer_inputs = inner.get_per_layer_inputs(ids, inputs_embeds)
-                                per_layer_inputs = inner.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
-                            position_ids = torch.arange(L, device=device).unsqueeze(0)
-                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
-                            cmm = {"full_attention": create_causal_mask(**mk), "sliding_attention": create_sliding_window_causal_mask(**mk)}
-                            pe = {lt: inner.rotary_emb(h, position_ids, lt) for lt in inner.unique_layer_types}
-                            skv = UserDict()
-                            for i in range(start_layer):
-                                pli = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
-                                lt = mcfg.layer_types[i]
-                                h = inner.layers[i](h, pli, shared_kv_states=skv, position_embeddings=pe[lt], attention_mask=cmm[lt], position_ids=position_ids, past_key_values=None)
-                            if per_layer_inputs is not None:
-                                ple_tail = _to_host(per_layer_inputs[0, :, start_layer:, :])
-                                actual_bytes += ple_tail.numel() * ple_tail.element_size()
-                            skv_cpu = {}
-                            for lt, kv in skv.items():
-                                kc, vc = _to_host(kv[0][0]), _to_host(kv[1][0])
-                                skv_cpu[lt] = (kc, vc)
-                                actual_bytes += (kc.numel() + vc.numel()) * kc.element_size()
-                        elif kind == "qwen35":
-                            position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
-                            text_pos = position_ids[0]
-                            mrope_pos = position_ids[1:]
-                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
-                            cmm = {"full_attention": create_causal_mask(**mk), "linear_attention": create_recurrent_attention_mask(**mk)}
-                            pe = inner.rotary_emb(h, mrope_pos)
-                            for i in range(start_layer):
-                                h = inner.layers[i](h, position_embeddings=pe, attention_mask=cmm[mcfg.layer_types[i]], position_ids=text_pos, past_key_values=None, use_cache=False)
+                        blocks_cpu_entry = None
+                        if kind == "inkling2_loop":
+                            h, blocks_list = inner.forward_prefix(ids, attn, start_layer)
+                            blocks_cpu_entry = _to_host(torch.stack([b[0] for b in blocks_list], dim=0))
+                            actual_bytes += blocks_cpu_entry.numel() * blocks_cpu_entry.element_size()
                         else:
-                            position_ids = torch.arange(L, device=device).unsqueeze(0)
-                            mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
-                            cmm = {"full_attention": create_causal_mask(**mk)}
-                            if getattr(inner, "has_sliding_layers", False):
-                                cmm["sliding_attention"] = create_sliding_window_causal_mask(**mk)
-                            pe = inner.rotary_emb(h, position_ids)
-                            ltypes = getattr(mcfg, "layer_types", None)
-                            for i in range(start_layer):
-                                lt = ltypes[i] if ltypes else "full_attention"
-                                h = inner.layers[i](h, attention_mask=cmm[lt], position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
+                            inputs_embeds = inner.embed_tokens(ids)
+                            h = inputs_embeds
+                            if kind == "gemma4":
+                                per_layer_inputs = None
+                                if getattr(inner, "hidden_size_per_layer_input", 0):
+                                    per_layer_inputs = inner.get_per_layer_inputs(ids, inputs_embeds)
+                                    per_layer_inputs = inner.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+                                position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                cmm = {"full_attention": create_causal_mask(**mk), "sliding_attention": create_sliding_window_causal_mask(**mk)}
+                                pe = {lt: inner.rotary_emb(h, position_ids, lt) for lt in inner.unique_layer_types}
+                                skv = UserDict()
+                                for i in range(start_layer):
+                                    pli = per_layer_inputs[:, :, i, :] if per_layer_inputs is not None else None
+                                    lt = mcfg.layer_types[i]
+                                    h = inner.layers[i](h, pli, shared_kv_states=skv, position_embeddings=pe[lt], attention_mask=cmm[lt], position_ids=position_ids, past_key_values=None)
+                                if per_layer_inputs is not None:
+                                    ple_tail = _to_host(per_layer_inputs[0, :, start_layer:, :])
+                                    actual_bytes += ple_tail.numel() * ple_tail.element_size()
+                                skv_cpu = {}
+                                for lt, kv in skv.items():
+                                    kc, vc = _to_host(kv[0][0]), _to_host(kv[1][0])
+                                    skv_cpu[lt] = (kc, vc)
+                                    actual_bytes += (kc.numel() + vc.numel()) * kc.element_size()
+                            elif kind == "qwen35":
+                                position_ids = torch.arange(L, device=device).view(1, 1, -1).expand(4, 1, -1)
+                                text_pos = position_ids[0]
+                                mrope_pos = position_ids[1:]
+                                mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": text_pos}
+                                cmm = {"full_attention": create_causal_mask(**mk), "linear_attention": create_recurrent_attention_mask(**mk)}
+                                pe = inner.rotary_emb(h, mrope_pos)
+                                for i in range(start_layer):
+                                    h = inner.layers[i](h, position_embeddings=pe, attention_mask=cmm[mcfg.layer_types[i]], position_ids=text_pos, past_key_values=None, use_cache=False)
+                            else:
+                                position_ids = torch.arange(L, device=device).unsqueeze(0)
+                                mk = {"config": mcfg, "inputs_embeds": inputs_embeds, "attention_mask": attn, "past_key_values": None, "position_ids": position_ids}
+                                cmm = {"full_attention": create_causal_mask(**mk)}
+                                if getattr(inner, "has_sliding_layers", False):
+                                    cmm["sliding_attention"] = create_sliding_window_causal_mask(**mk)
+                                pe = inner.rotary_emb(h, position_ids)
+                                ltypes = getattr(mcfg, "layer_types", None)
+                                for i in range(start_layer):
+                                    lt = ltypes[i] if ltypes else "full_attention"
+                                    h = inner.layers[i](h, attention_mask=cmm[lt], position_embeddings=pe, position_ids=position_ids, past_key_values=None, use_cache=False)
                         h_cpu = _to_host(h[0])
                         actual_bytes += h_cpu.numel() * h_cpu.element_size()
-                    entries[key] = _PrefixEntry(L, h_cpu, ple=ple_tail, skv=skv_cpu)
+                    entries[key] = _PrefixEntry(L, h_cpu, ple=ple_tail, skv=skv_cpu, blocks=blocks_cpu_entry)
 
             if free_prefix:
                 freed = cls._free_prefix(model, start_layer, kind)
@@ -1161,7 +2182,19 @@ class PrefixCache:
         use_amp = bool((amp and dev_type == "cuda") or ents[0].h.dtype == torch.bfloat16)
 
         with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=use_amp):
-            if self.kind == "gemma4":
+            if self.kind == "inkling2_loop":
+                n_blocks = ents[0].blocks.shape[0]
+                b_buf = torch.zeros((B, n_blocks, n, d), dtype=ents[0].blocks.dtype)
+                for k, e in enumerate(ents):
+                    b_buf[k, :, :e.length, :] = e.blocks
+                b_dev = b_buf.to(device, non_blocking=nb)
+                blocks = [b_dev[:, j, :, :] for j in range(n_blocks)]
+                h = inner.forward_tail(
+                    h, blocks, attn, self.start_layer,
+                    grad_ckpt=getattr(model, "is_gradient_checkpointing", False),
+                    gc_kwargs=getattr(model, "_gc_kwargs", None),
+                )
+            elif self.kind == "gemma4":
                 ple = None
                 if ents[0].ple is not None:
                     n_tail, d_ple = ents[0].ple.shape[1], ents[0].ple.shape[2]
@@ -1260,7 +2293,7 @@ def student_traj_nll(model, trajs: list[tuple[np.ndarray, np.ndarray]], device: 
 
 def learn_gates_seq(
     art_path: str,
-    config_dir: str,
+    config_dir: str | Path | None,
     feedback: list[dict],
     replay: list,
     out: str,
@@ -1282,9 +2315,9 @@ def learn_gates_seq(
     cfg = cfg or {}
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    amp = device.startswith("cuda") and bool(cfg.get("amp", True))
-    switch_mode = cfg.get("switch_mode", "up_row_zero")
-    pad_mult = int(cfg.get("pad_multiple", 32))
+    amp = device.startswith("cuda") and (True if cfg.get("amp") is None else bool(cfg["amp"]))
+    switch_mode = "up_row_zero" if cfg.get("switch_mode") is None else cfg["switch_mode"]
+    pad_mult = 32 if cfg.get("pad_multiple") is None else int(cfg["pad_multiple"])
 
     lessons = [_norm_seq_lesson(r) for r in feedback]
     rep_trajs = [_norm_replay_traj(x) for x in replay]
@@ -1292,7 +2325,7 @@ def learn_gates_seq(
         raise ValueError("learn_gates_seq requires at least one feedback lesson or replay trajectory")
 
     art = lattice.Artifact(art_path)
-    frozen_bf16 = bool(cfg.get("frozen_bf16", amp))
+    frozen_bf16 = amp if cfg.get("frozen_bf16") is None else bool(cfg["frozen_bf16"])
     stream_pref = _should_stream_prefix(art, cfg, device, frozen_bf16)
     model, _ = build_student(art, config_dir, [], cfg.get("ggml_lib"), "cpu" if stream_pref else device, frozen_bf16=frozen_bf16)
     layers = _switchable_layers(art, len(model.model.layers), switch_mode, cfg.get("gate_last_blocks"))
@@ -1308,8 +2341,8 @@ def learn_gates_seq(
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
 
-    init_val = float(cfg.get("gate_init", 1.0))
-    theta = {il: torch.nn.Parameter(torch.full((art.shape(f"blk.{il}.ffn_down.weight")[1],), init_val, device=device)) for il in layers}
+    init_val = 1.0 if cfg.get("gate_init") is None else float(cfg["gate_init"])
+    theta = {il: torch.nn.Parameter(torch.full((_layer_ffn_width(art, il),), init_val, device=device)) for il in layers}
 
     replay_h0: list[torch.Tensor] = []
     with torch.no_grad():
@@ -1325,28 +2358,36 @@ def learn_gates_seq(
             return (args[0] * g.to(args[0].dtype),)
         return f
 
-    hooks = [model.model.layers[il].mlp.down_proj.register_forward_pre_hook(hook(il)) for il in layers]
+    hooks = [_switch_hook_module(model.model.layers[il]).register_forward_pre_hook(hook(il)) for il in layers]
     flat = list(theta.values())
-    opt = torch.optim.AdamW(flat, lr=float(cfg.get("gate_lr", 0.05)), weight_decay=0.0, eps=float(cfg.get("adam_eps", 1e-4)))
-    rng = random.Random(cfg.get("seed", 20261031))
+    gate_lr = 0.05 if cfg.get("gate_lr") is None else float(cfg["gate_lr"])
+    adam_eps = 1e-4 if cfg.get("adam_eps") is None else float(cfg["adam_eps"])
+    opt = torch.optim.AdamW(flat, lr=gate_lr, weight_decay=0.0, eps=adam_eps)
+    rng = random.Random(20261031 if cfg.get("seed") is None else cfg["seed"])
 
-    steps = int(cfg.get("steps", 80))
+    steps = 80 if cfg.get("steps") is None else int(cfg["steps"])
     def_bs = _default_seq_batch(model, device)
-    nf = int(cfg.get("feedback_batch", min(def_bs, len(lessons))))
-    nr = int(cfg.get("replay_batch", min(def_bs, len(rep_trajs)))) if rep_trajs else 0
-    nll_w = float(cfg.get("nll_weight", 1.0))
-    margin_w = float(cfg.get("margin_weight", 1.0))
-    margin = float(cfg.get("margin", 0.5))
-    hold_w = float(cfg.get("replay_weight", 2.0))
-    kl_temp = float(cfg.get("kl_temp", 1.0))
-    use_agem = bool(cfg.get("project", True))
+    fb_raw = cfg.get("feedback_batch")
+    nr_raw = cfg.get("replay_batch")
+    nf = min(def_bs, len(lessons)) if fb_raw is None else int(fb_raw)
+    nr = (min(def_bs, len(rep_trajs)) if nr_raw is None else int(nr_raw)) if rep_trajs else 0
+    if nf < 0 or nr < 0:
+        raise ValueError(f"feedback_batch and replay_batch must be >= 0, got {nf!r}, {nr!r}")
+    nll_w = 1.0 if cfg.get("nll_weight") is None else float(cfg["nll_weight"])
+    margin_w = 1.0 if cfg.get("margin_weight") is None else float(cfg["margin_weight"])
+    margin = 0.5 if cfg.get("margin") is None else float(cfg["margin"])
+    hold_w = 2.0 if cfg.get("replay_weight") is None else float(cfg["replay_weight"])
+    kl_temp = float(1.0 if cfg.get("kl_temp") is None else cfg["kl_temp"])
+    if not math.isfinite(kl_temp) or kl_temp <= 0:
+        raise ValueError(f"kl_temp must be finite > 0, got {kl_temp!r}")
+    use_agem = True if cfg.get("project") is None else bool(cfg["project"])
 
     log(f"learn_gates_seq: {sum(w.numel() for w in flat):,} switches across {len(layers)} FFN layers, {len(lessons)} lessons, {len(rep_trajs)} replay")
     hist: list[tuple[float, float, float]] = []
     conflicts = 0
 
     for step in range(steps):
-        if lessons and (nll_w > 0 or margin_w > 0):
+        if lessons and nf > 0 and (nll_w > 0 or margin_w > 0):
             fb_batch = rng.sample(lessons, min(nf, len(lessons)))
             pos_seqs = [r["pos_tokens"] for r in fb_batch]
             pos_tgts = [r["pos_targets"] for r in fb_batch]
@@ -1387,6 +2428,14 @@ def learn_gates_seq(
             loss_hold = torch.stack(kl_terms).mean()
         else:
             loss_hold = torch.zeros((), device=device)
+
+        if not (torch.isfinite(loss_new) and torch.isfinite(loss_hold)):
+            for h in hooks:
+                h.remove()
+            art.close()
+            raise FloatingPointError(
+                f"non-finite loss in learn_gates_seq step {step}: loss_new={loss_new.item()}, loss_hold={loss_hold.item()}"
+            )
 
         opt.zero_grad()
         has_new = bool(loss_new.requires_grad)
@@ -1432,7 +2481,7 @@ def learn_gates_seq(
         "method": "gates_seq",
         "switch_mode": switch_mode,
         "steps": steps,
-        "gate_lr": float(cfg.get("gate_lr", 0.05)),
+        "gate_lr": gate_lr,
         "neurons": bits,
         "off": n_off,
         "fraction_moved": n_off / max(1, bits),
@@ -1496,21 +2545,29 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _side(task: str, prompt_id: str | None = None) -> int:
+def _side(task: str, prompt_id: str | None = None, seed: int | None = None) -> int:
     """Deterministic 50/50 split by `prompt_id` (when provided) or `task` id so related items stay on one side."""
-    return int(hashlib.sha256((task if prompt_id is None else str(prompt_id)).encode()).hexdigest()[:8], 16) % 2
+    key = task if prompt_id is None else str(prompt_id)
+    if seed is not None:
+        key = f"{seed}:{key}"
+    return int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % 2
 
 
 def row_side(r: dict, c: dict) -> int:
     """Resolve select side (0 = replay pool, 1 = judge), grouping multi-variant rows by `prompt_id` when configured."""
-    return _side(r["task"], r["prompt_id"] if c.get("side_by_prompt") and r["task"].startswith("beemo") else None)
+    return _side(
+        r["task"],
+        r["prompt_id"] if c.get("side_by_prompt") and r["task"].startswith("beemo") else None,
+        seed=c.get("side_seed"),
+    )
 
 
 def real_scores(model: str, c: dict, scorer) -> tuple[np.ndarray, np.ndarray]:
     """The real file's scores on the pool and the feedback, once per file."""
     pair = tuple(c["pair"])
     quick = c.get("quick_idx") and sha256(model) != sha256(c["model"])
-    cache = Path(c.get("cache_dir", c["out_dir"])) / f"scores-{sha256(model)[:16]}{'-quick' if quick else ''}.npz"
+    cache_dir = c["out_dir"] if c.get("cache_dir") is None else c["cache_dir"]
+    cache = Path(cache_dir) / f"scores-{sha256(model)[:16]}{'-quick' if quick else ''}.npz"
     if cache.exists():
         z = np.load(cache)
         return z["pool"], z["held"]
@@ -1538,8 +2595,9 @@ def make_panel(c: dict, rows: list[dict], humans: list[int] | None = None) -> No
     """Write the fixed panel once, to `panel_trj` and `panel_idx`: `panel_humans` random calibration humans from `humans` (default
     all of calibration), then all of select side 1. Pool indices are kept in `panel_idx`, and no document is chosen by its score."""
     ncal = c["n_calibration"]
-    rng = random.Random(c.get("seed", 20261031))
-    idx = sorted(rng.sample(range(ncal) if humans is None else humans, c.get("panel_humans", 4000)))
+    rng = random.Random(20261031 if c.get("seed") is None else c["seed"])
+    panel_humans = 4000 if c.get("panel_humans") is None else int(c["panel_humans"])
+    idx = sorted(rng.sample(range(ncal) if humans is None else humans, panel_humans))
     idx += [ncal + i for i, r in enumerate(rows) if row_side(r, c) == 1]
     pool = read_trj(c["pool_trj"])
     assert len(pool) == ncal + len(rows)
@@ -1549,7 +2607,8 @@ def make_panel(c: dict, rows: list[dict], humans: list[int] | None = None) -> No
 
 def real_panel(model: str, c: dict, scorer) -> np.ndarray:
     """Score the built GGUF directly on the fixed panel (cached by model and panel hash; no base-score imputation)."""
-    cache = Path(c.get("cache_dir", c["out_dir"])) / f"panel-{sha256(model)[:16]}-{sha256(c['panel_trj'])[:8]}.npy"
+    cache_dir = c["out_dir"] if c.get("cache_dir") is None else c["cache_dir"]
+    cache = Path(cache_dir) / f"panel-{sha256(model)[:16]}-{sha256(c['panel_trj'])[:8]}.npy"
     if cache.exists():
         return np.load(cache)
     v = scorer.score_trj(model, c["panel_trj"], tuple(c["pair"]))
@@ -1576,8 +2635,9 @@ def judge(model: str, c: dict, scorer, rows: list[dict], fb: list[dict], hold: l
     def rate(ai: bool, beemo: bool) -> float:
         x = [s[i] < cut for i in gate if (rows[i]["verdict"] == "ai") == ai and rows[i]["task"].startswith("beemo") == beemo]
         return float(np.mean(x)) if x else float("nan")
+    gate_margin = 0.02 if c.get("gate_margin") is None else float(c["gate_margin"])
     out = {"model": model, "bytes": Path(model).stat().st_size, "cutoff": cut, "n_gate": len(gate), "delta": b["delta"], "L": b["L"], "U": b["U"],
-           "gate_pass": bool(b["L"] > -c.get("gate_margin", .02)), "caught_wo": rate(True, False), "caught_beemo": rate(True, True),
+           "gate_pass": bool(b["L"] > -gate_margin), "caught_wo": rate(True, False), "caught_beemo": rate(True, True),
            "human_flagged_wo": rate(False, False), "human_flagged_beemo": rate(False, True)}
     h = [fb[i] for i in hold]
     v = {r["index"]: held[r["index"]] for r in h}
@@ -1605,7 +2665,38 @@ def _load_json_or_jsonl(path_or_list) -> list[dict]:
     return [json.loads(line) for line in txt.splitlines() if line.strip()]
 
 
-def _tokenize_seq_lessons(tc, model_gguf: str, raw_rows: list[dict], threads: int = 8) -> list[dict]:
+def _stratified_select(items: list, limit: int, key_fn, id_fn=None) -> list:
+    """Deterministically select up to `limit` items stratified round-robin across buckets."""
+    if limit <= 0 or not items:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    buckets: dict[str, list] = {}
+    for idx, it in enumerate(items):
+        k = str(key_fn(it) or "")
+        buckets.setdefault(k, []).append((idx, it))
+    keys = sorted(buckets)
+    if id_fn is not None:
+        for k in keys:
+            buckets[k].sort(key=lambda pair: str(id_fn(pair[1])))
+    out = []
+    pos = 0
+    while len(out) < limit:
+        progressed = False
+        for k in keys:
+            b = buckets[k]
+            if pos < len(b):
+                out.append(b[pos][1])
+                progressed = True
+                if len(out) >= limit:
+                    break
+        if not progressed:
+            break
+        pos += 1
+    return out
+
+
+def _tokenize_seq_lessons(tc, model_gguf: str, raw_rows: list[dict], threads: int = 8, log=None) -> list[dict]:
     from . import runtime
     need_str = [i for i, r in enumerate(raw_rows) if "prompt_tokens" not in r and "pos_tokens" not in r]
     if not need_str:
@@ -1619,18 +2710,40 @@ def _tokenize_seq_lessons(tc, model_gguf: str, raw_rows: list[dict], threads: in
         strs.extend([pr, pr + good_s, good_s, (pr + bad_s) if bad_s else "", bad_s])
     toks = [x.tolist() for x in runtime.tokenize_docs(tc, model_gguf, strs, threads=threads)]
     out = [dict(r) for r in raw_rows]
+    good_fb = 0
+    bad_fb = 0
     for k, i in enumerate(need_str):
         pr, pr_good, good_raw, pr_bad, bad_raw = toks[5 * k : 5 * k + 5]
-        good = pr_good[len(pr):] if (len(pr_good) > len(pr) and pr_good[: len(pr)] == pr) else good_raw
-        bad = (pr_bad[len(pr):] if (len(pr_bad) > len(pr) and pr_bad[: len(pr)] == pr) else bad_raw) if bad_raw else []
+        if len(pr_good) > len(pr) and pr_good[: len(pr)] == pr:
+            good = pr_good[len(pr):]
+        else:
+            good = good_raw
+            good_fb += 1
+        if bad_raw:
+            if len(pr_bad) > len(pr) and pr_bad[: len(pr)] == pr:
+                bad = pr_bad[len(pr):]
+            else:
+                bad = bad_raw
+                bad_fb += 1
+        else:
+            bad = []
         out[i]["prompt_tokens"] = pr
         out[i]["corrected_tokens"] = good
         if bad:
             out[i]["mistaken_tokens"] = bad
+    if good_fb or bad_fb:
+        msg = (
+            f"_tokenize_seq_lessons: BPE-boundary prefix mismatch fell back to unmerged tokenization "
+            f"(corrected={good_fb}/{len(need_str)}, mistaken={bad_fb}/{len(need_str)})"
+        )
+        if callable(log):
+            log(f"WARNING: {msg}")
+        else:
+            _LOG.warning(msg)
     return out
 
 
-def _load_replay_trajs(tc, model_gguf: str, spec, threads: int = 8) -> list[tuple[np.ndarray, np.ndarray]]:
+def _load_replay_trajs(tc, model_gguf: str, spec, threads: int = 8, log=None) -> list[tuple[np.ndarray, np.ndarray]]:
     from . import runtime
     if not spec:
         return []
@@ -1648,10 +2761,31 @@ def _load_replay_trajs(tc, model_gguf: str, spec, threads: int = 8) -> list[tupl
         strs.extend([pr, full])
     toks = [x.tolist() for x in runtime.tokenize_docs(tc, model_gguf, strs, threads=threads)]
     out = []
+    dropped_bpe = 0
+    dropped_empty = 0
     for k in range(0, len(toks), 2):
         pre, full = toks[k], toks[k + 1]
         if len(full) > len(pre) and full[: len(pre)] == pre:
             out.append((np.asarray(full, dtype=np.int32), np.arange(len(pre), len(full), dtype=np.uint32)))
+        elif len(full) <= len(pre):
+            dropped_empty += 1
+        else:
+            dropped_bpe += 1
+    dropped = dropped_bpe + dropped_empty
+    if dropped:
+        msg = (
+            f"_load_replay_trajs: dropped {dropped}/{len(rows)} replay trajectories "
+            f"(bpe_mismatch={dropped_bpe}, empty_completion={dropped_empty})"
+        )
+        if callable(log):
+            log(f"WARNING: {msg}")
+        else:
+            _LOG.warning(msg)
+    if rows and not out:
+        raise ValueError(
+            f"all {len(rows)} replay trajectories were dropped "
+            f"(bpe_mismatch={dropped_bpe}, empty_completion={dropped_empty})"
+        )
     return out
 
 
@@ -1667,16 +2801,28 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
     out_dir = Path(c["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     base_model = str(c["model"])
-    config_dir = str(c["config_dir"])
+    config_dir = str(c["config_dir"]) if c.get("config_dir") else None
     ggml_lib = str(c.get("ggml_lib") or cfg["toolchain"]["llama_bin"])
-    base_cfg = {**c, "ggml_lib": ggml_lib, "switch_mode": c.get("switch_mode", "up_row_zero")}
+    switch_mode = "up_row_zero" if c.get("switch_mode") is None else c["switch_mode"]
+    base_cfg = {**c, "ggml_lib": ggml_lib, "switch_mode": switch_mode}
 
-    all_lessons = _tokenize_seq_lessons(tc, base_model, _load_json_or_jsonl(c["lessons"]))
+    all_lessons = _tokenize_seq_lessons(tc, base_model, _load_json_or_jsonl(c["lessons"]), log=log)
     train_lessons = [r for r in all_lessons if fold is None or r.get("fold") != fold]
     held_lessons = [r for r in all_lessons if fold is not None and r.get("fold") == fold]
-    if len(train_lessons) > int(c.get("max_lessons", 25)):
-        train_lessons = train_lessons[: int(c.get("max_lessons", 25))]
-    replay_trajs = _load_replay_trajs(tc, base_model, c.get("replay"))
+    max_l = 25 if c.get("max_lessons") is None else int(c["max_lessons"])
+    if len(train_lessons) > max_l:
+        n_before = len(train_lessons)
+        if any(any(k in r for k in ("family", "category", "share")) for r in train_lessons):
+            train_lessons = _stratified_select(
+                train_lessons,
+                max_l,
+                key_fn=lambda r: r.get("family") or r.get("category") or r.get("share") or "",
+                id_fn=lambda r: r.get("id") or r.get("task") or "",
+            )
+        else:
+            train_lessons = train_lessons[:max_l]
+        log(f"run_generative: truncated train_lessons {n_before} -> {len(train_lessons)} (max_lessons={max_l})")
+    replay_trajs = _load_replay_trajs(tc, base_model, c.get("replay"), log=log)
 
     tag = "all" if fold is None else f"fold{fold}"
     learned_gguf = str(out_dir / f"apprentice-{tag}.gguf")
@@ -1696,7 +2842,7 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
 
     arms = {"base": base_model, "learned": learned_gguf}
     control_recs = {}
-    if c.get("controls", True):
+    if (True if c.get("controls") is None else bool(c["controls"])):
         # 1. Empty control (0 lessons, replay/init only)
         emp_gguf = str(out_dir / f"control-empty-{tag}.gguf")
         emp_cfg = {**base_cfg, "nll_weight": 0.0, "margin_weight": 0.0}
@@ -1704,26 +2850,42 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
         control_recs["empty"] = learn_gates_seq(base_model, config_dir, [], replay_trajs or [(np.array([1, 2, 3], dtype=np.int32), np.array([1, 2], dtype=np.uint32))], emp_gguf, cfg=emp_cfg, log=log)
         arms["empty"] = emp_gguf
 
-        # 2. Flipped control (swap corrected <-> mistaken on lessons that carry mistaken_tokens)
+        # 2. Flipped control (swap positive <-> negative on lessons that carry a negative trajectory)
+        normed_lessons = [_norm_seq_lesson(r) for r in train_lessons]
         flipped_lessons = []
-        for r in train_lessons:
-            if r.get("mistaken_tokens"):
-                flipped_lessons.append({**r, "corrected_tokens": r["mistaken_tokens"], "mistaken_tokens": r["corrected_tokens"]})
+        for nl in normed_lessons:
+            if nl["neg_tokens"] is not None:
+                flipped_lessons.append({
+                    "pos_tokens": nl["neg_tokens"],
+                    "pos_targets": nl["neg_targets"],
+                    "neg_tokens": nl["pos_tokens"],
+                    "neg_targets": nl["pos_targets"],
+                })
         if flipped_lessons:
             flp_gguf = str(out_dir / f"control-flipped-{tag}.gguf")
             flp_cfg = dict(base_cfg); flp_cfg.pop("mask_in", None); flp_cfg.pop("mask_out", None)
             control_recs["flipped"] = learn_gates_seq(base_model, config_dir, flipped_lessons, replay_trajs, flp_gguf, cfg=flp_cfg, log=log)
             arms["flipped"] = flp_gguf
 
-        # 3. Shuffled control (cyclic shift of `(corrected_tokens, mistaken_tokens)` pairs together across prompts)
-        if len(train_lessons) >= 2:
+        # 3. Shuffled control (cyclic shift of positive/negative completions across prompts)
+        if len(normed_lessons) >= 2:
             shuf_lessons = []
-            for i, r in enumerate(train_lessons):
-                other = train_lessons[(i + 1) % len(train_lessons)]
+            for i, nl_r in enumerate(normed_lessons):
+                nl_o = normed_lessons[(i + 1) % len(normed_lessons)]
+                r_prompt = nl_r["pos_tokens"][: int(nl_r["pos_targets"].min())]
+                o_pos_start = int(nl_o["pos_targets"].min())
+                pos_tok = np.concatenate([r_prompt, nl_o["pos_tokens"][o_pos_start:]])
+                pos_tgt = len(r_prompt) + (nl_o["pos_targets"] - o_pos_start)
+                neg_tok = neg_tgt = None
+                if nl_o["neg_tokens"] is not None:
+                    o_neg_start = int(nl_o["neg_targets"].min())
+                    neg_tok = np.concatenate([r_prompt, nl_o["neg_tokens"][o_neg_start:]])
+                    neg_tgt = len(r_prompt) + (nl_o["neg_targets"] - o_neg_start)
                 shuf_lessons.append({
-                    **r,
-                    "corrected_tokens": other["corrected_tokens"],
-                    "mistaken_tokens": other.get("mistaken_tokens"),
+                    "pos_tokens": pos_tok,
+                    "pos_targets": pos_tgt,
+                    "neg_tokens": neg_tok,
+                    "neg_targets": neg_tgt,
                 })
             shf_gguf = str(out_dir / f"control-shuffled-{tag}.gguf")
             shf_cfg = dict(base_cfg); shf_cfg.pop("mask_in", None); shf_cfg.pop("mask_out", None)
@@ -1750,8 +2912,10 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
     cpp_metrics = {}
     for arm_name, arm_path in arms.items():
         r_kl = kl.traj_kl(tc, "kl", arm_path, str(trj_eval), str(out_dir / "store_eval"), str(out_dir / f"kl-{arm_name}.json"), str(out_dir / "kl.log"), gpu=tc.gpus[0])
-        pos_nlls = [r_kl["trajs"][ip]["nll_cand"] for ip, _ in pair_indices]
-        margins = [(-r_kl["trajs"][ip]["nll_cand"]) - (-r_kl["trajs"][ineg]["nll_cand"]) for ip, ineg in pair_indices if ineg is not None]
+        pos_nlls = [float(r_kl["trajs"][ip]["nll_cand"]) for ip, _ in pair_indices]
+        margins = [float((-r_kl["trajs"][ip]["nll_cand"]) - (-r_kl["trajs"][ineg]["nll_cand"])) for ip, ineg in pair_indices if ineg is not None]
+        if not all(math.isfinite(x) for x in pos_nlls) or not all(math.isfinite(m) for m in margins):
+            raise FloatingPointError(f"non-finite traj-kl metrics for arm {arm_name!r}")
         cpp_metrics[arm_name] = {
             "bytes": Path(arm_path).stat().st_size,
             "sha256": sha256(arm_path),
@@ -1763,41 +2927,81 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
 
     # Optional live `Evaluator` task evaluation (`heldout_ids` + `select` side-1 retention gate)
     env_metrics = {}
-    accepted = bool(cpp_metrics["learned"]["pos_nll_mean"] < cpp_metrics["base"]["pos_nll_mean"])
+    l_nll = cpp_metrics["learned"]["pos_nll_mean"]
+    b_nll = cpp_metrics["base"]["pos_nll_mean"]
+    accepted = bool(l_nll is not None and b_nll is not None and l_nll < b_nll)
     if cfg.get("env"):
-        env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
+        env_kw = (cfg["env"].get("kwargs") or {})
+        env = load_environment(cfg["env"]["module"], **env_kw)
         by_id = {t.id: t for t in env.tasks()}
-        ev = Evaluator(tc, env, cfg.get("decoding", {"temperature": 0.0}),
-                       int(c.get("judge_slots", 1)),
-                       cfg.get("serving", {}).get("ctx_per_slot", env.deployment["context"]),
-                       env.deployment["kv_type"], out_dir / "episodes",
-                       cache_prompt=bool(c.get("judge_cache_prompt", False)))
-        held_ids = c.get("heldout_ids") or [t.id for t in env.tasks() if t.split == "train" and _side(t.id) == 1]
-        held_tasks = [by_id[i] for i in held_ids if i in by_id]
-        sel_tasks = [t for t in env.tasks() if t.split == "select" and _side(t.id) == 1]
-        if c.get("select_limit"):
-            sel_tasks = sel_tasks[: int(c["select_limit"])]
+        decoding = cfg.get("decoding") or {"temperature": 0.0}
+        serving = cfg.get("serving") or {}
+        slots = int(c["judge_slots"] if c.get("judge_slots") is not None else (1 if serving.get("slots_per_gpu") is None else serving["slots_per_gpu"]))
+        ctx_per_slot = int(serving["ctx_per_slot"] if serving.get("ctx_per_slot") is not None else env.deployment["context"])
+        ev = Evaluator(
+            tc, env, decoding, slots, ctx_per_slot, env.deployment["kv_type"], out_dir / "episodes",
+            cache_prompt=(False if c.get("judge_cache_prompt") is None else bool(c["judge_cache_prompt"])),
+            special=serving.get("special"),
+            flash_attn=("on" if serving.get("flash_attn") is None else serving["flash_attn"]),
+            use_chat_completions=serving.get("use_chat_completions"),
+        )
+        side_seed = c.get("side_seed")
+        if c.get("heldout_ids") is not None:
+            held_ids = list(c["heldout_ids"])
+            missing_ids = [i for i in held_ids if i not in by_id]
+            if missing_ids:
+                raise ValueError(f"unknown heldout_ids: {missing_ids[:10]}")
+        else:
+            held_ids = [t.id for t in env.tasks() if t.split == "train" and _side(t.id, seed=side_seed) == 1]
+        held_tasks = [by_id[i] for i in held_ids]
+        sel_tasks = [t for t in env.tasks() if t.split == "select" and _side(t.id, seed=side_seed) == 1]
+        if c.get("select_limit") is not None:
+            sel_tasks = _stratified_select(
+                sel_tasks,
+                int(c["select_limit"]),
+                key_fn=lambda t: (t.meta or {}).get("category") or (t.meta or {}).get("area") or t.family,
+                id_fn=lambda t: t.id,
+            )
         ref_model = str(c.get("gate_ref_model") or base_model)
         ref_sel = ok_rows(ev.run(ref_model, [(t, util.stable_seed("learn-sel", t.id)) for t in sel_tasks], "learn-ref-sel", "src")) if sel_tasks else []
 
+        gate_margin = 0.03 if c.get("gate_margin") is None else float(c["gate_margin"])
+        alpha = 0.05 if c.get("alpha") is None else float(c["alpha"])
         for arm_name, arm_path in arms.items():
             h_rows = ok_rows(ev.run(arm_path, [(t, util.stable_seed("learn-held", t.id)) for t in held_tasks], f"learn-{arm_name}-held", "cand")) if held_tasks else []
             s_rows = ok_rows(ev.run(arm_path, [(t, util.stable_seed("learn-sel", t.id)) for t in sel_tasks], f"learn-{arm_name}-sel", "cand")) if sel_tasks else []
-            bnd = stats.delta_and_bounds(s_rows + ref_sel, float(c.get("alpha", 0.05))) if (s_rows and ref_sel) else {"delta": 0.0, "L": 0.0, "U": 0.0}
+            if not sel_tasks:
+                bnd = {"delta": 0.0, "L": 0.0, "U": 0.0}
+                g_pass = True
+            elif not s_rows or not ref_sel:
+                bnd = {"delta": None, "L": None, "U": None}
+                g_pass = False
+            else:
+                bnd = stats.delta_and_bounds(s_rows + ref_sel, alpha)
+                g_pass = bool(math.isfinite(bnd["L"]) and bnd["L"] > -gate_margin)
             env_metrics[arm_name] = {
                 "heldout_n": len(h_rows),
                 "heldout_passed": int(sum(bool(r["success"]) for r in h_rows)),
-                "heldout_rate": float(sum(bool(r["success"]) for r in h_rows) / max(1, len(h_rows))) if h_rows else None,
+                "heldout_rate": float(sum(bool(r["success"]) for r in h_rows) / len(h_rows)) if h_rows else None,
                 "select_n": len(s_rows),
-                "select_rate": float(sum(bool(r["success"]) for r in s_rows) / max(1, len(s_rows))) if s_rows else None,
+                "select_rate": float(sum(bool(r["success"]) for r in s_rows) / len(s_rows)) if s_rows else None,
                 "select_delta": bnd["delta"],
                 "select_L": bnd["L"],
-                "gate_pass": bool(bnd["L"] > -float(c.get("gate_margin", 0.03))),
+                "gate_pass": g_pass,
             }
         if held_tasks:
             l_rate = env_metrics["learned"]["heldout_rate"]
-            ctrl_rates = [env_metrics[k]["heldout_rate"] for k in ("base", "empty", "flipped", "shuffled") if k in env_metrics and env_metrics[k]["heldout_rate"] is not None]
-            accepted = bool(env_metrics["learned"]["gate_pass"] and all(l_rate > cr for cr in ctrl_rates))
+            ctrl_keys = [k for k in ("base", "empty", "flipped", "shuffled") if k in env_metrics]
+            ctrl_rates = [env_metrics[k]["heldout_rate"] for k in ctrl_keys]
+            accepted = bool(
+                l_rate is not None
+                and math.isfinite(l_rate)
+                and env_metrics["learned"]["gate_pass"]
+                and "base" in env_metrics
+                and all(cr is not None and math.isfinite(cr) and l_rate > cr for cr in ctrl_rates)
+            )
+        elif sel_tasks:
+            accepted = bool(accepted and env_metrics["learned"]["gate_pass"])
 
     res = {
         "accepted": accepted,
@@ -1816,7 +3020,7 @@ def run_generative(cfg: dict, fold: int | None = None, log=print) -> dict:
 def run(cfg: dict, fold: int | None = None, log=print) -> dict:
     """`chantless.cli learn`: train on feedback, materialize switches/levels, judge the real file + controls."""
     c = cfg["learn"]
-    if c.get("mode") == "generative" or c.get("method") == "gates_seq":
+    if c.get("mode") == "generative" or c.get("method") == "gates_seq" or c.get("task_kind") == "generative":
         return run_generative(cfg, fold=fold, log=log)
     from .runtime import BatchScorer, Toolchain
 
@@ -1830,36 +3034,49 @@ def run(cfg: dict, fold: int | None = None, log=print) -> dict:
     hold = [i for i, r in enumerate(fb) if fold is None or r.get("fold") == fold]
     fdocs, pool = read_trj(c["feedback_trj"]), read_trj(c["pool_trj"])
     assert len(pool) == ncal + len(rows)
-    rng = random.Random(c.get("seed", 20261031))
+    rng = random.Random(20261031 if c.get("seed") is None else c["seed"])
     side0 = [ncal + i for i, r in enumerate(rows) if row_side(r, c) == 0]
-    picks = rng.sample(range(ncal), c.get("replay_humans", 1000)) + rng.sample(side0, c.get("replay_select", 1000))
+    rh = 1000 if c.get("replay_humans") is None else int(c["replay_humans"])
+    rs = 1000 if c.get("replay_select") is None else int(c["replay_select"])
+    picks = rng.sample(range(ncal), rh) + rng.sample(side0, rs)
     strata = None
     if c.get("stratify"):
         kind = lambda i: ("beemo" if rows[i - ncal]["task"].startswith("beemo") else "wo", "human" if rows[i - ncal]["verdict"] != "ai" else "ai")
         beemo = [i for i in side0 if kind(i)[0] == "beemo"]
         wo = [i for i in side0 if kind(i)[0] == "wo"]
-        picks = rng.sample(range(ncal), c.get("replay_humans", 1000)) + beemo + rng.sample(wo, c.get("replay_select", 1000))
-        strata = ["human-cal"] * c.get("replay_humans", 1000) + [f"{kind(i)[1]}-{kind(i)[0]}" for i in picks[c.get("replay_humans", 1000):]]
-    scorer = BatchScorer(Toolchain.from_config(cfg["toolchain"]), c.get("slots_per_gpu", 2))
+        picks = rng.sample(range(ncal), rh) + beemo + rng.sample(wo, rs)
+        strata = ["human-cal"] * rh + [f"{kind(i)[1]}-{kind(i)[0]}" for i in picks[rh:]]
+    slots_pg = 2 if c.get("slots_per_gpu") is None else int(c["slots_per_gpu"])
+    scorer = BatchScorer(Toolchain.from_config(cfg["toolchain"]), slots_pg)
     if c.get("tails"):
         # the documents that decide the operating point: the humans who set the 1% cutoff, and the AI just under it
         p, _ = real_scores(c["model"], c, scorer)
-        tail = np.argsort(p[:ncal])[:c.get("tail_n", 500)].tolist()
+        tail_n = 500 if c.get("tail_n") is None else int(c["tail_n"])
+        near_n = 300 if c.get("near_n") is None else int(c["near_n"])
+        tail = np.argsort(p[:ncal])[:tail_n].tolist()
         ai = [i for i in side0 if rows[i - ncal]["verdict"] == "ai"]
-        near = sorted(ai, key=lambda i: -p[i])[:c.get("near_n", 300)]
+        near = sorted(ai, key=lambda i: -p[i])[:near_n]
         picks += tail + near
+        if strata is None:
+            strata = ["all"] * (len(picks) - len(tail) - len(near))
         strata += ["human-tail"] * len(tail) + ["ai-near"] * len(near)
     feedback = [dict(fb[i], tokens=fdocs[fb[i]["index"]]) for i in train]
     tag = "all" if fold is None else f"fold{fold}"
     out = str(out_dir / f"model-{tag}.gguf")
     trainer = learn_gates if c.get("method") == "gates" else learn
-    rec = trainer(c["model"], c["config_dir"], feedback, [pool[i] for i in picks], pair, c["cutoff"], out, c, log, strata=strata)
+    config_dir = str(c["config_dir"]) if c.get("config_dir") else None
+    rec = trainer(c["model"], config_dir, feedback, [pool[i] for i in picks], pair, c["cutoff"], out, c, log, strata=strata)
     base = judge(c["model"], c, scorer, rows, fb, hold)
     cand = judge(out, c, scorer, rows, fb, hold)
     rise = cand["human_flagged_beemo"] - base["human_flagged_beemo"]
     better = hold and cand["held"]["pairs"] and cand["held"]["mean_gap"] > base["held"]["mean_gap"]
-    drop = max(base["caught_wo"] - cand["caught_wo"], base["caught_beemo"] - cand["caught_beemo"])    # enforce per-subset recall drop cap alongside the pooled gate
-    accepted = bool(cand["gate_pass"] and rise <= c.get("max_human_rise", .01) and drop <= c.get("max_ai_drop", .02) and better)
+    drop_wo = base["caught_wo"] - cand["caught_wo"]
+    drop_beemo = base["caught_beemo"] - cand["caught_beemo"]
+    finite_drop = math.isfinite(drop_wo) and math.isfinite(drop_beemo)
+    drop = max(drop_wo, drop_beemo) if finite_drop else float("nan")    # enforce per-subset recall drop cap alongside the pooled gate
+    max_human_rise = 0.01 if c.get("max_human_rise") is None else float(c["max_human_rise"])
+    max_ai_drop = 0.02 if c.get("max_ai_drop") is None else float(c["max_ai_drop"])
+    accepted = bool(cand["gate_pass"] and math.isfinite(rise) and finite_drop and rise <= max_human_rise and drop <= max_ai_drop and better)
     res = {"accepted": accepted, "fold": fold, "lineage": rec, "base": base, "candidate": cand, "split": "select_side1"}
     (out_dir / f"result-{tag}.json").write_text(json.dumps(res, indent=1))
     log(f"learn {tag}: accepted={accepted} gate L {cand['L']:.4f} held pairs right {base['held']['pairs_right']} -> {cand['held']['pairs_right']}, "

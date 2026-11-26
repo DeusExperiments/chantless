@@ -18,6 +18,7 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--reset", choices=PHASES, help="clear this phase marker and all later ones")
     p.add_argument("--out-mask", help="optional path to export the resulting chantless.mask/v3 JSON")
     p.add_argument("--out", help="optional path to export the built specialist GGUF")
+    p.add_argument("--cache-prompt", action=argparse.BooleanOptionalAction, default=None, help="override serving.cache_prompt from config")
 
 
 def _load_validated(path: str, kind: str, overrides: list[str] | None):
@@ -83,7 +84,7 @@ def main():
     sw.add_argument("--stop-on-failure", action="store_true", help="halt scheduling remaining cells after first failure")
 
     sc = sub.add_parser("schema", help="export Pydantic v2 JSON Schema for Chantless config files")
-    sc.add_argument("kind", nargs="?", default="all", choices=("extract", "learn", "sweep", "all"))
+    sc.add_argument("kind", nargs="?", default="all", choices=("extract", "learn", "sweep", "anneal", "all"))
     sc.add_argument("--out", help="optional output path for schema JSON")
 
     vl = sub.add_parser("validate", help="strictly validate a Chantless JSON/YAML config file (with extends and --set)")
@@ -151,6 +152,9 @@ def main():
         p.add_argument("--kv-type", default="f16")
         p.add_argument("--alias", help="OpenAI API model alias")
         p.add_argument("--webui", action="store_true", help="enable llama-server WebUI (off by default)")
+        p.add_argument("--special", action=argparse.BooleanOptionalAction, default=None, help="pass --special to llama-server (auto-detected for Inkling-2 when omitted; use --no-special to force off)")
+        p.add_argument("--cache-prompt", action=argparse.BooleanOptionalAction, default=False, help="enable llama-server prompt caching (disabled by default)")
+        p.add_argument("--flash-attn", default="on", choices=("on", "off", "auto"), help="llama-server flash attention mode (on, off, auto; default: on)")
         p.add_argument("--no-metrics", action="store_true", help="disable /metrics endpoint")
         p.add_argument("--log", help="optional llama-server log path")
         p.add_argument("--threads", type=int, default=8, help="quantize threads on auto-build cache miss")
@@ -168,7 +172,7 @@ def main():
     bn = sub.add_parser("bench", help="benchmark a built GGUF or thin mask and emit JSON telemetry receipt")
     _add_serve_args(bn, default_bench=True)
 
-    dr = sub.add_parser("doctor", help="validate llama.cpp@a01dff9 binaries, C++ tools, CUDA/Metal, Python deps, and /dev/shm")
+    dr = sub.add_parser("doctor", help="validate llama.cpp@afe77e18 binaries, C++ tools, CUDA/Metal, Python deps, and /dev/shm")
     dr.add_argument("--config", help="optional extract/learn config JSON/YAML to read toolchain paths from")
     dr.add_argument("--llama-bin", help="directory containing llama-server, llama-quantize, llama-imatrix")
     dr.add_argument("--traj-kl", help="path to traj-kl binary")
@@ -178,13 +182,17 @@ def main():
     dr.add_argument("--model-gb", type=float, help="optional BF16 model size in GiB to preview scratch and tier-cache layout")
     dr.add_argument("--require-classifier", action="store_true", help="require logodds and tokdocs binaries")
     dr.add_argument("--require-cuda", action="store_true", help="require NVIDIA CUDA availability")
+    dr.add_argument("--llama-commit", default=None, help="expected llama-server --version commit substring (default: afe77e1)")
 
     a = ap.parse_args()
     if a.cmd == "doctor":
         from . import config as cfgmod, doctor as drmod
         llama_bin, traj_kl, logodds, tokdocs, run_root = a.llama_bin, a.traj_kl, a.logodds, a.tokdocs, a.run_root
         if a.config:
-            raw = cfgmod.load_raw_with_extends(a.config)
+            try:
+                raw = cfgmod.load_raw_with_extends(a.config)
+            except (FileNotFoundError, ValueError, OSError) as e:
+                raise SystemExit(f"doctor failed reading config ({a.config}): {e}")
             tc = raw.get("toolchain") or {}
             llama_bin = llama_bin or tc.get("llama_bin")
             traj_kl = traj_kl or tc.get("traj_kl")
@@ -201,6 +209,7 @@ def main():
             model_gb=a.model_gb,
             require_classifier=a.require_classifier,
             require_cuda=a.require_cuda,
+            llama_commit=a.llama_commit or drmod.PINNED_LLAMA_COMMIT,
         )
         print(json.dumps(res, indent=2))
         if not res["ok"]:
@@ -233,6 +242,9 @@ def main():
                     prompt_tokens=a.prompt_tokens,
                     gen_tokens=a.gen_tokens,
                     runs=a.runs,
+                    special=a.special,
+                    cache_prompt=a.cache_prompt,
+                    flash_attn=a.flash_attn,
                 )
             else:
                 out = svmod.serve_live(
@@ -248,6 +260,9 @@ def main():
                     metrics=not a.no_metrics,
                     webui=a.webui,
                     log_path=a.log,
+                    special=a.special,
+                    cache_prompt=a.cache_prompt,
+                    flash_attn=a.flash_attn,
                 )
         except (ValueError, FileNotFoundError, RuntimeError) as e:
             raise SystemExit(f"{a.cmd} failed: {e}")
@@ -343,7 +358,10 @@ def main():
         print(json.dumps(res.to_dict(), indent=2))
         return
 
-    cfg = _load_validated(a.config, a.cmd, getattr(a, "overrides", None)).to_raw_dict()
+    overrides = list(getattr(a, "overrides", None) or [])
+    if a.cmd in ("extract", "run") and getattr(a, "cache_prompt", None) is not None:
+        overrides.append(f"serving.cache_prompt={'true' if a.cache_prompt else 'false'}")
+    cfg = _load_validated(a.config, a.cmd, overrides or None).to_raw_dict()
     if a.cmd == "anneal":
         from .anneal import main as anneal_main
         anneal_main(cfg, a)

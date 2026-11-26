@@ -15,7 +15,7 @@ from pathlib import Path
 
 import gguf
 
-from . import gguf_ops, mask as mk
+from . import gguf_ops, mask as mk, oneshot
 from .learner import LearnerState, legal_moves
 
 # Effective rates, not peaks. tflops: prefill per GPU at 2 x params FLOPs per token; decode_gbps: weight bytes
@@ -34,13 +34,15 @@ RATES = {
 
 
 def tensor_bytes(t: dict, tier: str) -> int:
-    """Bytes of one quantizable tensor at `tier`; a row length the block size does not divide falls back to Q8_0."""
+    """Bytes of one quantizable tensor at `tier`, matching `llama-quant.cpp:tensor_type_fallback`."""
     if tier == mk.DROP:
         return 0
-    qt = gguf.GGMLQuantizationType[tier]
+    key = tier.upper()
+    eff = oneshot._llama_fallback_type(int(t["shape"][0]), key) if key in oneshot.BLOCK else key
+    qt = gguf.GGMLQuantizationType[eff]
     blk, size = gguf.GGML_QUANT_SIZES[qt]
-    if t["shape"][0] % blk:
-        blk, size = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.Q8_0]
+    if int(t["shape"][0]) % blk:
+        blk, size = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.F16]
     return t["n_elements"] // blk * size
 
 
@@ -48,9 +50,17 @@ class SizeModel:
     """Built-file bytes of a mask, from the source header: quantizable tensors at their tier, the rest as stored."""
 
     def __init__(self, path: str):
-        self.inv = gguf_ops.inventory(path)
+        h = gguf_ops._Hdr(path)
+        try:
+            self.inv = [
+                {"name": t["name"], "type": t["type"], "shape": t["dims"], "n_elements": t["n_elements"], "n_bytes": t["n_bytes"]}
+                for t in h.tensors
+            ]
+            kvs = h.parsed_kvs(skip_large_arrays=True)
+        finally:
+            h.close()
         self.by_name = {t["name"]: t for t in self.inv}
-        self.groups = gguf_ops.groups_from_inventory(self.inv)
+        self.groups = gguf_ops.groups_from_inventory(self.inv, kvs=kvs)
         self.params = sum(t["n_elements"] for t in self.inv)
         self.file_bytes = gguf_ops.file_bytes(path)
         self.overhead = self.file_bytes - sum(t["n_bytes"] for t in self.inv)   # metadata and alignment
@@ -96,14 +106,14 @@ def _receipt(run_dir: Path, rel: str):
 
 
 def _moves(cfg, sm: SizeModel, start: dict, A: list) -> dict:
-    ladder, lc = cfg["ladder"], cfg.get("learner", {})
+    ladder, lc = cfg["ladder"], cfg.get("learner") or {}
     groups = sm.groups
     sweep = legal_moves(LearnerState(mask=start), groups, ladder)
     # one rung up as the exchange phase allows it: never above ladder[1]; a dropped group returns at its cheapest tier
     up = sum(1 for g, e in start["groups"].items()
              if (e["tier"] == mk.DROP) or ladder.index(e["tier"]) > 1)
     start_b = sm.mask_bytes(start)
-    target = lc.get("target_bytes", 0)
+    target = lc.get("target_bytes") or 0
 
     def greedy(allow_drop: bool, stop: int) -> int:
         m, b, n = copy.deepcopy(start), start_b, 0
@@ -122,7 +132,7 @@ def _moves(cfg, sm: SizeModel, start: dict, A: list) -> dict:
     out = {"start_bytes": start_b, "target_bytes": target or None, "legal_per_sweep": len(sweep),
            "legal_per_sweep_with_up": len(sweep) + up, "rung_moves": len(rung), "drop_moves": len(sweep) - len(rung),
            "mean_rung_saving": int(sum(rung) / max(1, len(rung)))}
-    max_moves = lc.get("max_moves", 10 ** 9)
+    max_moves = 10 ** 9 if lc.get("max_moves") is None else lc["max_moves"]
     if target and start_b > target:
         out["fewest"] = greedy(True, target)
         out["fewest_rungs_only"] = greedy(False, target)
@@ -154,8 +164,12 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         if miss:
             raise ValueError(f"rates[{k!r}] is a new backend and lacks {', '.join(miss)}")
     run_dir = Path(cfg["run_root"]) / cfg["run_id"]
-    lc, st, pc, sc = cfg.get("learner", {}), cfg.get("stats", {}), cfg.get("pool", {}), cfg.get("sanity", {})
-    px, scr = cfg.get("proxy", {}), cfg.get("screen", {})
+    lc = cfg.get("learner") or {}
+    st = cfg.get("stats") or {}
+    pc = cfg.get("pool") or {}
+    sc = cfg.get("sanity") or {}
+    px = cfg.get("proxy") or {}
+    scr = cfg.get("screen") or {}
     ladder = cfg["ladder"]
 
     # ---- model and groups
@@ -184,7 +198,7 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         start = sanity_mask
         A.append("start mask: this run's sanity/sanity_mask.json (its floors apply)")
     else:
-        start = mk.new_mask(groups, cfg["start_tier"], {}, cfg.get("objective_mode", "preserve"))
+        start = mk.new_mask(groups, cfg["start_tier"], {}, cfg.get("objective_mode") or "preserve")
         start["groups"] = {g: {"tier": mk.clip(groups[g], cfg["start_tier"], ladder)} for g in start["groups"]}
         A.append(f"start mask: uniform {cfg['start_tier']} with no sanity floors (floors only remove moves)")
     A.append("built bytes from the header: quantizable tensors at their tier (Q8_0 where the block size does not divide a row), "
@@ -193,10 +207,12 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     acc = moves["planned"]
 
     # ---- environment
-    env, toks, classifier = None, None, bool(cfg["env"].get("kwargs", {}).get("classifier", False))
+    env_cfg = cfg.get("env") or {}
+    env_kw = env_cfg.get("kwargs") or {}
+    env, toks, classifier = None, None, bool(env_kw.get("classifier", False))
     try:
         from .env.protocol import load_environment
-        env = load_environment(cfg["env"]["module"], **cfg["env"].get("kwargs", {}))
+        env = load_environment(env_cfg["module"], **env_kw)
         classifier = bool(getattr(env, "classifier", False))
         avail = Counter(t.split for t in env.tasks())
     except Exception as e:  # noqa: BLE001 - a plan must still print without the data
@@ -211,11 +227,11 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     if toks is None:
         toks = {}
         A.append("no env.token_counts(): 1,000 prompt tokens per task")
-    budget = env.budget if env is not None else {}
+    budget = (env.budget if env is not None else None) or {}
     if classifier:
         dec = 0.0
     elif budget.get("max_turns"):
-        dec = 0.5 * budget["max_turns"] * budget.get("max_tokens_per_turn", 512)
+        dec = 0.5 * budget["max_turns"] * (budget.get("max_tokens_per_turn") or 512)
         A.append(f"{dec:.0f} decoded tokens per episode: half the turn budget")
     elif "max_tokens" in budget:
         dec = float(budget["max_tokens"])
@@ -223,9 +239,9 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         dec = 256.0
         A.append("256 decoded tokens per episode (no environment budget known)")
     mean = lambda s: toks.get(s, {}).get("mean", 1000.0)
-    tps = pc.get("tasks_per_split", {})
+    tps = pc.get("tasks_per_split") or {}
     n_of = lambda s, n: min(n, avail[s]) if avail.get(s) else n
-    pool_n = {s: n_of(s, n) for s, n in tps.items() if s != "exam"}
+    pool_n = {s: n_of(s, int(n)) for s, n in tps.items() if s != "exam" and n is not None}
     sel = pool_n.get("select", 0)
     n_search = pool_n.get("search", 0)
     A.append("every screened task counts as reliable (the pool's pass rule only shrinks the counts)")
@@ -236,21 +252,29 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         n_gate = aa["n_gate"]
         A.append("gate size from this run's aa.json")
     else:
-        n_gate = st.get("n_floor", 0)
+        n_gate = st.get("n_floor") or 0
         A.append(f"gate size = n_floor {n_gate}: the A/A sample-size rule can only raise it")
-    k_gate = lambda n: min(st.get("max_eps_per_task", 1), max(1, math.ceil(n_gate / max(1, n))))
-    exam_n = n_of("exam", tps.get("exam", tps.get("select", 0)))
-    n_screens = acc // lc.get("screen_every", 4) if lc.get("screen_every") else 0
-    n_gates = acc // math.lcm(lc.get("screen_every", 4), lc.get("gate_every", 10 ** 9)) if lc.get("screen_every") else 0
-    n_beh = sc.get("behavioral_items", 0) * sc.get("behavioral_seeds", 1)
+    max_eps = st.get("max_eps_per_task") or 1
+    k_gate = lambda n: min(max_eps, max(1, math.ceil(n_gate / max(1, n))))
+    raw_exam = tps.get("exam") if tps.get("exam") is not None else tps.get("select")
+    exam_n = n_of("exam", 0 if raw_exam is None else int(raw_exam))
+    screen_every = 4 if lc.get("screen_every") is None else int(lc["screen_every"])
+    gate_every = 10 ** 9 if lc.get("gate_every") is None else int(lc["gate_every"])
+    n_screens = acc // screen_every if screen_every > 0 else 0
+    n_gates = acc // math.lcm(screen_every, gate_every) if (screen_every > 0 and gate_every > 0) else 0
+    n_beh = (sc.get("behavioral_items") or 0) * (sc.get("behavioral_seeds") or 1)
 
     # ---- store sizes (tokens scored per probe)
-    gen_tok = px.get("general_seq_len", 1024) * px.get("general_n_seq", 4)
-    cap_kind = sc.get("cap", "general_kl")
+    gen_seq_len = px.get("general_seq_len") or 1024
+    gen_n_seq = 4 if px.get("general_n_seq") is None else px["general_n_seq"]
+    gen_tok = gen_seq_len * gen_n_seq
+    cap_kind = sc.get("cap") or "general_kl"
     pj = _receipt(run_dir, "proxy/proxy.json")
+    tmt = 3000 if px.get("task_max_targets") is None else int(px["task_max_targets"])
     if classifier:
-        spec = px.get("spec", {})   # the pipeline passes proxy.spec to env.proxy_spec
-        n_neg, n_pos = spec.get("n_neg", 1000), spec.get("n_pos", 600)
+        spec = px.get("spec") or {}   # the pipeline passes proxy.spec to env.proxy_spec
+        n_neg = 1000 if spec.get("n_neg") is None else spec["n_neg"]
+        n_pos = 600 if spec.get("n_pos") is None else spec["n_pos"]
         task_tok = n_neg * mean("calibration") + n_pos * mean("search")
         A.append(f"log-odds store: {n_neg} calibration negatives + {n_pos} search positives (proxy.spec.n_neg / n_pos)")
         if cap_kind == "off":
@@ -260,10 +284,10 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         task_tok, gen_tok = pj["task"]["n_tokens"], pj["general"]["n_tokens"]
         A.append("store sizes from this run's proxy/proxy.json")
     elif toks:
-        task_tok = px.get("task_max_targets", 3000) * mean("search")
+        task_tok = tmt * mean("search")
         A.append("task store: one target per document (task_max_targets x mean search tokens)")
     else:
-        task_tok = 2 * px.get("task_max_targets", 3000)
+        task_tok = 2 * tmt
         A.append("task store: half the rendered tokens are targets (2 x task_max_targets)")
     probe_tok = gen_tok + task_tok
 
@@ -273,13 +297,17 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     solo_tiers = sc.get("solo_tiers") or ladder[1:]
     n_solo = sum(sum(1 for t in solo_tiers if t in ladder and mk.tier_allowed(groups[g], t)) + groups[g]["droppable"]
                  for g in real)
-    per_step = L if lc.get("reprobe_every", 8) == 1 else lc.get("top_k", 16) + 1
-    n_fb = n_screens if lc.get("feedback", True) else 0
-    rounds = lc.get("exchange_rounds", 0)
-    search_probes = 1 + L + acc * per_step + n_screens * (1 + (L if lc.get("reprobe_after_screen", True) else 0))
-    fb_probes = n_fb * (lc.get("screen_every", 4) + 1)
-    ex_probes = rounds * (L_up + lc.get("exchange_top_k", 32))
-    A.append(f"search probes: a full sweep at the start{' and after every screen' if lc.get('reprobe_after_screen', True) else ''}, "
+    top_k = 16 if lc.get("top_k") is None else lc["top_k"]
+    per_step = L if lc.get("reprobe_every", 8) == 1 else top_k + 1
+    feedback_on = True if lc.get("feedback") is None else bool(lc["feedback"])
+    n_fb = n_screens if feedback_on else 0
+    rounds = lc.get("exchange_rounds") or 0
+    reprobe_after = True if lc.get("reprobe_after_screen") is None else bool(lc["reprobe_after_screen"])
+    ex_top_k = 32 if lc.get("exchange_top_k") is None else lc["exchange_top_k"]
+    search_probes = 1 + L + acc * per_step + n_screens * (1 + (L if reprobe_after else 0))
+    fb_probes = n_fb * (screen_every + 1)
+    ex_probes = rounds * (L_up + ex_top_k)
+    A.append(f"search probes: a full sweep at the start{' and after every screen' if reprobe_after else ''}, "
              f"then {per_step} per accepted move; every probe scores every store (the general-cap shortcut ignored)")
     if n_fb:
         A.append("feedback: every screen is assumed to yield failures (one failure store and one revert trial per windowed move)")
@@ -311,7 +339,12 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         if items:
             work.append({"stage": stage, "items": int(items), "prefill_tokens": float(tok), "decode_tokens": float(dec_tok)})
 
-    src_scores = cfg.get("exam", {}).get("source_scores")
+    exam_cfg = cfg.get("exam") or {}
+    src_scores = exam_cfg.get("source_scores")
+    scr_pairs = scr.get("pairs") or 0
+    fb_tasks_n = lc.get("feedback_tasks") or 0
+    runs = pc.get("runs") or 1
+    n_aa = st.get("n_aa") or 0
     if classifier:
         # one score per distinct task per model; each new model is calibrated once on the calibration split
         n_cal = avail.get("calibration") or toks.get("calibration", {}).get("n", 0)
@@ -325,8 +358,8 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         add("calibration", n_models * n_cal, n_models * cal_tok)
         add("pool (source)", sum(pool_n.values()), sum(n * mean(s) for s, n in pool_n.items()))
         add("A/A (source)", 2 * sel, 2 * sel * mean("select"))
-        add("screens", n_screens * (min(scr.get("pairs", 0), sel) + min(lc.get("feedback_tasks", 0), n_search)),
-            n_screens * (min(scr.get("pairs", 0), sel) * mean("select") + min(lc.get("feedback_tasks", 0), n_search) * mean("search")))
+        add("screens", n_screens * (min(scr_pairs, sel) + min(fb_tasks_n, n_search)),
+            n_screens * (min(scr_pairs, sel) * mean("select") + min(fb_tasks_n, n_search) * mean("search")))
         g_mult = 1 if st.get("reuse_source") else 2
         add("gates", (n_gates + 1) * sel * g_mult, (n_gates + 1) * sel * g_mult * mean("select"))
         ex_src = 0 if src_scores else exam_n
@@ -335,16 +368,17 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     else:
         def eps(stage, n, split):
             add(stage, n, n * mean(split), n * dec)
-        eps("pool (source)", sum(n * pc.get("runs", 1) for n in pool_n.values()), "search")
-        k_aa = min(st.get("max_eps_per_task", 1), max(1, math.ceil(st.get("n_aa", 0) / max(1, sel))))
+        eps("pool (source)", sum(n * runs for n in pool_n.values()), "search")
+        k_aa = min(max_eps, max(1, math.ceil(n_aa / max(1, sel))))
         eps("A/A (source)", 2 * sel * k_aa, "select")
-        eps("screens", n_screens * min(scr.get("pairs", 0), sel), "select")
-        eps("feedback", n_screens * min(lc.get("feedback_tasks", 0), n_search), "search")
+        eps("screens", n_screens * min(scr_pairs, sel), "select")
+        eps("feedback", n_screens * min(fb_tasks_n, n_search), "search")
         g_mult = 1 if st.get("reuse_source") else 2
         eps("gates", (n_gates + 1) * sel * k_gate(sel) * g_mult, "select")
-        ex_pool = 0 if src_scores else exam_n * pc.get("runs", 1)
+        ex_pool = 0 if src_scores else exam_n * runs
         ex_src = 0 if (st.get("reuse_source") or src_scores) else exam_n * k_gate(exam_n)
-        eps("exam", ex_pool + exam_n * k_gate(exam_n) + ex_src + n_base_models * exam_n * cfg.get("exam", {}).get("baseline_eps_per_task", 1), "exam")
+        base_eps = exam_cfg.get("baseline_eps_per_task") or 1
+        eps("exam", ex_pool + exam_n * k_gate(exam_n) + ex_src + n_base_models * exam_n * base_eps, "exam")
         nb = n_beh * (1 + n_screens + n_gates + 2)
         add("behavioral", nb, nb * 40, nb * 16)
         add("proxy stores (source)", 2, 2 * probe_tok)
@@ -362,8 +396,10 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
     tot_pre = sum(w["prefill_tokens"] for w in work)
     tot_dec = sum(w["decode_tokens"] for w in work)
     n_builds = sum(builds.values())
-    slots = cfg.get("serving", {}).get("slots_per_gpu", 4)
-    gb = sm.file_bytes / 1e9
+    slots = (cfg.get("serving") or {}).get("slots_per_gpu") or 4
+    gb = max(1e-9, sm.file_bytes / 1e9)
+    max_hours = (cfg.get("budget") or {}).get("max_hours")
+    max_hours = float("inf") if max_hours is None else float(max_hours)
     A.append(f"decode reads the source's {gb:.2f} GB of weights per step on each of {slots} batched slots per GPU; "
              "server start-up, model loads and imatrix are not counted")
     A.append("builds run beside scoring only up to build_parallel at once; scoring spreads over every GPU of a backend")
@@ -375,7 +411,7 @@ def estimate(cfg: dict, rates: dict | None = None, source: str | None = None) ->
         h = (pre_s + dec_s + bld_s) / 3600
         backends[name] = {"label": r.get("label", name), "hours": h, "usd": h * r["usd_per_hour"],
                           "prefill_h": pre_s / 3600, "decode_h": dec_s / 3600, "build_h": bld_s / 3600,
-                          "within_budget": h <= cfg.get("budget", {}).get("max_hours", float("inf")), "basis": r.get("basis", "")}
+                          "within_budget": h <= max_hours, "basis": r.get("basis", "")}
     return {"run_id": cfg["run_id"], "env": cfg["env"]["module"], "classifier": classifier,
             "model": {"params": sm.params, "source_bytes": sm.file_bytes, "groups": len(real), "ladder": ladder},
             "moves": moves, "probes": probes, "builds": builds, "work": work,

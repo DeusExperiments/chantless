@@ -138,7 +138,7 @@ Because a specialist mask is `6–53 KB` while the frozen base checkpoint is gig
 
 - **Streaming local materialization:** The builder quantizes and packs kept tensors directly from memory-mapped source chunks, avoiding full-BF16 GPU residency.
 - **Concurrent skill unions:** Multiple active mask-only specialists sharing identical `(source_revision, tensor_name, ggml_type, imatrix)` entries share those quantized representations once in storage rather than duplicating full checkpoints.
-- **Deterministic CLI rebuilds:** Unified `llama.cpp @ a01dff9` ([`../mvp/patches/llama-cpp-a01dff9-chantless.patch`](../mvp/patches/llama-cpp-a01dff9-chantless.patch)) rebuilds byte-exact SHA256 specialists cleanly from `stock GGUF + mask JSON`.
+- **Deterministic CLI rebuilds:** Unified `llama.cpp @ afe77e18` ([`../mvp/patches/llama-cpp-afe77e18-chantless.patch`](../mvp/patches/llama-cpp-afe77e18-chantless.patch)) rebuilds byte-exact SHA256 specialists cleanly from `stock GGUF + mask JSON`.
 
 ---
 

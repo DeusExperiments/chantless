@@ -18,6 +18,7 @@ import struct
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -48,6 +49,8 @@ def mask_key(mask: dict) -> str:
     if maskmod.has_v3_cuts(mask):
         core["dead_tensors"] = sorted(mask.get("dead_tensors") or ())
         core["widths"] = mask.get("widths") or {}
+        if mask.get("experts"):
+            core["experts"] = mask["experts"]
         core["vocab_keep"] = mask.get("vocab_keep")
         app = mask.get("apprentice") or {}
         if app.get("switches") or app.get("levels"):
@@ -82,10 +85,14 @@ def _apply_apprentice(gguf_in: str | Path, gguf_out: str | Path, app: dict) -> N
             if len(dead) == 0:
                 continue
             if switch_mode == "up_row_zero":
-                for suf in ("ffn_up.weight", "ffn_gate.weight"):
+                for suf in ("ffn_up.weight", "ffn_gate.weight", "ffn_up_exps.weight", "ffn_gate_exps.weight"):
                     tname = f"blk.{il}.{suf}"
                     if tname in art.tensors:
                         row_zeros[tname] = dead
+                gu_name = f"blk.{il}.ffn_gate_up_exps.weight"
+                if gu_name in art.tensors:
+                    half = int(art.tensors[gu_name]["dims"][1]) // 2
+                    row_zeros[gu_name] = np.concatenate([dead, half + dead])
             else:
                 name = f"blk.{il}.ffn_down.weight"
                 shape = art.shape(name)
@@ -132,6 +139,7 @@ class Builder:
         inv = gguf_ops.inventory(self.weights)
         self.source_params = sum(t["n_elements"] for t in inv)
         self.source_types = {t["name"]: t["type"] for t in inv}
+        self.source_ndims = {t["name"]: len(t["shape"]) for t in inv}
 
     def _pruned(self, drop: set[str]) -> str:
         if not drop:
@@ -155,15 +163,22 @@ class Builder:
         maskmod.validate(m, self.groups)
         types, drop = maskmod.tensor_plan(m, self.groups)
         widths = maskmod.kept_widths(m)
+        experts = maskmod.kept_experts(m)
         vocab_spec = m.get("vocab_keep")
         app = m.get("apprentice") or {}
         has_app = bool(app.get("switches") or app.get("levels"))
         out = Path(out) if out else self.work / f"cand-{mask_key(m)}.gguf"
         out.parent.mkdir(parents=True, exist_ok=True)
+        fixed_pins = {
+            n: self.source_types[n]
+            for g in self.groups.values()
+            for n in g["fixed"]
+            if n not in drop and n in self.source_types and self.source_ndims[n] >= 2
+        }
 
         tmp_var = tmp_im = tmp_q = tmp_trim = None
         try:
-            if widths:
+            if widths or experts:
                 key = mask_key(m)
                 tmp_var = self.work / f"var-{key}.gguf"
                 if self.imatrix:
@@ -177,16 +192,16 @@ class Builder:
                 else:
                     tmp_im = None
                 gguf_ops.write_variable_width(self.weights, tmp_var, widths, drop_tensors=drop,
-                                              imatrix_src=self.imatrix, imatrix_dst=tmp_im)
+                                              imatrix_src=self.imatrix, imatrix_dst=tmp_im, kept_experts=experts)
                 src = str(tmp_var)
                 im_use = str(tmp_im) if tmp_im else None
             else:
                 src = self._pruned(drop)
                 im_use = self.imatrix
 
-            q_dst = (self.work / f"q-{mask_key(m)}.gguf") if (vocab_spec is not None or has_app) else out
-            if q_dst != out:
-                tmp_q = q_dst
+            final_from_q = vocab_spec is None and not has_app
+            q_dst = Path(str(out) + ".part") if final_from_q else (self.work / f"q-{mask_key(m)}.gguf")
+            tmp_q = q_dst
 
             if all(t == "BF16" for t in types.values()) and all(self.source_types[n] == "BF16" for n in types):
                 Path(q_dst).unlink(missing_ok=True)
@@ -196,7 +211,7 @@ class Builder:
                         tmp_var = None
                     except OSError:
                         shutil.copyfile(src, q_dst)
-                elif not widths and vocab_spec is None and not has_app:
+                elif not widths and not experts and final_from_q:
                     try:
                         os.link(src, q_dst)
                     except OSError:
@@ -204,14 +219,17 @@ class Builder:
                 else:
                     shutil.copyfile(src, q_dst)
             else:
-                tok = types.pop("token_embd.weight", None)
+                overrides = {**fixed_pins, **types}
+                tok = overrides.pop("token_embd.weight", None)
                 shards = self.quantize_shards if self.quantize_shards > 0 else (min(16, max(1, self.threads // 4)) if self.threads >= 12 else 1)
-                parallel_quantize(self.tc, src, str(q_dst), "Q8_0", {n: t for n, t in types.items()}, tok,
+                parallel_quantize(self.tc, src, str(q_dst), "Q8_0", overrides, tok,
                                   im_use, self.log, self.threads, shards=shards)
-                if tok:
-                    types["token_embd.weight"] = tok
 
-            cur_file = q_dst
+            if final_from_q:
+                os.replace(q_dst, out)
+                cur_file = out
+            else:
+                cur_file = q_dst
             expected_vocab = None
             if vocab_spec is not None:
                 keep_ids = maskmod.unpack_bitmap(vocab_spec)
@@ -236,13 +254,34 @@ class Builder:
                 raise RuntimeError(f"built file lacks expected tensor {n}")
             if inv[n]["type"] != t.upper():
                 fallbacks[n] = inv[n]["type"]
+        for n, t in fixed_pins.items():
+            if n in types:
+                continue
+            if n not in inv:
+                raise RuntimeError(f"built file lacks expected fixed tensor {n}")
+            if inv[n]["type"] != t.upper():
+                raise RuntimeError(f"fixed tensor {n}: built type {inv[n]['type']} != expected {t.upper()}")
         present_dropped = sorted(n for n in drop if n in inv)
         if present_dropped:
             raise RuntimeError(f"dropped tensors still present: {present_dropped[:3]}")
         for il, idx in widths.items():
-            dn = f"blk.{il}.ffn_down.weight"
-            if dn in inv and inv[dn]["shape"][0] != len(idx):
-                raise RuntimeError(f"{dn}: built width {inv[dn]['shape'][0]} != mask width {len(idx)}")
+            for suf in ("ffn_down.weight", "ffn_down_exps.weight"):
+                dn = f"blk.{il}.{suf}"
+                if dn in inv and inv[dn]["shape"][0] != len(idx):
+                    raise RuntimeError(f"{dn}: built width {inv[dn]['shape'][0]} != mask width {len(idx)}")
+            gu = f"blk.{il}.ffn_gate_up_exps.weight"
+            if gu in inv and inv[gu]["shape"][1] != 2 * len(idx):
+                raise RuntimeError(f"{gu}: built gate_up rows {inv[gu]['shape'][1]} != {2 * len(idx)}")
+        for il, e_idx in experts.items():
+            for suf, axis in (
+                ("ffn_down_exps.weight", 2),
+                ("ffn_gate_up_exps.weight", 2),
+                ("ffn_gate_inp.weight", 1),
+                ("exp_probs_b.bias", 0),
+            ):
+                en = f"blk.{il}.{suf}"
+                if en in inv and inv[en]["shape"][axis] != len(e_idx):
+                    raise RuntimeError(f"{en}: built expert dim {inv[en]['shape'][axis]} != mask {len(e_idx)}")
         if expected_vocab is not None and "token_embd.weight" in inv:
             if inv["token_embd.weight"]["shape"][1] != expected_vocab:
                 raise RuntimeError(f"token_embd vocab {inv['token_embd.weight']['shape'][1]} != {expected_vocab}")
@@ -329,7 +368,13 @@ class SpliceProbeBuilder:
         return cls(inner, tier_paths, cache_dir=cdir, exact_paths=exact_paths)
 
     def build(self, m: dict, out: str | os.PathLike | None = None, keep_pruned: bool = False) -> BuildResult:
-        if m.get("widths") or m.get("vocab_keep") is not None or (m.get("apprentice") or {}).get("switches") or (m.get("apprentice") or {}).get("levels"):
+        if (
+            m.get("widths")
+            or m.get("experts")
+            or m.get("vocab_keep") is not None
+            or (m.get("apprentice") or {}).get("switches")
+            or (m.get("apprentice") or {}).get("levels")
+        ):
             self.fallbacks += 1
             return self.inner.build(m, out, keep_pruned=keep_pruned)
         maskmod.validate(m, self.inner.groups)
@@ -413,6 +458,55 @@ class SpliceProbeBuilder:
         self.inner.cleanup()
 
 
-def kv_bytes(info: dict, n_attn_kept: int, context: int, concurrency: int, kv_type: str) -> int:
+def _layer_is_swa(info: dict, il: int) -> bool:
+    pat = info.get("swa_pattern")
+    if isinstance(pat, list):
+        return bool(pat[il]) if il < len(pat) else False
+    if isinstance(pat, int) and not isinstance(pat, bool) and pat > 0:
+        return (il + 1) % pat != 0
+    return False
+
+
+def kv_bytes(
+    info: dict,
+    n_attn_kept: int,
+    context: int,
+    concurrency: int,
+    kv_type: str,
+    kept_attn_layers: Sequence[int] | None = None,
+) -> int:
     per = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}[kv_type]
-    return int(n_attn_kept * 2 * info["n_head_kv"] * info["head_dim"] * per * context * concurrency)
+    n_head_kv = int(info["n_head_kv"])
+    head_dim_k = int(info["head_dim"])
+    head_dim_v = int(info.get("value_length") or head_dim_k)
+    k_swa = int(info.get("key_length_swa") or head_dim_k)
+    v_swa = int(info.get("value_length_swa") or head_dim_v)
+    n_swa = int(info.get("n_swa") or 0)
+    loop_start = int(info.get("loop_start") or 0)
+    loop_end = int(info.get("loop_end") or 0)
+    loop_count = int(info.get("loop_count") or 1)
+    n_layer = int(info.get("n_layer") or 0)
+
+    def _layer_kv_bytes(il: int) -> float:
+        mult = loop_count if (loop_count > 1 and loop_start <= il < loop_end) else 1
+        is_swa = _layer_is_swa(info, il)
+        kd = k_swa if is_swa else head_dim_k
+        vd = v_swa if is_swa else head_dim_v
+        toks = min(context, n_swa) if (is_swa and n_swa > 0) else context
+        return mult * (kd + vd) * n_head_kv * per * toks * concurrency
+
+    if kept_attn_layers is not None:
+        return int(sum(_layer_kv_bytes(int(il)) for il in kept_attn_layers))
+    if n_layer > 0 and n_attn_kept == n_layer:
+        return int(sum(_layer_kv_bytes(il) for il in range(n_layer)))
+    has_loop_or_swa = (
+        (loop_count > 1 and loop_end > loop_start)
+        or (n_swa > 0 and info.get("swa_pattern") is not None)
+        or (head_dim_k != head_dim_v)
+    )
+    if n_layer > 0 and has_loop_or_swa:
+        if n_attn_kept <= 0:
+            return 0
+        full_b = sum(_layer_kv_bytes(il) for il in range(n_layer))
+        return int(full_b * n_attn_kept / n_layer)
+    return int(n_attn_kept * (head_dim_k + head_dim_v) * n_head_kv * per * context * concurrency)

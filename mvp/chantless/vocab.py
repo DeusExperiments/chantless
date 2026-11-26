@@ -18,11 +18,7 @@ from . import gguf_ops
 
 _STR = 8
 VOCAB_TABLES = ("token_embd.weight", "per_layer_token_embd.weight", "output.weight")
-BLOCK_BYTES = {
-    "F32": (1, 4), "BF16": (1, 2), "F16": (1, 2), "Q8_0": (32, 34), "Q6_K": (256, 210),
-    "Q5_K": (256, 176), "Q4_K": (256, 144), "Q3_K": (256, 110), "Q2_K": (256, 84),
-    "IQ2_XS": (256, 74), "IQ1_S": (256, 50),
-}
+BLOCK_BYTES = {name: (bs, ts) for _, (name, bs, ts) in gguf_ops.GGML_TYPES.items()}
 
 
 def _str_array(raw: bytes) -> list[bytes]:
@@ -75,6 +71,21 @@ def read_tokenizer(gguf_path: str | os.PathLike) -> dict:
         }
     finally:
         h.close()
+
+
+def _gpt2_byte_tokens() -> frozenset[bytes]:
+    bs = list(range(0x21, 0x7F)) + list(range(0xA1, 0xAD)) + list(range(0xAE, 0x100))
+    cs = list(bs)
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return frozenset(chr(c).encode("utf-8") for c in cs)
+
+
+_GPT2_BYTE_TOKENS = _gpt2_byte_tokens()
 
 
 def _ascii_punct(tok_bytes: bytes) -> bool:
@@ -142,15 +153,29 @@ def rule_p_keep_set(
                     stack.append(p)
         return s
 
-    base = (
+    mandatory = (
         set(np.flatnonzero(ttype != 1).tolist())
-        | {i for i, t in enumerate(tokens) if ttype[i] == 1 and (_ascii_punct(t) or _is_chat_or_tool_tag(t))}
+        | {i for i, t in enumerate(tokens) if ttype[i] == 1 and _is_chat_or_tool_tag(t)}
+        | {tid[b] for b in _GPT2_BYTE_TOKENS if b in tid}
         | set(meta["special_ids"])
         | {int(i) for i in must_keep}
     )
-    closed_base = close(base)
+    closed_mandatory = close(mandatory)
+    if len(closed_mandatory) > k:
+        raise ValueError(f"mandatory merge-closed base vocabulary ({len(closed_mandatory)}) exceeds target K={k}")
+
+    punct = [i for i, t in enumerate(tokens) if ttype[i] == 1 and _ascii_punct(t) and i not in closed_mandatory]
+    closed_base = close(closed_mandatory | set(punct))
     if len(closed_base) > k:
-        raise ValueError(f"mandatory merge-closed base vocabulary ({len(closed_base)}) exceeds target K={k}")
+        punct.sort(key=lambda i: (len(tokens[i]), -int(counts[i]), i))
+        lo_p, hi_p = 0, len(punct)
+        while lo_p < hi_p:
+            mid = (lo_p + hi_p + 1) // 2
+            if len(close(closed_mandatory | set(punct[:mid]))) <= k:
+                lo_p = mid
+            else:
+                hi_p = mid - 1
+        closed_base = close(closed_mandatory | set(punct[:lo_p]))
 
     order = np.lexsort((np.arange(v), -counts[:v]))
     lo, hi = 0, v
@@ -251,17 +276,15 @@ def vocab_trim_byte_savings(
         h.close()
     if "token_embd.weight" not in ten:
         return 0
-    v = int(ten["token_embd.weight"]["dims"][1])
-    if len(keep) >= v:
-        return 0
     cut = kv_trim_savings(gguf_path, keep)
-    rows_removed = v - len(keep)
     for tab in VOCAB_TABLES:
-        if tab in ten:
-            cols = int(ten[tab]["dims"][0])
-            ty = table_tiers.get(tab, ten[tab]["type"]).upper()
-            bs, ts = BLOCK_BYTES[ty]
-            cut += rows_removed * (ts * (cols // bs))
+        if tab in ten and len(ten[tab]["dims"]) >= 2:
+            n_rows = int(ten[tab]["dims"][1])
+            if len(keep) < n_rows:
+                cols = int(ten[tab]["dims"][0])
+                ty = table_tiers.get(tab, ten[tab]["type"]).upper()
+                bs, ts = BLOCK_BYTES[ty]
+                cut += (n_rows - len(keep)) * (ts * (cols // bs))
     return int(cut)
 
 
@@ -278,52 +301,63 @@ def trim_gguf(src: str | os.PathLike, dst: str | os.PathLike, keep: Sequence[int
         v = len(tokens)
         if int(keep[-1]) >= v or int(keep[0]) < 0:
             raise ValueError(f"keep indices out of bounds for vocab size {v}")
-        if len(keep) == v:
+        has_padded = any(t["name"] in VOCAB_TABLES and len(t["dims"]) >= 2 and int(t["dims"][1]) > v for t in h.tensors)
+        if len(keep) == v and not has_padded:
             if Path(src).resolve() != Path(dst).resolve():
                 __import__("shutil").copyfile(src, dst)
             return {"kept_tokens": v, "kept_merges": 0, "file_bytes": os.path.getsize(dst)}
 
-        new_id = np.full(v, -1, dtype=np.int64)
-        new_id[keep] = np.arange(len(keep), dtype=np.int64)
-        ks = {tokens[int(i)] for i in keep}
-        new_tokens = [tokens[int(i)] for i in keep]
+        arch = h.arch or ""
+        vocab_kv_keys = {f"{arch}.vocab_size", f"{arch}.vocab_size_unpadded"} if arch else set()
+        trim_tokens = len(keep) < v
+        if trim_tokens:
+            new_id = np.full(v, -1, dtype=np.int64)
+            new_id[keep] = np.arange(len(keep), dtype=np.int64)
+            ks = {tokens[int(i)] for i in keep}
+            new_tokens = [tokens[int(i)] for i in keep]
 
         out_kvs = []
         kept_merges = 0
         for k, vt, raw in kvs:
-            if k == "tokenizer.ggml.tokens":
-                raw = _pack_str_array(new_tokens)
-            elif k == "tokenizer.ggml.token_type":
-                ttype = np.frombuffer(raw, "<i4", v, 12)[keep]
-                raw = struct.pack("<IQ", 5, len(keep)) + np.asarray(ttype, "<i4").tobytes()
+            if k in vocab_kv_keys and vt == 4 and len(raw) == 4:
+                raw = struct.pack("<I", int(len(keep)))
+            elif trim_tokens:
+                if k == "tokenizer.ggml.tokens":
+                    raw = _pack_str_array(new_tokens)
+                elif k == "tokenizer.ggml.token_type":
+                    ttype = np.frombuffer(raw, "<i4", v, 12)[keep]
+                    raw = struct.pack("<IQ", 5, len(keep)) + np.asarray(ttype, "<i4").tobytes()
+                elif k == "tokenizer.ggml.merges":
+                    merges = _str_array(raw)
+                    nm = []
+                    for r in merges:
+                        sp = r.find(b" ", 1)
+                        if sp > 0 and r[:sp] in ks and r[sp + 1 :] in ks and (r[:sp] + r[sp + 1 :]) in ks:
+                            nm.append(r)
+                    kept_merges = len(nm)
+                    raw = _pack_str_array(nm)
+                elif k == "tokenizer.ggml.scores":
+                    sc = np.frombuffer(raw, "<f4", v, 12)[keep]
+                    raw = struct.pack("<IQ", 6, len(keep)) + np.asarray(sc, "<f4").tobytes()
+                elif k.startswith("tokenizer.ggml.") and k.endswith("_token_id") and len(raw) == 4:
+                    (oid,) = struct.unpack("<I", raw)
+                    nid = int(new_id[oid])
+                    if nid < 0:
+                        raise ValueError(f"{k}={oid} is not in vocab_keep")
+                    raw = struct.pack("<I", nid)
             elif k == "tokenizer.ggml.merges":
-                merges = _str_array(raw)
-                nm = []
-                for r in merges:
-                    sp = r.find(b" ", 1)
-                    if sp > 0 and r[:sp] in ks and r[sp + 1 :] in ks and (r[:sp] + r[sp + 1 :]) in ks:
-                        nm.append(r)
-                kept_merges = len(nm)
-                raw = _pack_str_array(nm)
-            elif k == "tokenizer.ggml.scores":
-                sc = np.frombuffer(raw, "<f4", v, 12)[keep]
-                raw = struct.pack("<IQ", 6, len(keep)) + np.asarray(sc, "<f4").tobytes()
-            elif k.startswith("tokenizer.ggml.") and k.endswith("_token_id") and len(raw) == 4:
-                (oid,) = struct.unpack("<I", raw)
-                nid = int(new_id[oid])
-                if nid < 0:
-                    raise ValueError(f"{k}={oid} is not in vocab_keep")
-                raw = struct.pack("<I", nid)
+                kept_merges = struct.unpack_from("<IQ", raw, 0)[1]
             out_kvs.append((k, vt, raw))
 
         align = h.alignment
         tensors = []
         for t in h.tensors:
             d = dict(t)
-            if t["name"] in VOCAB_TABLES and t["dims"][1] == v:
-                row_bytes = t["n_bytes"] // v
+            if t["name"] in VOCAB_TABLES and len(t["dims"]) >= 2 and int(t["dims"][1]) >= v:
+                n_rows = int(t["dims"][1])
+                row_bytes = t["n_bytes"] // n_rows
                 base = h.data_start + t["offset"]
-                rows = np.frombuffer(h.m, np.uint8, t["n_bytes"], base).reshape(v, row_bytes)
+                rows = np.frombuffer(h.m, np.uint8, t["n_bytes"], base).reshape(n_rows, row_bytes)
                 blob = np.ascontiguousarray(rows[keep]).tobytes()
                 del rows
                 d["dims"] = [t["dims"][0], int(len(keep))]
@@ -358,6 +392,8 @@ def trim_gguf(src: str | os.PathLike, dst: str | os.PathLike, keep: Sequence[int
                 else:
                     s = h.data_start + t["offset"]
                     f.write(h.m[s : s + t["n_bytes"]])
+            end_pos = f.tell()
+            f.write(b"\0" * ((end_pos + align - 1) // align * align - end_pos))
         os.replace(tmp, dst)
         return {
             "kept_tokens": int(len(keep)),
