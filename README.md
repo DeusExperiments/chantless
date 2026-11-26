@@ -4,9 +4,13 @@
 
 **Your taste. Multiplied.**
 
-Chantless eliminates **weight debt**. Instead of fine-tuning, distilling, and shipping mutated gigabyte checkpoints, Chantless keeps stock open-weight models (`Qwen3`, `Qwen3.5`, `Gemma 4`, `Inkling-2-Mini`) **completely frozen** and compiles capabilities into **`6–53 KB` Apache-2.0 declarative masks** (`chantless.mask/v3`, zero trained floats).
+Chantless extracts capabilities from frozen models without training their weights. The extracted capabilities remain independently deployable and adaptable.
 
-From any stock Hugging Face checkpoint + thin mask, Chantless deterministically builds a SHA256-exact standalone GGUF—and adapts it from **`<= 25` real mistakes at `+0 bytes`** by flipping binary MLP neuron switches rather than rewriting float weights.
+Conventional compression work tries to preserve as much of the model as possible, primarily under a size constraint. Chantless utilizes search algorithms to best attribute everything that really contributes to a capability and ensure it is neatly abstracted. Once we identify the capability, we extract it in a novel way that keeps it malleable.
+
+In practice, you hand Chantless a small batch of up to 25 real mistakes. Instead of training new float weight values, it decides which small set of late-layer neurons to switch off. Flipping those switches adds zero bytes to the file.
+
+[**Read the research announcement — How do models lose weight without crying?**](https://deusexperiments.com/research/how-do-models-lose-weight-without-crying/)
 
 ---
 
@@ -74,7 +78,15 @@ All **`16` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 | **Inference & Apprentice (`mps` / `MTL0`)** | Apple Silicon | `1,286 MiB` `MTL0` | **`464 MiB`** `MTL0` (`build_s=0.0` cache hit) | **`2.498×`** decode · **`0.361×`** memory · `3.9×–13.5×` learn |
 
 ### 4. Production-Scale Classifier Proof & OOD Counter-Baselines
-- **`Gemma 4 E2B` `10.00%` (`931 MB`) Detector & Switch Apprentice:** **`99.76%`** agreement on a **`51,066`-document** held-out exam (`99.82%` AI caught @ `0.08%` human FPR); on `4,549` unseen Beemo docs, real labels fixed **`241`** mistakes vs **`36`** for flipped labels.
+
+| Capability | Held-out result | Extracted size |
+|---|---|---|
+| AI writing detection · Gemma 4 E2B | **99.76% retention of source-correct decisions** | **930.97 MB (10% of BF16)** |
+
+**Artifacts:** Source checkpoint, winning extraction mask, evaluation receipt and reproduction instructions.
+
+**Caveat:** Passes pooled non-inferiority; Beemo alone falls outside the two-point margin.
+
 - **`Qwen3.5-0.8B` `200 MB` multi-pass Apprentice vs Small-Model SFT/KD:** Improved **`8/25 → 25/25`** on unseen AI passages (`0/25` human FPR) at **`6.6 × 10¹⁶` FLOPs** replay (`3.2×` cheaper than Hinton KD on `ModernBERT-base`). On the exact same `14,991`-doc splits, labels-only SFT on `ModernBERT-base` (`159 MB`) and `LFM2.5-230M` (`244 MB`) collapsed OOD (**`75.21%`** and **`78.44%`** human false-positive rate on Beemo).
 
 ---

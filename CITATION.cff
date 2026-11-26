@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: Chantless
+message: "If you use Chantless in your research, please cite this repository."
+type: software
+authors:
+  - given-names: Abhishek
+    family-names: Mishra
+    affiliation: Deus Experiments
+version: 0.3.0
+license: Apache-2.0
+repository-code: https://github.com/DeusExperiments/chantless
+url: https://deusexperiments.com/research/how-do-models-lose-weight-without-crying/
