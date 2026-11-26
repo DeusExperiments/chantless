@@ -1,0 +1,173 @@
+name: Transfer approved detector artifacts
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: chantless-detector-transfer
+  cancel-in-progress: false
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install transfer clients
+        run: python -m pip install 'requests==2.34.2' 'huggingface_hub==2.4.0'
+      - name: Transfer existing artifacts and verify checksums
+        env:
+          TRANSFER_MODELSCOPE_COOKIES: ${{ secrets.TRANSFER_MODELSCOPE_COOKIES }}
+          TRANSFER_HF_TOKEN: ${{ secrets.TRANSFER_HF_TOKEN }}
+          HF_HUB_DISABLE_XET: '1'
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          PYTHONUNBUFFERED: '1'
+        shell: bash
+        run: |
+          python - <<'PYTRANSFER'
+          """Transfer only the approved existing detector artifacts; never load a model."""
+          import concurrent.futures
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import time
+
+          import requests
+          from huggingface_hub import HfApi
+
+          BASE = "https://modelscope.ai/models/tokenbender/chantless-detect-local-archive/resolve/master/"
+          DEST = "TokenBender/Chantless"
+          COOKIES = json.loads(os.environ["TRANSFER_MODELSCOPE_COOKIES"])
+          api = HfApi(token=os.environ["TRANSFER_HF_TOKEN"])
+          root = Path(os.environ["RUNNER_TEMP"]) / "chantless-transfer"
+          root.mkdir(exist_ok=True)
+
+
+          def session():
+              s = requests.Session()
+              for c in COOKIES:
+                  s.cookies.set(c["name"], c["value"], domain=c["domain"],
+                                path=c["path"], secure=c["secure"], expires=c["expires"])
+              return s
+
+
+          def digest(path):
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                      h.update(block)
+              return h.hexdigest()
+
+
+          def fetch(remote, path):
+              url = BASE + remote
+              with session() as s:
+                  response = s.get(url, headers={"Range": "bytes=0-0"},
+                                   stream=True, timeout=(30, 90))
+                  if response.status_code == 200:
+                      with response, path.open("wb") as f:
+                          for block in response.iter_content(8 * 1024 * 1024):
+                              f.write(block)
+                      return
+                  if response.status_code != 206:
+                      status = response.status_code
+                      response.close()
+                      raise RuntimeError(f"ModelScope download status {status}")
+                  match = re.fullmatch(r"bytes 0-0/(\d+)", response.headers.get("Content-Range", ""))
+                  response.close()
+                  if not match:
+                      raise RuntimeError("Unexpected range response")
+                  total = int(match.group(1))
+              workers = min(8, max(1, math.ceil(total / (32 * 1024 * 1024))))
+              size = math.ceil(total / workers)
+              fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+              os.ftruncate(fd, total)
+
+              def part(i):
+                  start, end = i * size, min(total, (i + 1) * size) - 1
+                  for attempt in range(4):
+                      try:
+                          with session() as s, s.get(
+                              url, headers={"Range": f"bytes={start}-{end}"},
+                              stream=True, timeout=(30, 90)
+                          ) as r:
+                              expected_range = f"bytes {start}-{end}/{total}"
+                              if r.status_code != 206 or r.headers.get("Content-Range") != expected_range:
+                                  raise RuntimeError("Range download refused")
+                              pos = start
+                              for block in r.iter_content(4 * 1024 * 1024):
+                                  if pos + len(block) > end + 1:
+                                      raise RuntimeError("Range overflow")
+                                  view = memoryview(block)
+                                  while view:
+                                      count = os.pwrite(fd, view, pos)
+                                      if count <= 0:
+                                          raise RuntimeError("Short file write")
+                                      pos += count
+                                      view = view[count:]
+                              if pos != end + 1:
+                                  raise RuntimeError("Incomplete range")
+                          print(f"Downloaded {path.name}: part {i + 1}/{workers}", flush=True)
+                          return
+                      except Exception:
+                          if attempt == 3:
+                              raise RuntimeError(f"Download part {i + 1} failed") from None
+                          time.sleep(2 ** attempt)
+              try:
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                      list(pool.map(part, range(workers)))
+              finally:
+                  os.close(fd)
+
+
+          def transfer(remote, name, expected=None):
+              if expected:
+                  existing = api.get_paths_info(DEST, [name], repo_type="model")
+                  if existing and getattr(existing[0], "lfs", None):
+                      if existing[0].lfs.sha256 == expected:
+                          print(f"Already verified on HF: {name}", flush=True)
+                          return
+              p = root / name
+              print(f"Downloading approved artifact: {name}", flush=True)
+              fetch(remote, p)
+              sha = digest(p)
+              if expected and sha != expected:
+                  raise RuntimeError(f"Checksum mismatch: {name}")
+              print(f"Verified {name}: {p.stat().st_size} bytes, SHA256 {sha}", flush=True)
+              for attempt in range(3):
+                  try:
+                      api.upload_file(path_or_fileobj=str(p), path_in_repo=name, repo_id=DEST,
+                                      repo_type="model", commit_message=f"Release verified {name}")
+                      break
+                  except Exception:
+                      if attempt == 2:
+                          raise RuntimeError(f"Hugging Face upload failed: {name}") from None
+                      time.sleep(5 * (attempt + 1))
+              info = api.get_paths_info(DEST, [name], repo_type="model")
+              if len(info) != 1 or info[0].size != p.stat().st_size:
+                  raise RuntimeError(f"Remote size verification failed: {name}")
+              if expected and (not info[0].lfs or info[0].lfs.sha256 != expected):
+                  raise RuntimeError(f"Remote checksum verification failed: {name}")
+              print(f"Published and verified: {name}", flush=True)
+              p.unlink()
+
+
+          try:
+              transfer("gemma4/mask10/gemma4-e2b-detector-mask10.gguf",
+                       "gemma4-e2b-detector-mask10.gguf",
+                       "92dd691f82642fbd58a0a11bd7e904f8f5b0f26e7cf322f247c9a40c634876ce")
+              transfer("gemma4/e2b-detector/model.safetensors", "model.safetensors",
+                       "e131fecf2d247441056a6d5f4eaa1b5dd8ccd81c894458b1bf61209837d7cfab")
+              for name in ("config.json", "generation_config.json", "processor_config.json",
+                           "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+                  transfer("gemma4/e2b-detector/" + name, name)
+              print("TRANSFER COMPLETE: both checkpoints and original metadata verified.", flush=True)
+          except Exception as exc:
+              # Never print signed URLs, cookie values, auth headers or SDK exception bodies.
+              print(f"Transfer stopped: {type(exc).__name__}", flush=True)
+              raise SystemExit(1)
+          PYTRANSFER
