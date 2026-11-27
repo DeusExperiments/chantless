@@ -10,7 +10,7 @@ Conventional compression work tries to preserve as much of the model as possible
 
 In practice, you hand Chantless a small batch of up to 25 real mistakes. Instead of training new float weight values, it decides which small set of late-layer neurons to switch off. Flipping those switches adds zero bytes to the file.
 
-[**Read the research announcement — How do models lose weight without crying?**](https://deusexperiments.com/research/how-do-models-lose-weight-without-crying/)
+[**Read the research announcement — How do models lose weight without crying?**](https://deusexperiments.com/research/how-do-models-lose-weight-without-crying/) · [**Hugging Face artifacts (`TokenBender/Chantless`)**](https://huggingface.co/TokenBender/Chantless)
 
 ---
 
@@ -52,9 +52,9 @@ All **`16` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 | **`Gemma 4 E2B`** | `BFCL` | `1.95 GB` (`20.92%`) | `47.1 KB` | **`97.13%`** | **`+44.02` pts** | **`26 / 60`** (`43.3%`, `+0 B`) | `0 / 0 / 0 / 7` |
 | **`Qwen3-4B`** | `BFCL` | `1.97 GB` (`24.50%`) | `6.4 KB` | **`92.31%`** | **`+5.87` pts** | **`22 / 60`** (`36.7%`, `+0 B`) | `3 / 3 / 1 / 12` |
 | **`Qwen3.5-4B`** | `BFCL` | `2.19 GB` (`26.01%`) | `18.6 KB` | **`92.39%`** | `+0.00` pts | **`29 / 60`** (`48.3%`, `+0 B`) | `0 / 0 / 2 / 19` |
-| **`Inkling-2-Mini`** (`24B` MoE) | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `33.9 KB` | **`98.67%` @ `5.00%` FPR** | `11.65×` smaller (`BF16` `99.17%`) | **`10 / 60`** (`+0 B`, exam `+0.34 pp`) | `4 / 4 / 3 / 8` |
+| **`Inkling-2-Mini`** (`26.4B` MoE) | `ClsBench` | `4.17 GiB` (**`8.58%`**) | `33.9 KB` | **`98.67%` @ `5.00%` FPR** | `11.65×` smaller (`BF16` `99.17%`) | **`10 / 60`** (`+0 B`, exam `+0.34 pp`) | `4 / 4 / 3 / 8` |
 
-### 2. Additional Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners
+### 2. Additional Looped-MoE `Inkling-2-Mini` (`26.4B` / `128` Experts) Specialist Winners
 
 | Mask | Task | Size (`%` BF16) | Mask | Held-Out `exam` (vs `BF16`) | `reasoning_effort="high"` (`0.9`) Stress Test |
 | :--- | :--- | :---: | :---: | :--- | :--- |
@@ -77,17 +77,17 @@ All **`16` trophy masks** (`6.4–52.8 KB`, zero trained floats) and SHA256 rece
 | **Inference (`chantless bench`, `Q4_K` vs `BF16`)** | NVIDIA RTX 4090 (`CUDA0`) | `440.95 tok/s` · `1,844 MiB` VRAM | **`630.0 tok/s`** · **`1,016 MiB`** VRAM (`571 MiB` `CUDA0`) | **`1.429×`** decode · **`0.551×`** `nvidia-smi` VRAM |
 | **Inference & Apprentice (`mps` / `MTL0`)** | Apple Silicon | `1,286 MiB` `MTL0` | **`464 MiB`** `MTL0` (`build_s=0.0` cache hit) | **`2.498×`** decode · **`0.361×`** memory · `3.9×–13.5×` learn |
 
-### 4. Production-Scale Classifier Proof & OOD Counter-Baselines
+### 5. Production-Scale Classifier Proof & OOD Counter-Baselines
 
 | Capability | Held-out result | Extracted size |
 |---|---|---|
 | AI writing detection · Gemma 4 E2B | **99.76% retention of source-correct decisions** | **930.97 MB (10% of BF16)** |
 
-**Artifacts:** Source checkpoint, winning extraction mask, evaluation receipt and reproduction instructions.
+**Artifacts:** Source checkpoint, winning extraction mask, evaluation receipt and reproduction instructions on [Hugging Face (`TokenBender/Chantless`)](https://huggingface.co/TokenBender/Chantless).
 
 **Caveat:** Passes pooled non-inferiority; Beemo alone falls outside the two-point margin.
 
-- **`Qwen3.5-0.8B` `200 MB` multi-pass Apprentice vs Small-Model SFT/KD:** Improved **`8/25 → 25/25`** on unseen AI passages (`0/25` human FPR) at **`6.6 × 10¹⁶` FLOPs** replay (`3.2×` cheaper than Hinton KD on `ModernBERT-base`). On the exact same `14,991`-doc splits, labels-only SFT on `ModernBERT-base` (`159 MB`) and `LFM2.5-230M` (`244 MB`) collapsed OOD (**`75.21%`** and **`78.44%`** human false-positive rate on Beemo).
+- **Pure Stage 1 `Qwen3.5-0.8B` Extraction vs. Compact Trained Baselines:** Extracted `detector-cls396.gguf` (`396.45 MB` vs. `1,516.74 MB` BF16) retains **`98.09%`** WildOutlines AI recall @ **`1.83%`** FPR (`48,869` test docs, vs. BF16 `98.39%` / `1.89%`) and **`50.66%`** Beemo AI @ **`14.04%`** FPR (`4,549` docs, vs. BF16 `48.38%` / `12.59%`), while a `200.30 MB` Stage 1 mask (`detector-200mb-q4cut50.gguf`) reaches `50.4%` / `14.2%` on Beemo. On the `14,991`-doc search split (`13,987` WildOutlines-val + `1,004` Beemo), fixed-recipe labels-only SFT on `ModernBERT-base` (`158.99 MB` est.) and `LFM2.5-230M-Base` (`244.08 MB` est.) collapsed OOD (**`75.21%`** and **`78.44%`** Beemo human FPR), whereas `ModernBERT-base` Hinton KD reached `92.95%` / `1.64%` WildOutlines and `49.01%` / `17.01%` Beemo.
 
 ---
 
