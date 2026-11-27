@@ -1,8 +1,8 @@
 # Chantless Thin Masks (`chantless.mask/v3`)
 
 This directory tracks **`16` verified winner masks** (`6.4 KB – 52.8 KB` pure Apache-2.0 JSON, zero trained floats):
-- **`12` stock-checkpoint double-winner masks** (`6` architecture/task cells across `4` architectures — `Gemma 4`, `Qwen3.5`, `Qwen3`, and `24B` looped-MoE `Inkling-2-Mini` — × `{specialist, +0 B Apprentice}`) where extraction cleared its quality gate **and** zero-byte `<=25`-mistake Apprentice learning beat every matched-byte control (`base`, `empty`, `flipped`, `shuffled`).
-- **`2` additional looped-MoE `Inkling-2-Mini` (`24B`) specialist winners** (`bfcl`, `deepmath`) verified on sealed exams plus `reasoning_effort="high"` (`0.9`, `16k` math / `8k` tool-calling) stress tests.
+- **`12` stock-checkpoint double-winner masks** (`6` architecture/task cells across `4` architectures — `Gemma 4`, `Qwen3.5`, `Qwen3`, and `26.4B` looped-MoE `Inkling-2-Mini` — × `{specialist, +0 B Apprentice}`) where extraction cleared its quality gate **and** zero-byte `<=25`-mistake Apprentice learning beat every matched-byte control (`base`, `empty`, `flipped`, `shuffled`).
+- **`2` additional looped-MoE `Inkling-2-Mini` (`26.4B`) specialist winners** (`bfcl`, `deepmath`) verified on sealed exams plus `reasoning_effort="high"` (`0.9`, `16k` math / `8k` tool-calling) stress tests.
 - **`2` flagship `27B` imported winners** (`Qwen3.8-27B` `K34` and `K94`), demonstrating `chantless mask import` interoperability at `27B` scale.
 
 ## Pinned Stock Source Checkpoints
@@ -46,7 +46,7 @@ Each Apprentice mask trains binary `up_row_zero` MLP neuron switches on `25` spe
 
 ---
 
-## 3. Looped-MoE `Inkling-2-Mini` (`24B` / `128` Experts) Specialist Winners (`3 / 3` + `1` Double Winner)
+## 3. Looped-MoE `Inkling-2-Mini` (`26.4B` / `128` Experts) Specialist Winners (`3 / 3` + `1` Double Winner)
 
 Built against `ggml-org/Inkling-2-Mini-GGUF` (`Inkling-2-Mini-BF16.gguf`, `48.640 GiB`) and unified `llama.cpp @ afe77e18fadc` (`#32704` + `#32763`, `--special`, `f16` KV, `--no-cache-prompt`).
 
